@@ -1,0 +1,10 @@
+/target
+/Cargo.lock
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.env
+.env.local
+.oc-serve-auth.env
+.omo
