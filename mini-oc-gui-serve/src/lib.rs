@@ -14,6 +14,8 @@
 #![warn(rust_2018_idioms)]
 
 pub mod auth;
+pub mod attach;
+pub mod config;
 pub mod domain;
 pub mod error;
 pub mod handlers;

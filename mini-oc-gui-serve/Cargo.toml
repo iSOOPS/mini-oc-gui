@@ -33,17 +33,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 async-trait = "0.1"
 
-# HTTP client (remote SilverBullet sync).
-# By default we ship WITHOUT TLS so the project builds on dev machines
-# without a C compiler (ring/aws-lc-rs both require native toolchains).
-# The local `path-list.md` cache + JSON merge work without any HTTP. To
-# enable remote sync against an HTTPS SilverBullet, install a C compiler
-# and re-enable the `tls` feature:
-#
-#   cargo build --features remote-tls
-#
-# (then add the corresponding deps back into this [dependencies] block).
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# HTTP client (remote SilverBullet sync + opencode serve API).
+# TLS 通过 rustls（纯 Rust）提供，使 HTTPS 远端（如 md.isoops.com）可用。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

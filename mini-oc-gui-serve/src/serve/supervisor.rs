@@ -72,10 +72,14 @@ impl ServeSupervisor {
     /// [`AppError::Io`] if the binary cannot be spawned.
     pub async fn launch_opencode(&self, port: u16) -> Result<u32, AppError> {
         Self::check_port(port).await?;
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
         let spec = ProcessSpec::new("opencode")
             .arg("serve")
             .arg("--port")
-            .arg(port.to_string());
+            .arg(port.to_string())
+            .cwd(cwd);
         let child = spawn_traced(spec).await?;
         let pid = child.pid;
         self.children.lock().await.insert("opencode".to_string(), child);
@@ -135,6 +139,45 @@ impl ServeSupervisor {
         self.shutdown_tx.subscribe()
     }
 
+    /// 停止 opencode serve 进程（若在运行）。
+    ///
+    /// # Errors
+    /// 错误仅记录，不传播 —— 停止是尽力而为。
+    pub async fn stop_opencode(&self) -> Result<(), AppError> {
+        tracing::info!("stopping opencode serve");
+        let child = { self.children.lock().await.remove("opencode") };
+        if let Some(mut c) = child {
+            terminate_gracefully(&mut c.child).await;
+        }
+        let mut status = self.status.lock().await;
+        status.opencode_pid = None;
+        tracing::info!("opencode serve stopped");
+        Ok(())
+    }
+
+    /// 停止 rathole 进程（若在运行）。
+    ///
+    /// # Errors
+    /// 错误仅记录，不传播 —— 停止是尽力而为。
+    pub async fn stop_rathole(&self) -> Result<(), AppError> {
+        tracing::info!("stopping rathole");
+        let child = { self.children.lock().await.remove("rathole") };
+        if let Some(mut c) = child {
+            terminate_gracefully(&mut c.child).await;
+        }
+        let mut status = self.status.lock().await;
+        status.rathole_pid = None;
+        tracing::info!("rathole stopped");
+        Ok(())
+    }
+
+    /// 停止所有子进程（opencode + rathole）。
+    pub async fn stop_all(&self) -> Result<(), AppError> {
+        self.stop_opencode().await?;
+        self.stop_rathole().await?;
+        Ok(())
+    }
+
     /// Graceful shutdown: SIGTERM (Unix) / TerminateProcess (Windows), then
     /// SIGKILL after a 5-second grace period.
     ///
@@ -142,21 +185,7 @@ impl ServeSupervisor {
     /// Errors are logged but not propagated — shutdown is best-effort.
     pub async fn shutdown(&self) -> Result<(), AppError> {
         let _ = self.shutdown_tx.send(());
-
-        // Take all children out of the map so we don't hold the mutex across
-        // an `.await`.
-        let to_terminate: Vec<ChildProcess> = {
-            let mut map = self.children.lock().await;
-            map.drain().map(|(_, c)| c).collect()
-        };
-        for mut child in to_terminate {
-            terminate_gracefully(&mut child.child).await;
-        }
-
-        let mut status = self.status.lock().await;
-        status.opencode_pid = None;
-        status.rathole_pid = None;
-        Ok(())
+        self.stop_all().await
     }
 }
 

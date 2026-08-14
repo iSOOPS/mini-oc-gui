@@ -9,10 +9,20 @@ pub enum InputEvent {
     Up,
     /// Move selection down.
     Down,
-    /// Confirm the current selection.
+    /// Move focus left.
+    Left,
+    /// Move focus right.
+    Right,
+    /// Confirm the current selection / field.
     Select,
     /// Quit the TUI.
     Quit,
+    /// Delete the character before the cursor.
+    Backspace,
+    /// Switch to the next field (form mode).
+    Tab,
+    /// A printable character.
+    Char(char),
     /// Any other, unhandled key.
     Other,
 }
@@ -20,12 +30,16 @@ pub enum InputEvent {
 impl From<KeyEvent> for InputEvent {
     fn from(k: KeyEvent) -> Self {
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => Self::Up,
-            KeyCode::Down | KeyCode::Char('j') => Self::Down,
+            KeyCode::Up => Self::Up,
+            KeyCode::Down => Self::Down,
+            KeyCode::Left => Self::Left,
+            KeyCode::Right => Self::Right,
             KeyCode::Enter => Self::Select,
             KeyCode::Esc => Self::Quit,
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Self::Quit,
-            KeyCode::Char('q') => Self::Quit,
+            KeyCode::Backspace => Self::Backspace,
+            KeyCode::Tab => Self::Tab,
+            KeyCode::Char(c) => Self::Char(c),
             _ => Self::Other,
         }
     }

@@ -3,34 +3,26 @@
 /// A single selectable entry in the main TUI menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
-    /// 🚀 Launch `opencode serve` only.
-    LaunchOcServe,
-    /// 🚀 Launch `opencode serve` + rathole tunnel.
-    LaunchOcServeWithRathole,
-    /// ⬆️ Upgrade OpenCode + oh-my-openagent.
+    /// OpenCode Serve（启动/停止动态切换）.
+    OcServe,
+    /// Rathole 隧道（启动/停止动态切换）.
+    Rathole,
+    /// OC 项目（进入项目选择 / attach 子页面）.
+    OcProjects,
+    /// Upgrade OpenCode + oh-my-openagent.
     UpgradeOpenCodeAndOmo,
-    /// 🚪 Exit.
+    /// Exit.
     Exit,
 }
 
 impl MenuItem {
-    /// Human-readable label with emoji.
-    #[must_use]
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::LaunchOcServe => "🚀 启动 OC Serve（默认）",
-            Self::LaunchOcServeWithRathole => "🚀 启动 OC Serve + Rathole（全部）",
-            Self::UpgradeOpenCodeAndOmo => "⬆️  升级 OpenCode + omo",
-            Self::Exit => "🚪 退出",
-        }
-    }
-
     /// Return all menu items in display order.
     #[must_use]
     pub fn all() -> Vec<MenuItem> {
         vec![
-            Self::LaunchOcServe,
-            Self::LaunchOcServeWithRathole,
+            Self::OcServe,
+            Self::Rathole,
+            Self::OcProjects,
             Self::UpgradeOpenCodeAndOmo,
             Self::Exit,
         ]
@@ -40,8 +32,12 @@ impl MenuItem {
 /// What a selected [`MenuItem`] should translate to in terms of side effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
-    /// Launch `opencode serve`. The bool is `with_rathole`.
-    Launch(bool),
+    /// Toggle OpenCode Serve：运行中则停止，未运行则提示端口并启动。
+    ToggleOcServe,
+    /// Toggle Rathole：运行中则停止，未运行则启动。
+    ToggleRathole,
+    /// 进入 OC 项目子页面。
+    EnterProjects,
     /// Run the upgrade flow.
     Upgrade,
     /// Exit the TUI cleanly.
@@ -51,8 +47,9 @@ pub enum MenuAction {
 impl From<MenuItem> for MenuAction {
     fn from(item: MenuItem) -> Self {
         match item {
-            MenuItem::LaunchOcServe => Self::Launch(false),
-            MenuItem::LaunchOcServeWithRathole => Self::Launch(true),
+            MenuItem::OcServe => Self::ToggleOcServe,
+            MenuItem::Rathole => Self::ToggleRathole,
+            MenuItem::OcProjects => Self::EnterProjects,
             MenuItem::UpgradeOpenCodeAndOmo => Self::Upgrade,
             MenuItem::Exit => Self::Exit,
         }

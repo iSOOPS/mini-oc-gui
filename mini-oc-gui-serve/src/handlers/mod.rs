@@ -17,7 +17,7 @@ pub mod health;
 pub mod project;
 pub mod session;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{Router, middleware, routing::{get, post}};
 use tower_http::trace::TraceLayer;
@@ -30,8 +30,8 @@ use crate::storage::PathListStore;
 pub struct AppState {
     /// Path-list store (local cache + optional remote sync).
     pub store: Arc<PathListStore>,
-    /// Authentication configuration.
-    pub auth: AuthConfig,
+    /// Authentication configuration（运行时可变，首次配置填写后热更新）.
+    pub auth: Arc<RwLock<AuthConfig>>,
     /// Default directory for `POST /api/session` when no location is given.
     pub default_dir: String,
 }
@@ -57,10 +57,11 @@ pub fn router(state: AppState) -> Router {
 
 /// Middleware that clones the [`AuthConfig`] into the request extensions.
 async fn attach_auth_config(
-    axum::extract::State(auth): axum::extract::State<AuthConfig>,
+    axum::extract::State(auth): axum::extract::State<Arc<RwLock<AuthConfig>>>,
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> axum::response::Response {
-    req.extensions_mut().insert(auth);
+    let config = auth.read().unwrap_or_else(|e| e.into_inner()).clone();
+    req.extensions_mut().insert(config);
     next.run(req).await
 }

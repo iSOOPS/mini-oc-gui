@@ -16,6 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use mini_oc_gui_serve::{
     auth::AuthConfig,
+    config::SbConfig,
     error::AppError,
     handlers::{AppState, router},
     serve::ServeSupervisor,
@@ -57,12 +58,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. Tracing.
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    // TUI 模式下把日志写入共享缓冲区（在日志面板渲染），避免 stderr 污染界面；
+    // --no-tui 模式保持默认 stderr 输出。
+    let log_buffer = mini_oc_gui_serve::ui::LogBuffer::new();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if cli.no_tui {
+        fmt().with_env_filter(filter).with_target(false).init();
+    } else {
+        fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(log_buffer.clone())
+            .init();
+    }
 
     // 2. Optional: generate-and-exit.
     if cli.generate_auth {
@@ -86,16 +95,16 @@ async fn main() -> Result<()> {
     // 4. Build storage.
     let cache = FileCache::new(&path_list_file);
     let store = PathListStore::new(cache);
-    if let (Ok(sb_url), Ok(sb_user), Ok(sb_password)) = (
-        std::env::var("SB_URL"),
-        std::env::var("SB_USER"),
-        std::env::var("SB_PASSWORD"),
-    ) {
-        let remote = RemoteClient::with_credentials(sb_url, sb_user, sb_password);
-        store.with_remote(remote).await;
-        if let Err(e) = store.refresh().await {
-            tracing::warn!("initial refresh failed: {e}");
+    let sb_config = Arc::new(std::sync::RwLock::new(SbConfig::load()));
+    if let Ok(cfg) = sb_config.read() {
+        if cfg.is_configured() {
+            let remote = RemoteClient::with_credentials(cfg.url.clone(), cfg.user.clone(), cfg.password.clone());
+            store.with_remote(remote).await;
         }
+    }
+    // 无论是否配置远端，都从本地 path-list.md 刷新一次缓存。
+    if let Err(e) = store.refresh().await {
+        tracing::warn!("initial refresh failed: {e}");
     }
     let store = Arc::new(store);
 
@@ -106,6 +115,8 @@ async fn main() -> Result<()> {
         AuthConfig::from_env()
     }
     .context("auth init")?;
+    // 运行时可变：首次配置填写后可立即热更新，无需重启。
+    let auth = Arc::new(std::sync::RwLock::new(auth));
 
     // 6. Supervisor + state.
     let supervisor = ServeSupervisor::new();
@@ -115,7 +126,15 @@ async fn main() -> Result<()> {
         default_dir: default_dir.clone(),
     };
 
-    // 7. Optionally bind the HTTP listener.
+    // 7. --no-tui 模式无交互终端，未配置凭据时提前安全退出，避免无认证监听。
+    if cli.no_tui && !auth.read().map(|a| a.is_configured()).unwrap_or(false) {
+        anyhow::bail!(
+            "未配置认证凭据（OPENCODE_SERVER_USERNAME/PASSWORD）。\
+             --no-tui 模式无法交互填写，请先运行 TUI 模式完成首次配置，或用 --generate-auth 生成凭据。"
+        );
+    }
+
+    // 8. Optionally bind the HTTP listener.
     let server_handle = if !cli.no_http {
         let app = router(state);
         let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -145,18 +164,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 8. Run TUI (blocks until user quits).
+    // 9. Run TUI (blocks until user quits).
     let terminal = ratatui::init();
-    let tui_result = TuiApp::new(supervisor.clone()).run(terminal).await;
+    TuiApp::new(
+        supervisor.clone(),
+        auth.clone(),
+        log_buffer.clone(),
+        store.clone(),
+        sb_config.clone(),
+    )
+    .run(terminal)
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     ratatui::restore();
 
-    // 9. Tear down.
+    // 10. Tear down.
     let _ = supervisor.shutdown().await;
     if let Some(h) = server_handle {
         h.abort();
     }
 
-    tui_result.map_err(|e| AppError::Internal(e.to_string()).into())
+    Ok(())
 }
 
 /// Generate a random 20-char HTTP Basic password and write it to
