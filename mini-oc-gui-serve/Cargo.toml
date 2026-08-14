@@ -75,6 +75,10 @@ rand = "0.8"
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
+# Clipboard (copy selected log text). Pure-Rust on Windows (win32 API via
+# windows-sys), so it doesn't drag in a C compiler the way ring/aws-lc do.
+arboard = "3"
+
 # CLI parsing
 clap = { version = "4", features = ["derive", "env"] }
 
