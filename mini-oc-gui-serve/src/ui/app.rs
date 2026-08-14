@@ -134,6 +134,39 @@ impl ConfirmChoice {
     }
 }
 
+/// 鼠标点击目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickTarget {
+    /// 主菜单栏（服务与系统）第 i 项。
+    MainColumn(usize),
+    /// OC 项目栏第 i 项。
+    ProjectsColumn(usize),
+    /// 当前服务栏第 i 项。
+    ServicePanel(usize),
+    /// OC 项目子页面第 i 项。
+    SubPage(usize),
+    /// Header 设置按钮。
+    Settings,
+    /// 确认弹框的确认按钮。
+    ConfirmButton,
+    /// 确认弹框的取消按钮。
+    CancelButton,
+}
+
+/// 可点击区域（每帧渲染时记录）。
+#[derive(Debug, Clone, Copy)]
+struct ClickRegion {
+    rect: Rect,
+    target: ClickTarget,
+}
+
+/// 主菜单栏的列类型（用于记录点击目标）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnKind {
+    Main,
+    Projects,
+}
+
 /// Main TUI application state.
 pub struct TuiApp {
     /// Process supervisor (opencode + rathole).
@@ -193,6 +226,8 @@ pub struct TuiApp {
     sb_user_input: String,
     /// 设置：SB 密码输入缓冲。
     sb_password_input: String,
+    /// 当前帧的可点击区域（渲染时填充，鼠标事件查询）。
+    click_regions: Vec<ClickRegion>,
 }
 
 impl TuiApp {
@@ -263,6 +298,7 @@ impl TuiApp {
             sb_url_input: String::new(),
             sb_user_input: String::new(),
             sb_password_input: String::new(),
+            click_regions: Vec::new(),
         }
     }
 
@@ -290,6 +326,12 @@ impl TuiApp {
         // 启动后异步验证远端服务可用性。
         self.verify_remote();
 
+        // 启用鼠标捕获。
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableMouseCapture
+        );
+
         while !self.should_quit {
             tokio::select! {
                 _ = interval.tick() => {
@@ -298,12 +340,22 @@ impl TuiApp {
                     }
                 }
                 Some(Ok(ev)) = events.next() => {
-                    if let crossterm::event::Event::Key(k) = ev {
-                        self.handle_key(InputEvent::from(k)).await;
+                    match ev {
+                        crossterm::event::Event::Key(k) => {
+                            self.handle_key(InputEvent::from(k)).await;
+                        }
+                        crossterm::event::Event::Mouse(m) => {
+                            self.handle_mouse(m).await;
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture
+        );
         refresh_handle.abort();
         Ok(())
     }
@@ -334,6 +386,96 @@ impl TuiApp {
                 }
             }
         });
+    }
+
+    async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        match mouse.kind {
+            crossterm::event::MouseEventKind::Moved | crossterm::event::MouseEventKind::Drag(_) => {
+                self.hover_at(mouse.column, mouse.row);
+            }
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.click_at(mouse.column, mouse.row).await;
+            }
+            _ => {}
+        }
+    }
+
+    fn find_target(&self, col: u16, row: u16) -> Option<ClickTarget> {
+        self.click_regions
+            .iter()
+            .find(|r| {
+                r.rect.x <= col
+                    && col < r.rect.x + r.rect.width
+                    && r.rect.y <= row
+                    && row < r.rect.y + r.rect.height
+            })
+            .map(|r| r.target)
+    }
+
+    fn hover_at(&mut self, col: u16, row: u16) {
+        let Some(target) = self.find_target(col, row) else { return };
+        match target {
+            ClickTarget::MainColumn(i) => {
+                self.main_state.select(Some(i));
+                self.focus = Focus::Main;
+            }
+            ClickTarget::ProjectsColumn(i) => {
+                self.projects_state.select(Some(i));
+                self.focus = Focus::Projects;
+            }
+            ClickTarget::ServicePanel(i) => {
+                self.service_state.select(Some(i));
+                self.focus = Focus::ServicePanel;
+            }
+            ClickTarget::SubPage(i) => self.set_sub_page_selected(i),
+            _ => {}
+        }
+    }
+
+    async fn click_at(&mut self, col: u16, row: u16) {
+        let Some(target) = self.find_target(col, row) else { return };
+        match target {
+            ClickTarget::MainColumn(i) => {
+                self.main_state.select(Some(i));
+                self.focus = Focus::Main;
+                self.focus_select().await;
+            }
+            ClickTarget::ProjectsColumn(i) => {
+                self.projects_state.select(Some(i));
+                self.focus = Focus::Projects;
+                self.focus_select().await;
+            }
+            ClickTarget::ServicePanel(i) => {
+                self.service_state.select(Some(i));
+                self.focus = Focus::ServicePanel;
+                self.focus_select().await;
+            }
+            ClickTarget::SubPage(i) => {
+                self.set_sub_page_selected(i);
+                self.sub_page_select().await;
+            }
+            ClickTarget::Settings => self.open_settings(),
+            ClickTarget::ConfirmButton => {
+                let action = self.confirm.take();
+                if let Some(ConfirmAction::ExitService(i)) = action {
+                    self.exit_service(i);
+                }
+            }
+            ClickTarget::CancelButton => {
+                self.confirm = None;
+            }
+        }
+    }
+
+    fn set_sub_page_selected(&mut self, i: usize) {
+        if let Some(sub) = &mut self.sub_page {
+            match sub {
+                SubPage::Projects { list_state, .. } => list_state.select(Some(i)),
+                SubPage::Sessions { list_state, .. } => list_state.select(Some(i)),
+                SubPage::NewPathChoice { list_state } => list_state.select(Some(i)),
+                SubPage::ManualPath { .. } => {}
+            }
+        }
     }
 
     fn open_settings(&mut self) {
@@ -1204,6 +1346,8 @@ impl TuiApp {
             return;
         }
 
+        self.click_regions.clear();
+
         // 进入 OC 项目子页面时隐藏日志框，给列表腾出空间。
         let hide_logs = self.sub_page.is_some();
         let chunks = if hide_logs {
@@ -1249,6 +1393,10 @@ impl TuiApp {
             )])),
             header_cols[1],
         );
+        self.click_regions.push(ClickRegion {
+            rect: header_cols[1],
+            target: ClickTarget::Settings,
+        });
 
         // 操作空间
         if self.sub_page.is_some() {
@@ -1409,7 +1557,7 @@ impl TuiApp {
         frame.render_widget(form, rect);
     }
 
-    fn render_confirm(&self, frame: &mut Frame<'_>) {
+    fn render_confirm(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let w = 44u16;
         let h = 5u16;
@@ -1444,6 +1592,16 @@ impl TuiApp {
         let para = Paragraph::new(lines).block(block);
         frame.render_widget(Clear, rect);
         frame.render_widget(para, rect);
+
+        let btn_y = rect.y + 3;
+        self.click_regions.push(ClickRegion {
+            rect: Rect::new(rect.x + 1, btn_y, 11, 1),
+            target: ClickTarget::ConfirmButton,
+        });
+        self.click_regions.push(ClickRegion {
+            rect: Rect::new(rect.x + 13, btn_y, 11, 1),
+            target: ClickTarget::CancelButton,
+        });
     }
 
     fn render_menu_area(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1470,6 +1628,8 @@ impl TuiApp {
             &status,
             main_focused,
             &mut self.main_state,
+            &mut self.click_regions,
+            ColumnKind::Main,
         );
         Self::render_card_column(
             frame,
@@ -1479,6 +1639,8 @@ impl TuiApp {
             &status,
             projects_focused,
             &mut self.projects_state,
+            &mut self.click_regions,
+            ColumnKind::Projects,
         );
         Self::render_service_panel(
             frame,
@@ -1487,6 +1649,7 @@ impl TuiApp {
             &sessions,
             panel_focused,
             &mut self.service_state,
+            &mut self.click_regions,
         );
     }
 
@@ -1498,6 +1661,8 @@ impl TuiApp {
         status: &ServeStatus,
         focused: bool,
         state: &mut ListState,
+        regions: &mut Vec<ClickRegion>,
+        kind: ColumnKind,
     ) {
         let outer = Block::default()
             .title(title)
@@ -1513,6 +1678,11 @@ impl TuiApp {
                 break;
             }
             let card_area = Rect::new(inner.x, y, inner.width, card_h);
+            let target = match kind {
+                ColumnKind::Main => ClickTarget::MainColumn(i),
+                ColumnKind::Projects => ClickTarget::ProjectsColumn(i),
+            };
+            regions.push(ClickRegion { rect: card_area, target });
             let selected = focused && state.selected() == Some(i);
             let border_style = if selected {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -1536,6 +1706,7 @@ impl TuiApp {
         sessions: &[AttachedSession],
         focused: bool,
         state: &mut ListState,
+        regions: &mut Vec<ClickRegion>,
     ) {
         let now = chrono::Utc::now().timestamp();
         let mut cards: Vec<Vec<Line<'static>>> = Vec::new();
@@ -1591,6 +1762,7 @@ impl TuiApp {
                 break;
             }
             let card_area = Rect::new(inner.x, y, inner.width, card_h);
+            regions.push(ClickRegion { rect: card_area, target: ClickTarget::ServicePanel(i) });
             let selected = focused && state.selected() == Some(i);
             let border_style = if selected {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -1658,7 +1830,7 @@ impl TuiApp {
                 for p in projects.iter() {
                     cards.push(Self::project_card(p));
                 }
-                Self::render_card_stack(frame, area, &crumb, &cards, list_state);
+                Self::render_card_stack(frame, area, &crumb, &cards, list_state, &mut self.click_regions);
             }
             Some(SubPage::Sessions { list_state, sessions, project }) => {
                 let mut cards: Vec<Vec<Line<'static>>> = vec![Self::new_session_card()];
@@ -1667,7 +1839,7 @@ impl TuiApp {
                 }
                 cards.push(Self::delete_card());
                 let header = format!("{} -> {}", crumb, project);
-                Self::render_card_stack(frame, area, &header, &cards, list_state);
+                Self::render_card_stack(frame, area, &header, &cards, list_state, &mut self.click_regions);
             }
             Some(SubPage::NewPathChoice { list_state }) => {
                 let cards: Vec<Vec<Line<'static>>> = vec![
@@ -1694,7 +1866,7 @@ impl TuiApp {
                         Line::from(""),
                     ],
                 ];
-                Self::render_card_stack(frame, area, &crumb, &cards, list_state);
+                Self::render_card_stack(frame, area, &crumb, &cards, list_state, &mut self.click_regions);
             }
             Some(SubPage::ManualPath { input, error }) => {
                 let mut lines: Vec<Line<'_>> = vec![
@@ -1741,6 +1913,7 @@ impl TuiApp {
         title: &str,
         cards: &[Vec<Line<'static>>],
         state: &mut ListState,
+        regions: &mut Vec<ClickRegion>,
     ) {
         let title_area = Rect::new(area.x, area.y, area.width, 1);
         frame.render_widget(
@@ -1767,6 +1940,7 @@ impl TuiApp {
         let end = (scroll + visible_count).min(cards.len());
         for idx in scroll..end {
             let card_area = Rect::new(area.x, y, area.width, card_h);
+            regions.push(ClickRegion { rect: card_area, target: ClickTarget::SubPage(idx) });
             let is_selected = state.selected() == Some(idx);
             let border_style = if is_selected {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
