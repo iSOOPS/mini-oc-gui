@@ -4,5 +4,5 @@ pub mod app;
 pub mod events;
 pub mod menu;
 
-pub use app::TuiApp;
+pub use app::{LogLine, TuiApp, TuiLogSink, TuiLogSinkFactory};
 pub use menu::{MenuAction, MenuItem};

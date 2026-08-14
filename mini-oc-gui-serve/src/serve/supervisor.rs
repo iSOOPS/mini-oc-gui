@@ -211,7 +211,7 @@ async fn is_port_busy(port: u16) -> bool {
 }
 
 /// Cross-platform graceful terminate: SIGTERM + 5s grace + SIGKILL on Unix,
-/// immediate kill on Windows.
+/// process-tree kill on Windows.
 async fn terminate_gracefully(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -234,5 +234,26 @@ async fn terminate_gracefully(child: &mut tokio::process::Child) {
             }
         }
     }
+
+    // Windows: `Child::kill` only calls TerminateProcess on the *direct*
+    // child. `opencode serve` (a Node process) commonly spawns its own
+    // children that keep the port bound, so killing the parent alone leaks
+    // the port. `taskkill /T /F` walks and force-kills the whole tree, which
+    // is what actually releases the listener.
+    #[cfg(windows)]
+    {
+        if let Some(pid) = child.id() {
+            if let Ok(out) = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output()
+            {
+                tracing::debug!(
+                    "taskkill /T /F {pid}: {}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+            }
+        }
+    }
+
     let _ = child.kill().await;
 }
