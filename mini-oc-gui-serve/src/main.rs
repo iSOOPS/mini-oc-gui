@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use mini_oc_gui_serve::{
     auth::AuthConfig,
-    config::SbConfig,
+    config::{RatholeConfig, SbConfig},
     error::AppError,
     handlers::{AppState, router},
     serve::ServeSupervisor,
@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
     let cache = FileCache::new(&path_list_file);
     let store = PathListStore::new(cache);
     let sb_config = Arc::new(std::sync::RwLock::new(SbConfig::load()));
+    let rathole_config = Arc::new(std::sync::RwLock::new(RatholeConfig::load()));
     if let Ok(cfg) = sb_config.read() {
         if cfg.is_configured() {
             let remote = RemoteClient::with_credentials(cfg.url.clone(), cfg.user.clone(), cfg.password.clone());
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
         log_buffer.clone(),
         store.clone(),
         sb_config.clone(),
+        rathole_config.clone(),
     )
     .run(terminal)
     .await

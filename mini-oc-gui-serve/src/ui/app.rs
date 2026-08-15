@@ -17,7 +17,7 @@ use ratatui::{
 
 use crate::attach::{AttachedSession, OcSession, OpencodeClient, choose_folder, spawn_in_new_terminal};
 use crate::auth::AuthConfig;
-use crate::config::{SbConfig, SB_ENV_FILE};
+use crate::config::{RatholeConfig, RATHOLE_CONFIG_FILE, RATHOLE_ENV_FILE, SbConfig, SB_ENV_FILE};
 use crate::domain::{PathEntry, PathValidator};
 use crate::serve::{
     ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
@@ -56,6 +56,30 @@ enum InputMode {
     SettingsUser,
     /// 设置：SilverBullet 密码。
     SettingsPassword,
+    /// 设置：rathole 远端 Host。
+    SettingsRatholeHost,
+    /// 设置：rathole 远端 Port。
+    SettingsRatholePort,
+    /// 设置：rathole 服务名 Name。
+    SettingsRatholeName,
+    /// 设置：rathole 鉴权 Token。
+    SettingsRatholeToken,
+}
+
+impl InputMode {
+    /// 是否为设置面板的某个字段（SB 或 Rathole）。
+    fn is_settings_field(self) -> bool {
+        matches!(
+            self,
+            InputMode::SettingsUrl
+                | InputMode::SettingsUser
+                | InputMode::SettingsPassword
+                | InputMode::SettingsRatholeHost
+                | InputMode::SettingsRatholePort
+                | InputMode::SettingsRatholeName
+                | InputMode::SettingsRatholeToken
+        )
+    }
 }
 
 /// 主菜单模式下的焦点位置（三个栏）。
@@ -118,6 +142,8 @@ enum SelectAction {
 enum ConfirmAction {
     /// 杀死/关闭「当前服务」栏第 i 个服务。
     ExitService(usize),
+    /// 未启动 serve 时仍进入 OC 项目流程（无远程服务支持）。
+    EnterProjectsWithoutServe,
 }
 
 /// 确认弹框的按钮选中态。
@@ -228,6 +254,16 @@ pub struct TuiApp {
     sb_user_input: String,
     /// 设置：SB 密码输入缓冲。
     sb_password_input: String,
+    /// rathole 全局配置（设置弹框热更新 + 生成 global.toml）.
+    rathole_config: Arc<RwLock<RatholeConfig>>,
+    /// 设置：rathole Host 输入缓冲。
+    rathole_host_input: String,
+    /// 设置：rathole Port 输入缓冲。
+    rathole_port_input: String,
+    /// 设置：rathole Name 输入缓冲。
+    rathole_name_input: String,
+    /// 设置：rathole Token 输入缓冲。
+    rathole_token_input: String,
     /// 当前帧的可点击区域（渲染时填充，鼠标事件查询）。
     click_regions: Vec<ClickRegion>,
 }
@@ -241,6 +277,7 @@ impl TuiApp {
         log_buffer: LogBuffer,
         store: Arc<PathListStore>,
         sb_config: Arc<RwLock<SbConfig>>,
+        rathole_config: Arc<RwLock<RatholeConfig>>,
     ) -> Self {
         let mut main_state = ListState::default();
         main_state.select(Some(0));
@@ -300,6 +337,11 @@ impl TuiApp {
             sb_url_input: String::new(),
             sb_user_input: String::new(),
             sb_password_input: String::new(),
+            rathole_config,
+            rathole_host_input: String::new(),
+            rathole_port_input: String::new(),
+            rathole_name_input: String::new(),
+            rathole_token_input: String::new(),
             click_regions: Vec::new(),
         }
     }
@@ -459,8 +501,12 @@ impl TuiApp {
             ClickTarget::Settings => self.open_settings(),
             ClickTarget::ConfirmButton => {
                 let action = self.confirm.take();
-                if let Some(ConfirmAction::ExitService(i)) = action {
-                    self.exit_service(i);
+                match action {
+                    Some(ConfirmAction::ExitService(i)) => self.exit_service(i),
+                    Some(ConfirmAction::EnterProjectsWithoutServe) => {
+                        self.enter_projects().await;
+                    }
+                    None => {}
                 }
             }
             ClickTarget::CancelButton => {
@@ -485,6 +531,11 @@ impl TuiApp {
         self.sb_url_input = cfg.url;
         self.sb_user_input = cfg.user;
         self.sb_password_input = cfg.password;
+        let rc = self.rathole_config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        self.rathole_host_input = rc.host;
+        self.rathole_port_input = rc.port;
+        self.rathole_name_input = rc.name;
+        self.rathole_token_input = rc.token;
         self.input_mode = InputMode::SettingsUrl;
     }
 
@@ -501,12 +552,28 @@ impl TuiApp {
                 InputMode::SettingsPassword => {
                     self.sb_password_input.pop();
                 }
+                InputMode::SettingsRatholeHost => {
+                    self.rathole_host_input.pop();
+                }
+                InputMode::SettingsRatholePort => {
+                    self.rathole_port_input.pop();
+                }
+                InputMode::SettingsRatholeName => {
+                    self.rathole_name_input.pop();
+                }
+                InputMode::SettingsRatholeToken => {
+                    self.rathole_token_input.pop();
+                }
                 _ => {}
             },
             InputEvent::Char(c) => match self.input_mode {
                 InputMode::SettingsUrl => self.sb_url_input.push(c),
                 InputMode::SettingsUser => self.sb_user_input.push(c),
                 InputMode::SettingsPassword => self.sb_password_input.push(c),
+                InputMode::SettingsRatholeHost => self.rathole_host_input.push(c),
+                InputMode::SettingsRatholePort => self.rathole_port_input.push(c),
+                InputMode::SettingsRatholeName => self.rathole_name_input.push(c),
+                InputMode::SettingsRatholeToken => self.rathole_token_input.push(c),
                 _ => {}
             },
             InputEvent::Select => self.submit_settings().await,
@@ -521,19 +588,72 @@ impl TuiApp {
         self.input_mode = match self.input_mode {
             InputMode::SettingsUrl => InputMode::SettingsUser,
             InputMode::SettingsUser => InputMode::SettingsPassword,
-            InputMode::SettingsPassword => InputMode::SettingsUrl,
+            InputMode::SettingsPassword => InputMode::SettingsRatholeHost,
+            InputMode::SettingsRatholeHost => InputMode::SettingsRatholePort,
+            InputMode::SettingsRatholePort => InputMode::SettingsRatholeName,
+            InputMode::SettingsRatholeName => InputMode::SettingsRatholeToken,
+            InputMode::SettingsRatholeToken => InputMode::SettingsUrl,
             other => other,
         };
     }
 
     async fn submit_settings(&mut self) {
+        // ---- 1. Rathole 配置：校验 + 写 env + 生成 global.toml ----
+        let rc = RatholeConfig {
+            host: self.rathole_host_input.trim().to_string(),
+            port: self.rathole_port_input.trim().to_string(),
+            name: self.rathole_name_input.trim().to_string(),
+            token: self.rathole_token_input.clone(),
+        };
+        let rc_filled = [&rc.host, &rc.port, &rc.name, &rc.token]
+            .iter()
+            .all(|s| !s.is_empty());
+        let rc_empty = [&rc.host, &rc.port, &rc.name, &rc.token]
+            .iter()
+            .all(|s| s.is_empty());
+        if !rc_filled && !rc_empty {
+            *self.status_message.lock().unwrap() =
+                "❌ Rathole 配置需全部填写或全部留空".to_string();
+            return;
+        }
+        let mut rathole_msg = String::new();
+        if rc_filled {
+            let ok_port = rc.port.parse::<u16>().map(|p| p > 0).unwrap_or(false);
+            if !ok_port {
+                *self.status_message.lock().unwrap() =
+                    "❌ Rathole Port 无效（1-65535）".to_string();
+                return;
+            }
+            let host = rc.host.clone();
+            let port = rc.port.clone();
+            // local_addr 端口 = 当前已启动 serve 的端口，否则回退 DEFAULT_PORT。
+            let local_port = self
+                .status_snapshot()
+                .port
+                .map(|p| p.to_string())
+                .or_else(|| std::env::var("DEFAULT_PORT").ok())
+                .unwrap_or_else(|| "9464".to_string());
+            if let Err(e) = rc.write_env_file(Path::new(RATHOLE_ENV_FILE)) {
+                *self.status_message.lock().unwrap() =
+                    format!("❌ Rathole 配置写入失败：{e}");
+                return;
+            }
+            if let Err(e) = rc.write_config_file(Path::new(RATHOLE_CONFIG_FILE), &local_port) {
+                *self.status_message.lock().unwrap() =
+                    format!("❌ 生成 global.toml 失败：{e}");
+                return;
+            }
+            *self.rathole_config.write().unwrap_or_else(|e| e.into_inner()) = rc;
+            rathole_msg = format!("Rathole → {host}:{port}（已生成 global.toml）");
+        }
+
+        // ---- 2. SB 配置：连接测试成功才写文件 + 更新内存 ----
         let cfg = SbConfig {
             url: self.sb_url_input.trim().to_string(),
             user: self.sb_user_input.trim().to_string(),
             password: self.sb_password_input.clone(),
         };
 
-        // 连接测试：成功才写文件 + 更新内存。
         let mut remote = RemoteClient::with_credentials(
             cfg.url.clone(),
             cfg.user.clone(),
@@ -542,10 +662,15 @@ impl TuiApp {
         let test_result = remote.get("/serv/opencode/path-list.md").await;
         let connected = matches!(&test_result, Ok((status, _)) if (200..400).contains(status));
         if !connected {
-            let msg = match &test_result {
+            let base = match &test_result {
                 Ok((0, _)) => "❌ 连接测试失败：无法访问远端（网络/超时），未保存".to_string(),
                 Ok((status, _)) => format!("❌ 连接测试失败：HTTP {status}，未保存"),
                 Err(e) => format!("❌ 连接测试失败：{e}，未保存"),
+            };
+            let msg = if rathole_msg.is_empty() {
+                base
+            } else {
+                format!("{base}（但 {rathole_msg} 已保存）")
             };
             *self.status_message.lock().unwrap() = msg;
             return;
@@ -572,11 +697,16 @@ impl TuiApp {
             }
         });
         self.input_mode = InputMode::Menu;
-        let msg = match write_result {
+        let sb_msg = match write_result {
             Ok(()) => "✅ 设置已保存".to_string(),
             Err(e) => format!("⚠️ 连接成功但写文件失败：{e}"),
         };
-        *self.status_message.lock().unwrap() = msg;
+        let final_msg = if rathole_msg.is_empty() {
+            sb_msg
+        } else {
+            format!("{sb_msg}；{rathole_msg}")
+        };
+        *self.status_message.lock().unwrap() = final_msg;
         self.verify_remote();
     }
 
@@ -588,10 +718,18 @@ impl TuiApp {
                 }
                 InputEvent::Select => {
                     let action = self.confirm.take();
-                    if let Some(ConfirmAction::ExitService(i)) = action {
-                        if self.confirm_choice == ConfirmChoice::Confirm {
-                            self.exit_service(i);
+                    match action {
+                        Some(ConfirmAction::ExitService(i)) => {
+                            if self.confirm_choice == ConfirmChoice::Confirm {
+                                self.exit_service(i);
+                            }
                         }
+                        Some(ConfirmAction::EnterProjectsWithoutServe) => {
+                            if self.confirm_choice == ConfirmChoice::Confirm {
+                                self.enter_projects().await;
+                            }
+                        }
+                        None => {}
                     }
                 }
                 InputEvent::Quit | InputEvent::Char('q') => {
@@ -627,9 +765,7 @@ impl TuiApp {
             }
             InputMode::ConfigPort => self.handle_port_key(event),
             InputMode::ServePort => self.handle_serve_port_key(event).await,
-            InputMode::SettingsUrl | InputMode::SettingsUser | InputMode::SettingsPassword => {
-                self.handle_settings_key(event).await
-            }
+            _ => self.handle_settings_key(event).await,
         }
     }
 
@@ -793,8 +929,9 @@ impl TuiApp {
             self.attach_url = format!("http://127.0.0.1:{port}");
             self.enter_projects().await;
         } else {
-            self.port_input = "9464".to_string();
-            self.input_mode = InputMode::ServePort;
+            // serve 未启动：弹确认框提示（默认选中「取消」）。
+            self.confirm = Some(ConfirmAction::EnterProjectsWithoutServe);
+            self.confirm_choice = ConfirmChoice::Cancel;
         }
     }
 
@@ -1356,7 +1493,7 @@ impl TuiApp {
                 .constraints([
                     Constraint::Length(3), // Header
                     Constraint::Min(8),    // 操作空间
-                    Constraint::Length(6), // 状态
+                    Constraint::Length(7), // 状态
                 ])
                 .split(frame.area())
         } else {
@@ -1366,7 +1503,7 @@ impl TuiApp {
                     Constraint::Length(3),  // Header
                     Constraint::Min(8),     // 操作空间
                     Constraint::Length(10), // 日志记录
-                    Constraint::Length(6),  // 状态
+                    Constraint::Length(7),  // 状态
                 ])
                 .split(frame.area())
         };
@@ -1403,16 +1540,11 @@ impl TuiApp {
             self.render_sub_page(frame, chunks[1]);
         } else {
             match self.input_mode {
-                InputMode::Menu
-                | InputMode::ConfigPort
-                | InputMode::ServePort
-                | InputMode::SettingsUrl
-                | InputMode::SettingsUser
-                | InputMode::SettingsPassword => {
-                    self.render_menu_area(frame, chunks[1])
-                }
                 InputMode::ConfigUsername | InputMode::ConfigPassword => {
                     self.render_config_form(frame, chunks[1])
+                }
+                _ => {
+                    self.render_menu_area(frame, chunks[1])
                 }
             }
         }
@@ -1429,10 +1561,7 @@ impl TuiApp {
             self.render_port_popup(frame);
         }
 
-        if matches!(
-            self.input_mode,
-            InputMode::SettingsUrl | InputMode::SettingsUser | InputMode::SettingsPassword
-        ) {
+        if self.input_mode.is_settings_field() {
             self.render_settings_popup(frame);
         }
 
@@ -1445,6 +1574,15 @@ impl TuiApp {
         let pid = std::process::id();
         let now = chrono::Local::now();
         let duration = (now - self.program_started_at).num_seconds().max(0);
+        let op = self.status_message.lock().unwrap().clone();
+        let rathole_state = {
+            let rc = self.rathole_config.read().unwrap_or_else(|e| e.into_inner());
+            if rc.is_configured() {
+                format!("Rathole: ✅ {}:{}（{}）", rc.host, rc.port, rc.name)
+            } else {
+                "Rathole: 未配置（请在设置中填写 Host/Port/Name/Token）".to_string()
+            }
+        };
         let remote = self.remote_status.lock().unwrap().clone();
         let help = self.help_text();
         let status_text = vec![
@@ -1452,6 +1590,14 @@ impl TuiApp {
                 "PID: {pid}    启动时间: {}    运行时长: {}",
                 self.program_started_at.format("%H:%M:%S"),
                 Self::format_duration(duration),
+            )),
+            Line::from(Span::styled(
+                op,
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                rathole_state,
+                Style::default().fg(Color::Cyan),
             )),
             Line::from(Span::styled(
                 if remote.is_empty() {
@@ -1497,19 +1643,17 @@ impl TuiApp {
             InputMode::ConfigPort | InputMode::ServePort => {
                 "输入数字  回车确认  Esc 取消".to_string()
             }
-            InputMode::SettingsUrl | InputMode::SettingsUser | InputMode::SettingsPassword => {
-                "Tab 切换字段  回车保存  Esc 取消".to_string()
-            }
             InputMode::Menu => {
                 "↑/↓ 选择  Tab/←/→ 切换栏  回车确认  s 设置  l 日志  Esc/q 退出".to_string()
             }
+            _ => "Tab 切换字段  回车保存  Esc 取消".to_string(),
         }
     }
 
     fn render_settings_popup(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let w = 60u16;
-        let h = 9u16;
+        let w = 66u16;
+        let h = 16u16;
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
         let rect = Rect::new(x, y, w, h);
@@ -1522,6 +1666,10 @@ impl TuiApp {
         let url_style = if self.input_mode == InputMode::SettingsUrl { active } else { inactive };
         let user_style = if self.input_mode == InputMode::SettingsUser { active } else { inactive };
         let pass_style = if self.input_mode == InputMode::SettingsPassword { active } else { inactive };
+        let host_style = if self.input_mode == InputMode::SettingsRatholeHost { active } else { inactive };
+        let port_style = if self.input_mode == InputMode::SettingsRatholePort { active } else { inactive };
+        let name_style = if self.input_mode == InputMode::SettingsRatholeName { active } else { inactive };
+        let token_style = if self.input_mode == InputMode::SettingsRatholeToken { active } else { inactive };
 
         let lines = vec![
             Line::from(Span::styled(
@@ -1543,6 +1691,28 @@ impl TuiApp {
             ]),
             Line::from(""),
             Line::from(Span::styled(
+                "Rathole 内网穿透设置",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Host:   "),
+                Span::styled(self.rathole_host_input.clone(), host_style),
+            ]),
+            Line::from(vec![
+                Span::raw("  Port:   "),
+                Span::styled(self.rathole_port_input.clone(), port_style),
+            ]),
+            Line::from(vec![
+                Span::raw("  Name:   "),
+                Span::styled(self.rathole_name_input.clone(), name_style),
+            ]),
+            Line::from(vec![
+                Span::raw("  Token:  "),
+                Span::styled(self.rathole_token_input.clone(), token_style),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
                 "  Tab 切换字段  Enter 保存  Esc 取消",
                 Style::default().fg(Color::DarkGray),
             )),
@@ -1558,9 +1728,21 @@ impl TuiApp {
     }
 
     fn render_confirm(&mut self, frame: &mut Frame<'_>) {
+        let (msg_lines, w, h): (Vec<&str>, u16, u16) = match self.confirm {
+            Some(ConfirmAction::ExitService(_)) => {
+                (vec!["确认杀死/关闭该服务？"], 44, 5)
+            }
+            Some(ConfirmAction::EnterProjectsWithoutServe) => (
+                vec![
+                    "未启动 OpenCode Serve",
+                    "直接启动项目将无法支持远程服务，仍要继续吗？",
+                ],
+                68,
+                7,
+            ),
+            None => return,
+        };
         let area = frame.area();
-        let w = 44u16;
-        let h = 5u16;
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
         let rect = Rect::new(x, y, w, h);
@@ -1584,16 +1766,15 @@ impl TuiApp {
             if cancel_selected { selected_style } else { Style::default() },
         );
 
-        let lines = vec![
-            Line::from("确认杀死/关闭该服务？"),
-            Line::from(""),
-            Line::from(vec![confirm_btn, Span::raw("   "), cancel_btn]),
-        ];
+        let msg_count = msg_lines.len();
+        let mut lines: Vec<Line<'_>> = msg_lines.into_iter().map(Line::from).collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![confirm_btn, Span::raw("   "), cancel_btn]));
         let para = Paragraph::new(lines).block(block);
         frame.render_widget(Clear, rect);
         frame.render_widget(para, rect);
 
-        let btn_y = rect.y + 3;
+        let btn_y = rect.y + 2 + msg_count as u16;
         self.click_regions.push(ClickRegion {
             rect: Rect::new(rect.x + 1, btn_y, 11, 1),
             target: ClickTarget::ConfirmButton,

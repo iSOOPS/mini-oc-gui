@@ -109,7 +109,7 @@ If nothing is found, the program prints a clear error pointing to the expected f
 | `OC_CONFIG_DIR`        | `$HOME/.config/opencode`      | opencode config dir |
 | `OC_CACHE_DIR`         | `$HOME/.cache/opencode`       | opencode cache dir |
 | `RATHOLE_BIN`          | `rathole/bin/macos/rathole` (macOS) / `rathole/bin/windows/rathole.exe` (Windows) | rathole binary path (platform-aware) |
-| `RATHOLE_CONFIG`       | `rathole/settings/33-9464.toml` | rathole tunnel config |
+| `RATHOLE_CONFIG`       | `rathole/settings/global.toml` | rathole tunnel config（由设置面板生成） |
 | `OC_OMO_SKIP_VERIFY`   | `0`                           | Skip omo upgrade verification |
 | `RUST_LOG`             | `info`                        | tracing-subscriber filter |
 
