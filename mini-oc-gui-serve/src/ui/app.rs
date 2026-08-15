@@ -19,7 +19,9 @@ use crate::attach::{AttachedSession, OcSession, OpencodeClient, choose_folder, s
 use crate::auth::AuthConfig;
 use crate::config::{SbConfig, SB_ENV_FILE};
 use crate::domain::{PathEntry, PathValidator};
-use crate::serve::{ServeStatus, ServeSupervisor};
+use crate::serve::{
+    ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
+};
 use crate::storage::PathListStore;
 use crate::storage::remote::RemoteClient;
 use crate::ui::events::InputEvent;
@@ -872,10 +874,8 @@ impl TuiApp {
     fn launch_rathole(&mut self) {
         let status = self.status_message.clone();
         *status.lock().unwrap() = "🚀 正在启动 rathole…".to_string();
-        let bin = std::env::var("RATHOLE_BIN")
-            .unwrap_or_else(|_| "../rathole/rathole/rathole".to_string());
-        let config = std::env::var("RATHOLE_CONFIG")
-            .unwrap_or_else(|_| "../rathole/settings/33-9464.toml".to_string());
+        let bin = rathole_default_bin();
+        let config = rathole_default_config();
         let supervisor = self.supervisor.clone();
         tokio::spawn(async move {
             let msg = match supervisor.launch_rathole(&bin, &config).await {

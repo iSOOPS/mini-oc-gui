@@ -28,7 +28,18 @@ src/
 ├── serve/               # OpenCode + Rathole process supervisor
 ├── upgrade/             # OpenCode + omo upgrade flow
 └── ui/                  # ratatui TUI (replaces gum)
+
+rathole/                  # Bundled rathole tunnel binary + configs
+├── bin/
+│   ├── macos/rathole     # macOS (aarch64-apple-darwin) binary
+│   └── windows/rathole.exe # Windows binary (see rathole/bin/windows/README.md)
+└── settings/*.toml       # tunnel configs (33-/40-/41- prefix = different remotes)
 ```
+
+The bundled `rathole/` directory is resolved platform-aware at compile time
+(`serve/rathole.rs`): a macOS build picks `bin/macos/rathole`, a Windows build
+picks `bin/windows/rathole.exe`. Override either path via `RATHOLE_BIN` /
+`RATHOLE_CONFIG`.
 
 ## Quickstart
 
@@ -97,8 +108,8 @@ If nothing is found, the program prints a clear error pointing to the expected f
 | `SB_USER` / `SB_PASSWORD` | —                          | SilverBullet credentials |
 | `OC_CONFIG_DIR`        | `$HOME/.config/opencode`      | opencode config dir |
 | `OC_CACHE_DIR`         | `$HOME/.cache/opencode`       | opencode cache dir |
-| `RATHOLE_BIN`          | `../rathole/rathole/rathole`  | rathole binary path |
-| `RATHOLE_CONFIG`       | `../rathole/settings/33-9464.toml` | rathole config |
+| `RATHOLE_BIN`          | `rathole/bin/macos/rathole` (macOS) / `rathole/bin/windows/rathole.exe` (Windows) | rathole binary path (platform-aware) |
+| `RATHOLE_CONFIG`       | `rathole/settings/33-9464.toml` | rathole tunnel config |
 | `OC_OMO_SKIP_VERIFY`   | `0`                           | Skip omo upgrade verification |
 | `RUST_LOG`             | `info`                        | tracing-subscriber filter |
 

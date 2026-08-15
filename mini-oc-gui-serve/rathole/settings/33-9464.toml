@@ -1,0 +1,9 @@
+# client.toml
+[client]
+# 服务器的地址。端口必须与 `server.bind_addr` 中的端口相同。
+remote_addr = "8.159.159.138:2333" 
+[client.services.service-office-mac]
+# 必须与服务器相同以通过验证
+token = "pAG0FG3hvxJiw62shlqCjHSDyENYcXYYIMYKiqAyYWKBwdSz0R4qQQ0lM3" 
+# 需要被转发的服务的地址
+local_addr = "127.0.0.1:9464" 
