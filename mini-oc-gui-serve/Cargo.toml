@@ -34,8 +34,10 @@ futures = "0.3"
 async-trait = "0.1"
 
 # HTTP client (remote SilverBullet sync + opencode serve API).
-# TLS 通过 rustls（纯 Rust）提供，使 HTTPS 远端（如 md.isoops.com）可用。
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# TLS 走 native-tls：Windows 上落到系统 SChannel、macOS 上落到 SecureTransport，
+# 二者都是纯 Rust 绑定，无需 C 编译器。rustls 的默认加密后端 `ring` 需要
+# gcc/cl 编译 C 与汇编，在无 C 编译器的最小 GNU 工具链上无法构建。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -94,6 +96,14 @@ fs2 = "0.4"
 # `dlltool` to generate a def file; disabling the `std` feature uses
 # the pure-Rust fallback instead.
 getrandom = { version = "0.2", default-features = false }
+
+# Pin schannel to 0.1.27: 0.1.28+ switched to windows-sys 0.61, whose
+# `windows-link` backend generates import libs by shelling out to `dlltool`
+# on Windows-GNU. Our minimal GNU toolchain ships `rust-lld` but no MinGW
+# binutils (`dlltool`/`gcc`), so 0.1.27 (windows-sys 0.59, which bundles
+# prebuilt .lib import libs) is required to stay binutils/C-compiler-free.
+[target.'cfg(windows)'.dependencies]
+schannel = "=0.1.27"
 
 [dev-dependencies]
 tempfile = "3"

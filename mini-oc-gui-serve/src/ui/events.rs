@@ -1,6 +1,6 @@
 //! Keyboard event normalization.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// A high-level input event consumed by the TUI loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,13 @@ pub enum InputEvent {
 
 impl From<KeyEvent> for InputEvent {
     fn from(k: KeyEvent) -> Self {
+        // Windows 控制台会为一次按键产生 Press 与 Release 两个事件（macOS 的
+        // termios 只报 Press）。若不过滤，Esc 会被处理两次：第一次关闭弹窗、
+        // 第二次（Release）又被当成菜单退出键，表现为「弹窗按 Esc 直接退出程序」。
+        // 这里只保留 Press，忽略 Release / Repeat。
+        if k.kind != KeyEventKind::Press {
+            return Self::Other;
+        }
         match k.code {
             KeyCode::Up => Self::Up,
             KeyCode::Down => Self::Down,

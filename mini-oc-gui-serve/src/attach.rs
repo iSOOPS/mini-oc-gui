@@ -81,15 +81,101 @@ pub fn spawn_in_new_terminal(command: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// 在 Windows Terminal 新标签页执行命令。
+///
+/// 优先 `wt.exe` 新标签；未安装 Windows Terminal 时回退 `cmd /c start`
+/// 新控制台窗口，保证功能可用。
+#[cfg(target_os = "windows")]
+pub fn spawn_in_new_terminal(command: &str) -> Result<(), String> {
+    let wt = std::process::Command::new("wt.exe")
+        .arg("-w")
+        .arg("0")
+        .arg("new-tab")
+        .arg("--")
+        .arg(command)
+        .spawn();
+    if wt.is_ok() {
+        return Ok(());
+    }
+
+    // 回退：传统 cmd 新窗口。`start` 的第一个空串是窗口标题占位，
+    // 防止 command 里的引号被误当成标题。
+    std::process::Command::new("cmd.exe")
+        .args(["/c", "start", "", command])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开新终端：{e}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn spawn_in_new_terminal(_command: &str) -> Result<(), String> {
-    Err("新终端标签页打开仅在 macOS 上受支持".to_string())
+    Err("新终端标签页打开仅在 macOS / Windows 上受支持".to_string())
+}
+
+/// 构造 attach 会话的「PID 文件路径 + 在新终端执行的命令」（跨平台）。
+///
+/// macOS：`bash -c 'echo $$ > pidfile; exec opencode attach ...'`（`$$` 即
+/// opencode 进程 PID，`kill -9` 可直接终止）。
+/// Windows：PowerShell 写自身 `$PID` 到 pidfile 再 `opencode attach`（作为
+/// 子进程），`taskkill /PID <pid> /T /F` 终止整棵进程树。
+#[cfg(target_os = "windows")]
+pub fn attach_launch_spec(
+    url: &str,
+    directory: &str,
+    session: &str,
+    user: &str,
+    password: &str,
+) -> (String, String) {
+    let pid_file = std::env::temp_dir()
+        .join(format!("oc-attach-{session}.pid"))
+        .to_string_lossy()
+        .into_owned();
+    // PowerShell 脚本：写自身 PID，再运行 opencode attach。
+    let script = format!(
+        "$PID | Set-Content -Encoding ascii '{pid_file}'; opencode attach '{url}' --dir '{directory}' --session '{session}' -u '{user}' -p '{password}'"
+    );
+    let command = format!("powershell -NoProfile -Command \"{script}\"");
+    (pid_file, command)
+}
+
+/// macOS / Linux 版：保持原有 `bash -c` 方案不变。
+#[cfg(not(target_os = "windows"))]
+pub fn attach_launch_spec(
+    url: &str,
+    directory: &str,
+    session: &str,
+    user: &str,
+    password: &str,
+) -> (String, String) {
+    let pid_file = format!("/tmp/oc-attach-{session}.pid");
+    let attach_cmd = format!(
+        "opencode attach \"{url}\" --dir \"{directory}\" --session \"{session}\" -u \"{user}\" -p \"{password}\""
+    );
+    let command = format!("bash -c 'echo $$ > {pid_file}; exec {attach_cmd}'");
+    (pid_file, command)
+}
+
+/// 按 PID 终止进程（跨平台）。attach 会话的「杀掉会话」用。
+#[cfg(target_os = "windows")]
+pub fn kill_process(pid: i32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn kill_process(pid: i32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status();
 }
 
 /// 弹出 macOS 目录选择对话框（Finder），返回用户选择的目录路径。
 ///
 /// # Errors
 /// 返回可读的错误消息（如用户取消）。
+#[cfg(target_os = "macos")]
 pub async fn choose_folder() -> Result<String, String> {
     let output = tokio::process::Command::new("osascript")
         .arg("-e")
@@ -106,6 +192,12 @@ pub async fn choose_folder() -> Result<String, String> {
     } else {
         Ok(path)
     }
+}
+
+/// 非 macOS：无原生 Finder 目录选择，返回可读错误，引导使用手动输入路径。
+#[cfg(not(target_os = "macos"))]
+pub async fn choose_folder() -> Result<String, String> {
+    Err("目录选择对话框仅在 macOS 上受支持，请使用「手动输入路径」".to_string())
 }
 
 /// 打 opencode serve HTTP API 的客户端（Basic auth）。

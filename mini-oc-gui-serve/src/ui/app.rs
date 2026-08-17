@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, ListState, Padding, Paragraph},
 };
 
-use crate::attach::{AttachedSession, OcSession, OpencodeClient, choose_folder, spawn_in_new_terminal};
+use crate::attach::{AttachedSession, OcSession, OpencodeClient, attach_launch_spec, choose_folder, kill_process, spawn_in_new_terminal};
 use crate::auth::AuthConfig;
 use crate::config::{RatholeConfig, RATHOLE_CONFIG_FILE, RATHOLE_ENV_FILE, SbConfig, SB_ENV_FILE};
 use crate::domain::{PathEntry, PathValidator};
@@ -883,10 +883,7 @@ impl TuiApp {
         };
         if let Ok(pid_str) = std::fs::read_to_string(&removed.pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .status();
+                kill_process(pid);
             }
         }
         let _ = std::fs::remove_file(&removed.pid_file);
@@ -1248,12 +1245,13 @@ impl TuiApp {
 
     fn trigger_attach(&mut self, directory: String, session: String) {
         let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let pid_file = format!("/tmp/oc-attach-{}.pid", session);
-        let attach_cmd = format!(
-            "opencode attach \"{}\" --dir \"{}\" --session \"{}\" -u \"{}\" -p \"{}\"",
-            self.attach_url, directory, session, auth.basic_user, auth.basic_password
+        let (pid_file, wrapped) = attach_launch_spec(
+            &self.attach_url,
+            &directory,
+            &session,
+            &auth.basic_user,
+            &auth.basic_password,
         );
-        let wrapped = format!("bash -c 'echo $$ > {pid_file}; exec {attach_cmd}'");
         let sessions = self.attached_sessions.clone();
         let dir_clone = directory.clone();
         let sess_clone = session.clone();

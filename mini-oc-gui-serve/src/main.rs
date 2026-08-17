@@ -79,10 +79,13 @@ async fn main() -> Result<()> {
     }
 
     // 3. Resolve config from env + auth file.
-    let port: u16 = std::env::var("DEFAULT_PORT")
+    // axum HTTP 服务端口（path-list 管理接口）。独立于 opencode serve 的
+    // `DEFAULT_PORT`（默认 9464），避免两者同时监听同一端口，导致「启动 serv」
+    // 时报「端口被占用」。
+    let http_port: u16 = std::env::var("OC_SERVE_HTTP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(9464);
+        .unwrap_or(9465);
     let default_dir = std::env::var("OC_DEFAULT_DIR").unwrap_or_else(|_| {
         dirs::home_dir()
             .map(|p| p.join(".config/opencode").to_string_lossy().into_owned())
@@ -138,10 +141,10 @@ async fn main() -> Result<()> {
     // 8. Optionally bind the HTTP listener.
     let server_handle = if !cli.no_http {
         let app = router(state);
-        let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+        let listener = TcpListener::bind(format!("0.0.0.0:{http_port}"))
             .await
-            .with_context(|| format!("bind 0.0.0.0:{port}"))?;
-        tracing::info!("HTTP server listening on 0.0.0.0:{port}");
+            .with_context(|| format!("bind 0.0.0.0:{http_port}"))?;
+        tracing::info!("HTTP server listening on 0.0.0.0:{http_port}");
         Some(tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("axum server error: {e}");
@@ -153,7 +156,7 @@ async fn main() -> Result<()> {
 
     if cli.no_tui {
         tracing::info!(
-            "running in --no-tui mode: HTTP server up at http://127.0.0.1:{port}/health, \
+            "running in --no-tui mode: HTTP server up at http://127.0.0.1:{http_port}/health, \
              Ctrl+C to stop"
         );
         // Park forever (until SIGINT) so axum keeps serving.

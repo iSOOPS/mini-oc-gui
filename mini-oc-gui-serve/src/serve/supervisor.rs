@@ -75,7 +75,7 @@ impl ServeSupervisor {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
-        let spec = ProcessSpec::new("opencode")
+        let spec = ProcessSpec::new(opencode_program())
             .arg("serve")
             .arg("--port")
             .arg(port.to_string())
@@ -193,6 +193,50 @@ impl Default for ServeSupervisor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 解析 `opencode` 可执行程序名（跨平台）。
+///
+/// macOS / Linux 上 `opencode` 是真实可执行文件，直接返回裸名即可；
+/// Windows 上 `opencode` 通常是 npm/bun 生成的 `.cmd` / `.exe` shim，
+/// 裸名 `"opencode"` 无法被 `CreateProcessW` 解析（只会补 `.exe` 后缀），
+/// 必须显式解析成 `opencode.exe` 或 `opencode.cmd`。
+///
+/// 优先级：`OPENCODE_BIN` 环境变量 > 平台默认（可执行文件探测）。
+fn opencode_program() -> String {
+    // 1) 显式覆盖优先（与 `RATHOLE_BIN` 一致的设计）。
+    if let Ok(bin) = std::env::var("OPENCODE_BIN") {
+        return bin;
+    }
+
+    // 2) 平台默认。
+    #[cfg(not(target_os = "windows"))]
+    {
+        "opencode".to_string()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // 官方安装脚本 / bun 安装会生成 `opencode.exe`；npm 安装生成
+        // `opencode.cmd`。按存在性探测，最后回退裸名让 spawn 报错暴露问题。
+        if in_path("opencode.exe") {
+            "opencode.exe".to_string()
+        } else if in_path("opencode.cmd") {
+            "opencode.cmd".to_string()
+        } else {
+            "opencode".to_string()
+        }
+    }
+}
+
+/// 判断可执行文件是否存在于 `PATH` 中（Windows 专用）。
+#[cfg(target_os = "windows")]
+fn in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p).any(|dir| dir.join(name).is_file())
+        })
+        .unwrap_or(false)
 }
 
 async fn wait_alive(
