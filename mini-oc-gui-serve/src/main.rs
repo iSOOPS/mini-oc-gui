@@ -78,24 +78,75 @@ async fn main() -> Result<()> {
         return generate_auth_and_exit(cli.auth_env.as_deref());
     }
 
-    // 3. Resolve config from env + auth file.
-    // axum HTTP 服务端口（path-list 管理接口）。独立于 opencode serve 的
-    // `DEFAULT_PORT`（默认 9464），避免两者同时监听同一端口，导致「启动 serv」
-    // 时报「端口被占用」。
-    let http_port: u16 = std::env::var("OC_SERVE_HTTP_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(9465);
+    // 3. 加载统一 env 文件,把 OC_SERVE_SYSTEM_PORT / OC_SERVE_OPENCODE_PORT 等 key
+    // 注入到进程环境（仅在进程 env 尚未设置时生效,from_filename_override
+    // 不会覆盖进程已有值）。
+    let unified_env_path = cli
+        .auth_env
+        .clone()
+        .map(PathBuf::from)
+        .or_else(|| Some(mini_oc_gui_serve::config::unified_env_path()))
+        .expect("unified_env_path always returns Some");
+
+    // 一次性迁移 1:旧版独立的 .oc-serve-sb.env / .oc-serve-rathole.env 文件
+    // 合并进统一 env 后删除。完成后 Ok(false) 不再处理。
+    match mini_oc_gui_serve::config::migrate_legacy_env(&unified_env_path) {
+        Ok(true) => tracing::info!("已将旧 SB / Rathole env 合并到 {}", unified_env_path.display()),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("迁移旧 env 文件失败: {e}"),
+    }
+
+    // 一次性迁移 2:cwd 下的旧 .oc-serve-auth.env → 新位置(可执行文件同目录)
+    // 旧位置(通常 ./)有文件 + 新位置没有 → 复制内容过去 + 删除旧文件。
+    // 这一步只在用户没设 OC_SERVE_AUTH_ENV / --auth-env 时生效。
+    if cli.auth_env.is_none() && std::env::var("OC_SERVE_AUTH_ENV").is_err() {
+        let legacy_cwd_path = PathBuf::from(mini_oc_gui_serve::config::UNIFIED_ENV_FILE);
+        if legacy_cwd_path.exists() && !unified_env_path.exists() {
+            match std::fs::copy(&legacy_cwd_path, &unified_env_path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&legacy_cwd_path);
+                    tracing::info!(
+                        "已将旧 env 从 cwd 迁移到 {}",
+                        unified_env_path.display()
+                    );
+                }
+                Err(e) => tracing::warn!("迁移 env 到新位置失败: {e}"),
+            }
+        }
+    }
+
+    let _ = dotenvy::from_filename_override(&unified_env_path);
+
+    // 4. Resolve config from env + auth file.
+    // 系统监听端口(axum path-list 管理接口)。独立于 opencode 服务端口
+    // `OC_SERVE_OPENCODE_PORT`(默认 9464),避免两者同时监听同一端口,
+    // 导致「启动 serv」时报「端口被占用」。
+    let ports = mini_oc_gui_serve::config::PortsConfig::load();
+    let system_port = ports.system_port;
     let default_dir = std::env::var("OC_DEFAULT_DIR").unwrap_or_else(|_| {
         dirs::home_dir()
             .map(|p| p.join(".config/opencode").to_string_lossy().into_owned())
             .unwrap_or_else(|| "/Users/samuel/.config/opencode".to_string())
     });
     let path_list_file = std::env::var("PATH_LIST_FILE")
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("path-list.md"));
+        .unwrap_or_else(|| {
+            // 默认 <exe_dir>/target/data/path-list.md — 不用 CWD 相对路径,
+            // 避免 `cargo run` 在不同目录读到不同数据
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            match exe_dir {
+                Some(dir) => dir.join("target").join("data").join("path-list.md"),
+                None => PathBuf::from("target/data/path-list.md"),
+            }
+        });
 
     // 4. Build storage.
+    if let Some(parent) = path_list_file.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
     let cache = FileCache::new(&path_list_file);
     let store = PathListStore::new(cache);
     let sb_config = Arc::new(std::sync::RwLock::new(SbConfig::load()));
@@ -141,10 +192,10 @@ async fn main() -> Result<()> {
     // 8. Optionally bind the HTTP listener.
     let server_handle = if !cli.no_http {
         let app = router(state);
-        let listener = TcpListener::bind(format!("0.0.0.0:{http_port}"))
+        let listener = TcpListener::bind(format!("0.0.0.0:{system_port}"))
             .await
-            .with_context(|| format!("bind 0.0.0.0:{http_port}"))?;
-        tracing::info!("HTTP server listening on 0.0.0.0:{http_port}");
+            .with_context(|| format!("bind 0.0.0.0:{system_port}"))?;
+        tracing::info!("HTTP server listening on 0.0.0.0:{system_port}");
         Some(tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("axum server error: {e}");
@@ -156,7 +207,7 @@ async fn main() -> Result<()> {
 
     if cli.no_tui {
         tracing::info!(
-            "running in --no-tui mode: HTTP server up at http://127.0.0.1:{http_port}/health, \
+            "running in --no-tui mode: HTTP server up at http://127.0.0.1:{system_port}/health, \
              Ctrl+C to stop"
         );
         // Park forever (until SIGINT) so axum keeps serving.
