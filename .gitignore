@@ -8,5 +8,4 @@
 .env.local
 .oc-serve-auth.env
 .omo
-/mini-oc-gui-serve/path-list.md
 /mini-oc-gui-serve/*.env
