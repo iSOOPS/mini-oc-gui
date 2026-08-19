@@ -132,14 +132,16 @@ async fn main() -> Result<()> {
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            // 默认 <exe_dir>/target/data/path-list.md — 不用 CWD 相对路径,
-            // 避免 `cargo run` 在不同目录读到不同数据
+            // 默认 <workspace_root>/data/path-list.md。
+            // exe 在 <workspace>/target/{release,debug}/,所以 exe_dir 需要 ../.. 回到 workspace 根。
+            // 不依赖 CWD,且 release/dev profile 共享同一份数据
+            // (避免 `target/release/target/data/` 与 `target/debug/target/data/` 分裂)
             let exe_dir = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
             match exe_dir {
-                Some(dir) => dir.join("target").join("data").join("path-list.md"),
-                None => PathBuf::from("target/data/path-list.md"),
+                Some(dir) => dir.join("..").join("..").join("data").join("path-list.md"),
+                None => PathBuf::from("data/path-list.md"),
             }
         });
 
