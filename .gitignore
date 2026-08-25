@@ -8,4 +8,6 @@
 .env.local
 .oc-serve-auth.env
 .omo
-/mini-oc-gui-serve/*.env
+
+*/path-list.md
+*/global.toml

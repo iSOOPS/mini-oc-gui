@@ -1,0 +1,6 @@
+# global.toml
+[client]
+remote_addr = "8.159.159.138:2333"
+[client.services.service-office-mac]
+token = "pAG0FG3hvxJiw62shlqCjHSDyENYcXYYIMYKiqAyYWKBwdSz0R4qQQ0lM3"
+local_addr = "127.0.0.1:9464"

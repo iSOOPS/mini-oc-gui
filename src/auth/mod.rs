@@ -109,8 +109,16 @@ impl AuthConfig {
 
     /// 将凭据写入 auth-env 文件（Unix 下 chmod 600）。
     ///
+    /// **已废弃**:设置面板现在通过 [`crate::config::write_persisted_env`]
+    /// 一次性写入所有 key。保留此函数仅为向后兼容,**新代码不要使用**
+    /// ——它只写 USERNAME/PASSWORD 两行,会把文件里已有的 SB / rathole /
+    /// port 等配置抹掉。
+    ///
     /// # Errors
     /// 返回 [`AppError::Io`] 当文件写入失败。
+    #[deprecated(
+        note = "改用 crate::config::write_persisted_env 统一写入,保留其他 section"
+    )]
     pub fn write_env_file(
         &self,
         path: &Path,

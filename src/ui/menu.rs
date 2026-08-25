@@ -11,8 +11,6 @@ pub enum MenuItem {
     OcProjects,
     /// Upgrade OpenCode + oh-my-openagent.
     UpgradeOpenCodeAndOmo,
-    /// Exit.
-    Exit,
 }
 
 impl MenuItem {
@@ -24,8 +22,18 @@ impl MenuItem {
             Self::Rathole,
             Self::OcProjects,
             Self::UpgradeOpenCodeAndOmo,
-            Self::Exit,
         ]
+    }
+
+    /// 该菜单项是否在 TUI 窗口空间不足时必须保留。
+    ///
+    /// - 核心服务开关(`OcServe` / `Rathole`)是用户的日常主操作,
+    ///   任何终端尺寸下都必须可见。
+    /// - 次要项(`OcProjects` / `UpgradeOpenCodeAndOmo`)在窗口
+    ///   高度不足以容纳时,会被自适应裁剪掉。
+    #[must_use]
+    pub fn is_essential(self) -> bool {
+        matches!(self, Self::OcServe | Self::Rathole)
     }
 }
 
@@ -40,8 +48,6 @@ pub enum MenuAction {
     EnterProjects,
     /// Run the upgrade flow.
     Upgrade,
-    /// Exit the TUI cleanly.
-    Exit,
 }
 
 impl From<MenuItem> for MenuAction {
@@ -51,7 +57,21 @@ impl From<MenuItem> for MenuAction {
             MenuItem::Rathole => Self::ToggleRathole,
             MenuItem::OcProjects => Self::EnterProjects,
             MenuItem::UpgradeOpenCodeAndOmo => Self::Upgrade,
-            MenuItem::Exit => Self::Exit,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn essential_flags_are_stable() {
+        assert!(MenuItem::OcServe.is_essential(), "OcServe 必须 essential");
+        assert!(MenuItem::Rathole.is_essential(), "Rathole 必须 essential");
+        assert!(
+            !MenuItem::UpgradeOpenCodeAndOmo.is_essential(),
+            "Upgrade 是次要项,窗口太小时应被裁掉"
+        );
     }
 }
