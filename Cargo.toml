@@ -82,6 +82,9 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # windows-sys), so it doesn't drag in a C compiler the way ring/aws-lc do.
 arboard = "3"
 
+# OS username lookup (pure-Rust, no native toolchain required).
+whoami = "1"
+
 # CLI parsing
 clap = { version = "4", features = ["derive", "env"] }
 
