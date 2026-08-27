@@ -19,6 +19,7 @@ use crate::domain::{PathEntry, PathValidator};
 use crate::error::AppError;
 
 use super::cache::{FileCache, format_dt, max_non_empty, min_non_empty};
+use super::paths::RemotePaths;
 use super::remote::RemoteClient;
 
 /// Concurrency-safe, file-backed, optionally remote-syncing store.
@@ -75,7 +76,9 @@ impl PathListStore {
         let (status, remote_value) = match self.remote.read().await.as_ref() {
             Some(remote) => {
                 let mut r = remote.clone();
-                match r.get("/serv/opencode/path-list.md").await {
+                let path = RemotePaths::new(r.user.as_deref().unwrap_or("unknown"))
+                    .path_list_with_slash();
+                match r.get(&path).await {
                     Ok((s, body)) => {
                         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Array(Vec::new()));
                         (s, v)
