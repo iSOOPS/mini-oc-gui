@@ -93,7 +93,7 @@ If nothing is found, the program prints a clear error pointing to the expected f
 | GET    | `/project`                 | List known projects from path-list   | Basic/Session |
 | GET    | `/session?directory=...`   | List sessions for a project          | Basic/Session |
 | POST   | `/api/session`             | Create a new session                 | Basic/Session |
-| GET    | `/.fs/serv/opencode/path-list.md` | SilverBullet-compatible file store | Cookie |
+| GET    | `/.fs/serv/opencode/{sb_user}/{pctype}/{pcname}/path-list.md` | SilverBullet-compatible file store | Cookie |
 
 ## Configuration
 
@@ -118,7 +118,7 @@ If nothing is found, the program prints a clear error pointing to the expected f
 - **Atomic writes**: `path-list.md` is always written via tempfile + `fs::rename` to avoid corruption.
 - **Concurrent safety**: a `RwLock` guards the in-memory cache; a `fs2` flock guards the file.
 - **Failure tolerance**: if SilverBullet is unreachable, we fall back to the local cache and warn.
-- **Single source of truth**: `path-list.md` (local) ↔ remote PUT/GET; merges by `path` key.
+- **Single source of truth**: `path-list.md` (local) ↔ remote PUT/GET at `/.fs/serv/opencode/{sb_user}/{pctype}/{pcname}/path-list.md`; merges by `path` key.
 - **Process cleanup**: spawned children get tracked PIDs; SIGINT/SIGTERM trigger a graceful kill chain.
 
 ## License
