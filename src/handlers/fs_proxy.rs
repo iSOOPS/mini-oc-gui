@@ -69,8 +69,54 @@ pub async fn put_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Only the fixed remote path is exposed through this proxy — exactly the same
-/// path used by `lib-path-list.sh::SB_REMOTE_PATH`.
+/// Accept only the new namespaced layout
+/// `serv/opencode/<sb_user>/<macos|windows>/<pcname>/path-list.md`.
 fn is_path_list_path(path: &str) -> bool {
-    path.trim_start_matches('/') == "serv/opencode/path-list.md"
+    let rel = path.trim_start_matches('/');
+    let segs: Vec<&str> = rel.split('/').collect();
+    segs.len() == 6
+        && segs[0] == "serv"
+        && segs[1] == "opencode"
+        && matches!(segs[3], "macos" | "windows")
+        && segs[5] == "path-list.md"
+        && !segs[2].is_empty()
+        && !segs[4].is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_path_list_path;
+
+    #[test]
+    fn accepts_new_namespaced_layout() {
+        assert!(is_path_list_path(
+            "serv/opencode/alice/macos/alice-mbp/path-list.md"
+        ));
+        assert!(is_path_list_path(
+            "/serv/opencode/bob/windows/bob-pc/path-list.md"
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_layout() {
+        assert!(!is_path_list_path("serv/opencode/path-list.md"));
+        assert!(!is_path_list_path("/serv/opencode/path-list.md"));
+    }
+
+    #[test]
+    fn rejects_wrong_pctype() {
+        assert!(!is_path_list_path(
+            "serv/opencode/alice/linux/alice-pc/path-list.md"
+        ));
+    }
+
+    #[test]
+    fn rejects_extra_segments() {
+        assert!(!is_path_list_path(
+            "serv/opencode/alice/macos/alice-pc/extra/path-list.md"
+        ));
+        assert!(!is_path_list_path(
+            "serv/opencode/alice/macos/alice-pc/path-list.md/foo"
+        ));
+    }
 }
