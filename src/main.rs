@@ -128,22 +128,42 @@ async fn main() -> Result<()> {
             .map(|p| p.join(".config/opencode").to_string_lossy().into_owned())
             .unwrap_or_else(|| "/Users/samuel/.config/opencode".to_string())
     });
-    let path_list_file = std::env::var("PATH_LIST_FILE")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            // 默认 <workspace_root>/data/path-list.md。
-            // exe 在 <workspace>/target/{release,debug}/,所以 exe_dir 需要 ../.. 回到 workspace 根。
-            // 不依赖 CWD,且 release/dev profile 共享同一份数据
-            // (避免 `target/release/target/data/` 与 `target/debug/target/data/` 分裂)
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            match exe_dir {
-                Some(dir) => dir.join("..").join("..").join("data").join("path-list.md"),
-                None => PathBuf::from("data/path-list.md"),
+    // 解析 path-list 缓存路径:<exe_dir>/data/path-list.md (与 rathole bundle 一致的
+    // exe-adjacent 布局)。`current_exe()` 不可用时回退到 CWD 相对路径 (仅 cargo test 场景)。
+    let path_list_file = mini_oc_gui_serve::storage::default_path_list_path();
+
+    // 一次性迁移:把旧位置 <workspace>/data/path-list.md 拷到新位置。
+    // 满足以下全部条件才会执行:
+    //   1. 新路径 <exe_dir>/data/path-list.md 当前不存在
+    //   2. 旧路径 <exe_dir>/../../data/path-list.md 存在且是文件
+    // 同步 std::fs (而非 tokio::fs) —— 启动早期 tokio 还未完全 spin up,且文件很小 (~8 KB)。
+    if !path_list_file.exists() {
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let legacy = exe_dir
+                .join("..")
+                .join("..")
+                .join("data")
+                .join("path-list.md");
+            if legacy.is_file() {
+                if let Some(parent) = path_list_file.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::warn!("path-list migration: mkdir failed: {e}");
+                    } else if let Err(e) = std::fs::copy(&legacy, &path_list_file) {
+                        tracing::warn!("path-list migration: copy failed: {e}");
+                    } else {
+                        tracing::info!(
+                            "path-list cache migrated from {} to {}",
+                            legacy.display(),
+                            path_list_file.display()
+                        );
+                    }
+                }
             }
-        });
+        }
+    }
 
     // 4. Build storage.
     if let Some(parent) = path_list_file.parent() {
