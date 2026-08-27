@@ -11,5 +11,6 @@ pub mod paths;
 pub mod remote;
 pub mod sync;
 
+pub use cache::{default_path_list_path, FileCache};
 pub use paths::RemotePaths;
 pub use sync::{PathListStore, RefreshReport};

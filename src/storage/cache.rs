@@ -123,6 +123,27 @@ impl FileCache {
     }
 }
 
+/// Resolve the canonical on-filesystem location for the path-list cache.
+///
+/// Returns `<exe_dir>/data/path-list.md` when the running binary's path is
+/// known, otherwise a CWD-relative `data/path-list.md` fallback (used by
+/// `cargo test` and similar).
+///
+/// The exe-adjacent location matches the layout used by the bundled
+/// rathole binary (`<exe_dir>/rathole/...`) so that a release build is
+/// self-contained and the cache lives next to the thing that reads it.
+#[must_use]
+pub fn default_path_list_path() -> PathBuf {
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        exe_dir.join("data").join("path-list.md")
+    } else {
+        PathBuf::from("data").join("path-list.md")
+    }
+}
+
 /// Helper: timestamp at `now` formatted as ISO-8601 with timezone offset.
 ///
 /// Matches the bash `date +%Y-%m-%dT%H:%M:%S%z` output used by
@@ -214,5 +235,13 @@ mod tests {
         let xs = ["", "2026-08-12T00:00:00+0800", "2026-01-01T00:00:00+0000"];
         assert_eq!(min_non_empty(xs.iter().copied()), Some("2026-01-01T00:00:00+0000"));
         assert_eq!(max_non_empty(xs.iter().copied()), Some("2026-08-12T00:00:00+0800"));
+    }
+
+    #[test]
+    fn default_path_list_path_is_exe_adjacent() {
+        let p = default_path_list_path();
+        let exe = std::env::current_exe().expect("current_exe available in test");
+        let expected = exe.parent().unwrap().join("data").join("path-list.md");
+        assert_eq!(p, expected);
     }
 }
