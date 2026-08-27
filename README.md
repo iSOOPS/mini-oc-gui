@@ -120,6 +120,7 @@ If nothing is found, the program prints a clear error pointing to the expected f
 - **Failure tolerance**: if SilverBullet is unreachable, we fall back to the local cache and warn.
 - **Single source of truth**: `path-list.md` (local) ↔ remote PUT/GET at `/.fs/serv/opencode/{sb_user}/{pctype}/{pcname}/path-list.md`; merges by `path` key.
 - **Legacy-path migration**: on first startup after upgrading, the client reads the pre-namespaced `/serv/opencode/path-list.md` once, merges those entries into the new layout (dedup by `path`, union sections, min/max timestamps), and seeds the new path if it is empty. Idempotent within a process lifetime — subsequent calls are no-ops. The legacy file on the server is left in place; operators may remove it manually.
+- **Local cache lives next to the binary**: `path-list.md` is written under `<exe_dir>/data/`, alongside the bundled rathole. Release and debug builds use separate directories; no CWD assumption.
 - **Process cleanup**: spawned children get tracked PIDs; SIGINT/SIGTERM trigger a graceful kill chain.
 
 ## License
