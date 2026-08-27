@@ -283,7 +283,9 @@ impl PathListStore {
             };
             let mut remote = remote_arc;
             for attempt in 1..=3 {
-                match remote.put("/serv/opencode/path-list.md", &body).await {
+                let path = RemotePaths::new(remote.user.as_deref().unwrap_or("unknown"))
+                    .path_list_with_slash();
+                match remote.put(&path, &body).await {
                     Ok(200..=299) => return,
                     Ok(status) if status == 0 => {
                         tracing::warn!("push attempt {}: network unreachable", attempt);
