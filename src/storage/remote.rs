@@ -28,8 +28,9 @@ pub struct RemoteClient {
     pub cookie_name: String,
     /// Current cookie value (`<name>=<jwt>`). `None` triggers auto-login.
     pub cookie: Option<String>,
-    /// Cached credentials used by auto-relogin.
-    user: Option<String>,
+    /// Cached credentials used by auto-relogin; also drives the
+    /// namespaced remote path segment via `RemotePaths::new`.
+    pub user: Option<String>,
     password: Option<String>,
     /// Shared HTTP client.
     http: Client,
