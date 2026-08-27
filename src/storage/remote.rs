@@ -220,6 +220,7 @@ fn extract_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::RemotePaths;
 
     #[test]
     fn cookie_name_from_url() {
@@ -240,13 +241,14 @@ mod tests {
     #[test]
     fn url_for_normalizes() {
         let c = RemoteClient::new("https://md.isoops.com");
+        let path = RemotePaths::new("").path_list_with_slash();
         assert_eq!(
-            c.url_for("/serv/opencode/path-list.md"),
-            "https://md.isoops.com/.fs/serv/opencode/path-list.md"
+            c.url_for(&path),
+            format!("https://md.isoops.com/.fs{}", RemotePaths::new("").path_list_with_slash())
         );
         assert_eq!(
-            c.url_for("serv/opencode/path-list.md"),
-            "https://md.isoops.com/.fs/serv/opencode/path-list.md"
+            c.url_for(path.trim_start_matches('/')),
+            format!("https://md.isoops.com/.fs{}", RemotePaths::new("").path_list_with_slash())
         );
     }
 }
