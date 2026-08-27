@@ -2,7 +2,8 @@
 //!
 //! The default implementation delegates to the configured
 //! [`crate::storage::PathListStore`]. This gives us `GET`/`PUT` over
-//! `/.fs/serv/opencode/path-list.md` with no extra HTTP hop.
+//! `/.fs/serv/opencode/{sb_user}/{pctype}/{pcname}/path-list.md` with
+//! no extra HTTP hop.
 
 use axum::{
     Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse,
