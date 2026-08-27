@@ -159,6 +159,11 @@ async fn main() -> Result<()> {
             store.with_remote(remote).await;
         }
     }
+    // One-shot legacy-path migration (runs only if remote is configured).
+    // Idempotent: no-op on subsequent process restarts.
+    if let Err(e) = store.migrate_from_legacy_remote().await {
+        tracing::warn!("legacy migration failed: {e}");
+    }
     // 无论是否配置远端，都从本地 path-list.md 刷新一次缓存。
     if let Err(e) = store.refresh().await {
         tracing::warn!("initial refresh failed: {e}");

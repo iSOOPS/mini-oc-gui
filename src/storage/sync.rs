@@ -22,12 +22,21 @@ use super::cache::{FileCache, format_dt, max_non_empty, min_non_empty};
 use super::paths::RemotePaths;
 use super::remote::RemoteClient;
 
+/// Legacy remote path used by versions of the app before the namespaced
+/// remote layout was introduced. Read once during the first refresh
+/// after upgrade; never written by new code.
+pub(crate) const LEGACY_REMOTE_PATH: &str = "/serv/opencode/path-list.md";
+
 /// Concurrency-safe, file-backed, optionally remote-syncing store.
 #[derive(Clone)]
 pub struct PathListStore {
     cache: FileCache,
     remote: Arc<RwLock<Option<RemoteClient>>>,
     inner: Arc<RwLock<Vec<PathEntry>>>,
+    /// One-shot guard for the legacy-path migration. Set to `true` the
+    /// first time [`migrate_from_legacy_remote`](Self::migrate_from_legacy_remote)
+    /// runs so the migration runs exactly once per process lifetime.
+    migration_done: Arc<RwLock<bool>>,
 }
 
 impl std::fmt::Debug for PathListStore {
@@ -48,6 +57,7 @@ impl PathListStore {
             cache,
             remote: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(Vec::new())),
+            migration_done: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -317,6 +327,112 @@ impl PathListStore {
         }
         s
     }
+
+    /// One-shot legacy-path migration.
+    ///
+    /// Reads the pre-namespaced remote file at [`LEGACY_REMOTE_PATH`] and,
+    /// if it returns a non-empty JSON array, merges those entries into the
+    /// local cache using the same semantics as [`merge_entries`]:
+    /// dedup by `path`, `sections` = union, `createdAt` = min,
+    /// `lastOpenedAt` = max. If the new namespaced path on the remote is
+    /// empty, the merged set is pushed up so other clients on the new
+    /// layout can pick it up.
+    ///
+    /// Idempotent: subsequent calls after the first one are no-ops.
+    /// Network failures are non-fatal — a warning is logged and the
+    /// migration is treated as done so we don't loop on every startup.
+    ///
+    /// # Errors
+    /// Returns [`AppError`] only for unrecoverable local-cache write
+    /// failures. Remote I/O is always best-effort.
+    pub async fn migrate_from_legacy_remote(&self) -> Result<MigrationReport, AppError> {
+        // Atomically flip the one-shot guard. If already set, no-op.
+        {
+            let mut done = self.migration_done.write().await;
+            if *done {
+                return Ok(MigrationReport::default());
+            }
+            *done = true;
+        }
+
+        let Some(remote_arc) = self.remote.read().await.clone() else {
+            tracing::info!("legacy migration skipped: no remote configured");
+            return Ok(MigrationReport::default());
+        };
+
+        let mut remote = remote_arc;
+        let body = match remote.get(LEGACY_REMOTE_PATH).await {
+            Ok((200, body)) => body,
+            Ok((status, _)) => {
+                tracing::info!(
+                    "legacy migration: GET {LEGACY_REMOTE_PATH} returned HTTP {status}; nothing to migrate"
+                );
+                return Ok(MigrationReport::default());
+            }
+            Err(e) => {
+                tracing::warn!("legacy migration: GET {LEGACY_REMOTE_PATH} failed: {e}");
+                return Ok(MigrationReport::default());
+            }
+        };
+
+        let legacy_value: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "legacy migration: body at {LEGACY_REMOTE_PATH} is not JSON: {e}"
+                );
+                return Ok(MigrationReport::default());
+            }
+        };
+        let legacy_entries = match json_arr_to_entries(&legacy_value) {
+            Ok(es) => es,
+            Err(e) => {
+                tracing::warn!("legacy migration: {e}");
+                return Ok(MigrationReport::default());
+            }
+        };
+        if legacy_entries.is_empty() {
+            tracing::info!("legacy migration: remote returned empty array; nothing to merge");
+            return Ok(MigrationReport::default());
+        }
+
+        let local = self.cache.read().await.unwrap_or_default();
+        let merged = merge_entries(legacy_entries, local);
+        let merged_count = merged.len();
+        self.cache.write(&merged).await?;
+        *self.inner.write().await = merged.clone();
+
+        // If the new path is empty, seed it with the merged set so other
+        // clients (e.g. running on a different machine under the same
+        // sb_user) can pick it up on their next refresh.
+        let new_path = RemotePaths::new(remote.user.as_deref().unwrap_or("unknown"))
+            .path_list_with_slash();
+        let need_seeding = match remote.get(&new_path).await {
+            Ok((200, body)) => {
+                let v: Value =
+                    serde_json::from_str(&body).unwrap_or(Value::Array(Vec::new()));
+                v.as_array().map_or(true, |a| a.is_empty())
+            }
+            Ok(_) | Err(_) => true,
+        };
+        if need_seeding {
+            self.async_push(merged).await;
+        }
+
+        tracing::info!("legacy migration: merged entries into new layout");
+        Ok(MigrationReport {
+            migrated_entries: merged_count,
+        })
+    }
+}
+
+/// Outcome of [`PathListStore::migrate_from_legacy_remote`].
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct MigrationReport {
+    /// Number of entries in the in-memory snapshot after migration.
+    /// `0` when no migration was needed (no remote, missing/empty legacy
+    /// file, network failure, or already migrated).
+    pub migrated_entries: usize,
 }
 
 /// What a [`PathListStore::refresh`] call did.
@@ -443,5 +559,34 @@ mod tests {
 
         assert!(merged.iter().any(|e| e.path == "/b"));
         assert!(merged.iter().any(|e| e.path == "/c"));
+    }
+
+    #[tokio::test]
+    async fn migrate_is_noop_when_remote_unset() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        let report = store.migrate_from_legacy_remote().await.expect("migrate");
+        assert_eq!(report.migrated_entries, 0);
+
+        // Second call must remain idempotent.
+        let report = store.migrate_from_legacy_remote().await.expect("migrate 2");
+        assert_eq!(report.migrated_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn migrate_is_idempotent_under_repeat_calls() {
+        // The one-shot guard must flip on the first call, so the second
+        // call is a no-op regardless of remote state.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        // Manually flip the guard to simulate "already migrated this process".
+        *store.migration_done.write().await = true;
+
+        let report = store.migrate_from_legacy_remote().await.expect("migrate");
+        assert_eq!(report.migrated_entries, 0);
     }
 }
