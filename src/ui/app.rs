@@ -933,7 +933,8 @@ impl TuiApp {
                 cfg.user.clone(),
                 cfg.password.clone(),
             );
-            let test_result = remote.get("/serv/opencode/path-list.md").await;
+            let path = RemotePaths::new(cfg.user.as_str()).path_list_with_slash();
+            let test_result = remote.get(&path).await;
             let connected = matches!(&test_result, Ok((status, _)) if (200..400).contains(status));
             if !connected {
                 let base = match &test_result {
