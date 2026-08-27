@@ -7,30 +7,37 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::error::AppError;
-use crate::upgrade::UpgradeResult;
+use crate::upgrade::{UpgradeResult, resolve_command};
 
 /// Detect `bun` on PATH (or in well-known install locations).
 #[must_use]
 pub fn detect_bun() -> Option<PathBuf> {
+    // 1. 标准 PATH/PATHEXT 查找 —— Windows 上能正确解析 `bun.exe` 和 `bun.cmd`
+    //    (npm 全局装的 PATHEXT shim)。`Command::new` 不查 PATHEXT，所以这里
+    //    必须用 resolve_command 而非裸 `Command::new("bun")`。
+    if let Ok(p) = resolve_command("bun") {
+        return Some(p);
+    }
+
+    // 2. 已知安装位置（bun 经常装在 ~/.bun/bin/ 但未必在 PATH）。
+    //    Windows 下 `$HOME` 不一定存在，退回到 `$USERPROFILE`。
     for candidate in [
-        "bun",
         "$HOME/.bun/bin/bun",
         "/opt/homebrew/bin/bun",
         "/usr/local/bin/bun",
     ] {
         let resolved = if let Some(rest) = candidate.strip_prefix("$HOME/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                PathBuf::from(home).join(rest)
-            } else {
-                continue;
-            }
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))?;
+            PathBuf::from(home).join(rest)
         } else {
             PathBuf::from(candidate)
         };
-        if resolved.is_file() || is_on_path(&resolved) {
+        if resolved.is_file() {
             return Some(resolved);
         }
     }
+
     None
 }
 
@@ -59,18 +66,6 @@ fn npm_candidate_names() -> &'static [&'static str] {
     {
         &["npm"]
     }
-}
-
-fn is_on_path(p: &PathBuf) -> bool {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if dir.join(p) == *p || dir == *p {
-                return true;
-            }
-        }
-    }
-    // Fall back to the bare name — accept it if it's a valid executable.
-    p.is_file()
 }
 
 /// Upgrade oh-my-openagent, preferring bun over npm/npx.
@@ -124,9 +119,12 @@ pub async fn upgrade_omo(
         }
     }
 
+    // Windows 上 `npx` 通常是 npm 全局装的 `npx.cmd` shim；和 opencode 走
+    // 同样的 CreateProcess 不查 PATHEXT 陷阱，先 resolve_command 拿到真实路径。
+    let npx_path = resolve_command("npx")?;
     let npx_probe = timeout(
         Duration::from_secs(120),
-        Command::new("npx")
+        Command::new(&npx_path)
             .arg("--yes")
             .arg("oh-my-openagent@latest")
             .arg("version")

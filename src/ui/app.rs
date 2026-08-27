@@ -1,6 +1,6 @@
 //! TUI app state and render loop.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -46,6 +46,17 @@ const PROJECTS_ITEMS: [MenuItem; 1] = [MenuItem::OcProjects];
 /// 取 22 是因为最长标题 "⏹ 停止 OpenCode Serve" 在 UTF-8 等宽字体下约 18 显示列,
 /// 加上 2 列边框 + 2 列 padding = 22 列刚好容下。
 const MIN_CARD_WIDTH: u16 = 22;
+
+/// 「新建路径」子页中「系统路径选择」卡片的副标题文案，按平台切换：
+/// * macOS — Finder
+/// * Windows — 资源管理器
+/// * Linux / 其它 — 中性 "系统文件管理器" 描述
+#[cfg(target_os = "macos")]
+const SYS_PICKER_DESC: &str = "打开 Finder 选择项目目录";
+#[cfg(target_os = "windows")]
+const SYS_PICKER_DESC: &str = "打开资源管理器选择项目目录";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const SYS_PICKER_DESC: &str = "打开系统文件管理器选择项目目录";
 
 /// TUI 交互模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2601,7 +2612,7 @@ impl TuiApp {
                             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         )),
                         Line::from(Span::styled(
-                            "打开 Finder 选择项目目录",
+                            SYS_PICKER_DESC,
                             Style::default().fg(Color::DarkGray),
                         )),
                         Line::from(""),

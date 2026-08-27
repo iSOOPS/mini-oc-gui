@@ -81,30 +81,55 @@ pub fn spawn_in_new_terminal(command: &str) -> Result<(), String> {
     }
 }
 
-/// 在 Windows Terminal 新标签页执行命令。
+/// 在 Windows 弹出一个新的可见控制台窗口并执行命令。
 ///
-/// 优先 `wt.exe` 新标签；未安装 Windows Terminal 时回退 `cmd /c start`
-/// 新控制台窗口，保证功能可用。
+/// 实现策略：
+///
+///  1. 把整条命令写到 `%TEMP%\oc-attach-<pid>.bat` 里。
+///     `cmd /K "powershell -NoProfile -Command \"…\""` 这种内嵌 PowerShell 的
+///     `script` 字符串经过 cmd 的二次参数解析、PowerShell 的 -Command 引号剥离
+///     之后行为很难跨 Windows 版本预测；写成 `.bat` 后批处理器把文件内容当作
+///     字面命令行执行，quoting 干净，PowerShell 直接看到原本写好的脚本字符串。
+///  2. 拉起 `cmd.exe /K <bat>`，通过 `creation_flags` 同时打开独立可见控制台
+///     并脱离 TUI 的 Ctrl+C/Break：
+///
+///       * `CREATE_NEW_CONSOLE = 0x0010` —— 子进程获得自己的控制台窗口；
+///         否则会继承 TUI 的控制台，要么不开新窗口要么闪退。
+///       * `CREATE_NEW_PROCESS_GROUP = 0x0200` —— TUI 上的 Ctrl+C / Ctrl+Break
+///         不会传导到新会话，误杀 attach 子进程。
+///
+///  3. `/K` 让 cmd 在 `opencode attach` 异常退出后仍保留窗口，方便用户看错误
+///     信息；用户手动关窗即结束。
+///
+/// 为什么不优先 `wt.exe`：Windows Terminal 在很多机器上是 Microsoft Store 的
+/// `APPEXECUTION_ALIAS` stub，`spawn()` 会返回 `Ok` 但根本不打开标签页——继续
+/// 返回 Ok 等于"无声地告诉用户成了"，反而是更大的故障源。所以直接走 `cmd.exe`。
 #[cfg(target_os = "windows")]
 pub fn spawn_in_new_terminal(command: &str) -> Result<(), String> {
-    let wt = std::process::Command::new("wt.exe")
-        .arg("-w")
-        .arg("0")
-        .arg("new-tab")
-        .arg("--")
-        .arg(command)
-        .spawn();
-    if wt.is_ok() {
-        return Ok(());
-    }
+    use std::os::windows::process::CommandExt;
 
-    // 回退：传统 cmd 新窗口。`start` 的第一个空串是窗口标题占位，
-    // 防止 command 里的引号被误当成标题。
-    std::process::Command::new("cmd.exe")
-        .args(["/c", "start", "", command])
+    // CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
+    const FLAGS: u32 = 0x0210;
+
+    // 1. 写临时 .bat，避开 cmd / PowerShell 双层引号玄学。
+    let pid = std::process::id();
+    let bat_path = std::env::temp_dir().join(format!("oc-attach-{pid}.bat"));
+    std::fs::write(&bat_path, command.as_bytes())
+        .map_err(|e| format!("无法写入临时脚本 {}: {e}", bat_path.display()))?;
+
+    // 2. 拉起新的 cmd.exe 跑这个 bat。Rust 的 Command 会把 `bat_path`
+    //    自动包成带引号的 argv 项传给 CreateProcess，无需手动转义。
+    let result = std::process::Command::new("cmd.exe")
+        .arg("/K")
+        .arg(&bat_path)
+        .creation_flags(FLAGS)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("无法打开新终端：{e}"))
+        .map_err(|e| format!("无法打开新终端：{e}"));
+
+    // 3. bat 文件保留在 %TEMP% 下，重复运行会覆盖。删除不是必要的，且万一
+    //    新 cmd 启动有延迟、读到一半被删，反而出更隐蔽的 bug。
+    result
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -194,10 +219,58 @@ pub async fn choose_folder() -> Result<String, String> {
     }
 }
 
-/// 非 macOS：无原生 Finder 目录选择，返回可读错误，引导使用手动输入路径。
-#[cfg(not(target_os = "macos"))]
+/// Windows：通过 `Shell.Application` COM 弹出 Windows 原生"选择文件夹"对话框。
+///
+/// 用 PowerShell 子进程承载对话框（不会阻塞 TUI 的 tokio 事件循环）。
+/// `Shell.Application.BrowseForFolder` 与 .NET `FolderBrowserDialog` 不同，
+/// **不要求 STA 线程**，因此可以直接通过 `-Command` 跑，PowerShell 进程
+/// 会等用户点完才退出——`tokio::process::Command::output()` 就能直接拿到
+/// 用户选中的路径。
+///
+/// flags = 0x41：
+/// * `BIF_RETURNONLYFSDIRS = 0x01` —— 只允许选目录，禁止"选文件"
+/// * `BIF_NEWDIALOGSTYLE  = 0x40` —— 用 Vista+ 的新风格对话框（带"新建文件夹"按钮）
+///
+/// 用户取消时 PowerShell 退出码仍为 0，但 stdout 为空；stdout 非空 => 用户确认。
+#[cfg(target_os = "windows")]
 pub async fn choose_folder() -> Result<String, String> {
-    Err("目录选择对话框仅在 macOS 上受支持，请使用「手动输入路径」".to_string())
+    const SCRIPT: &str = "\
+        $shell = New-Object -ComObject Shell.Application; \
+        $folder = $shell.BrowseForFolder(0, '选择项目目录', 0x41, 0); \
+        if ($folder) { Write-Output $folder.Self.Path }";
+
+    let output = tokio::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(SCRIPT)
+        .output()
+        .await
+        .map_err(|e| format!("启动 PowerShell 失败（请确认 PowerShell 在 PATH 中）：{e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if trimmed.is_empty() {
+            return Err("已取消选择".to_string());
+        }
+        return Err(format!("目录选择失败：{trimmed}"));
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        // BrowseForFolder 用户点"取消"时 PowerShell 也会写一个空行，转成中文。
+        Err("未选择目录".to_string())
+    } else {
+        Ok(path)
+    }
+}
+
+/// Linux（及其它 Unix-like）：暂不实现 GUI 选目录，提示用户走"手动输入"。
+/// 注意：此分支以前笼统地写成 "仅 macOS"，把 Windows 也误归到不支持——已经
+/// 由上面的 `#[cfg(target_os = "windows")]` 实现替换。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub async fn choose_folder() -> Result<String, String> {
+    Err("目录选择对话框在当前平台不可用，请使用「手动输入路径」".to_string())
 }
 
 /// 打 opencode serve HTTP API 的客户端（Basic auth）。
