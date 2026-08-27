@@ -24,7 +24,7 @@ use crate::domain::{PathEntry, PathValidator};
 use crate::serve::{
     ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
 };
-use crate::storage::PathListStore;
+use crate::storage::{PathListStore, RemotePaths};
 use crate::storage::remote::RemoteClient;
 use crate::ui::events::InputEvent;
 use crate::ui::log::LogBuffer;
@@ -477,7 +477,8 @@ impl TuiApp {
             }
             let mut remote =
                 RemoteClient::with_credentials(cfg.url.clone(), cfg.user.clone(), cfg.password.clone());
-            match remote.get("/serv/opencode/path-list.md").await {
+            let path = RemotePaths::new(cfg.user.as_str()).path_list_with_slash();
+            match remote.get(&path).await {
                 Ok((0, _)) => {
                     *remote_status.lock().unwrap() = format!("远程存储不可用：{}", cfg.url);
                 }
