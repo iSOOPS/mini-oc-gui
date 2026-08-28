@@ -56,20 +56,28 @@ impl PathEntry {
 /// Validates and normalizes user-supplied local paths.
 ///
 /// The rejection rules are intentionally identical to the original shell
-/// `validate_local_path` / Python `validate_path` implementations, so
-/// the Rust UI accepts exactly the same inputs as the legacy scripts.
+/// `validate_local_path` / Python `validate_path` implementations, with one
+/// extension: Windows-style paths (`C:\Users\foo`) are accepted and
+/// normalized to POSIX form (`C:/Users/foo`) so that the same code path
+/// works on macOS, Linux, and Windows without making Windows users hand-
+/// rewrite their paths. The output is always POSIX forward slashes
+/// regardless of the host OS.
 #[derive(Debug)]
 pub struct PathValidator;
 
 impl PathValidator {
     /// Validate `input` and return its normalized absolute form.
     ///
+    /// Windows-style backslashes in `input` are auto-converted to forward
+    /// slashes; the output contract is always POSIX.
+    ///
     /// # Errors
     /// Returns [`AppError::PathValidation`] if the path fails any rejection
     /// rule. Bare `~` is rejected explicitly; `~/<subpath>` is expanded to
     /// the user's home directory. Paths starting with `/`, `./`, or `../`
     /// are resolved against the current working directory and lexically
-    /// cleaned via [`path_clean`].
+    /// cleaned via [`path_clean`]. Windows drive-letter paths (e.g. `C:/…`)
+    /// are accepted verbatim.
     pub fn validate(input: &str) -> Result<String, AppError> {
         // 1. Protocol scheme (e.g. http://, file://) — never a local path.
         if input.contains("://") {
@@ -78,12 +86,15 @@ impl PathValidator {
             ));
         }
 
-        // 2. Windows-style backslash — force POSIX.
-        if input.contains('\\') {
-            return Err(AppError::PathValidation(
-                "path contains backslash; use POSIX forward slashes".to_string(),
-            ));
-        }
+        // 2. Normalize Windows-style backslashes to POSIX forward slashes.
+        //    Output contract is POSIX (see step 7 below), so accept either
+        //    separator on input rather than rejecting the user outright —
+        //    Windows users routinely paste paths like `C:\Users\foo`.
+        let input = if input.contains('\\') {
+            input.replace('\\', "/")
+        } else {
+            input.to_string()
+        };
 
         // 3. Shell metacharacters that could enable injection.
         const SHELL_META: &str = "$`;&|<>(){}'\"";
@@ -109,14 +120,16 @@ impl PathValidator {
             ));
         }
 
-        // 6. Prefix check — must start with /, ./, ../, or ~/.
+        // 6. Prefix check — must start with /, ./, ../, ~/, or a Windows
+        //    drive letter (C:/, D:/, …) followed by a path component.
         let valid_prefix = input.starts_with('/')
             || input.starts_with("./")
             || input.starts_with("../")
-            || input.starts_with("~/");
+            || input.starts_with("~/")
+            || is_windows_drive_prefix(&input);
         if !valid_prefix {
             return Err(AppError::PathValidation(
-                "path must start with /, ./, ../ or ~/".to_string(),
+                "path must start with /, ./, ../, ~/ or a Windows drive letter (e.g. C:/Users/foo)".to_string(),
             ));
         }
 
@@ -128,6 +141,9 @@ impl PathValidator {
                 )
             })?;
             home.join(rest)
+        } else if is_windows_drive_prefix(&input) {
+            // <Drive>:/<rest> is already absolute on Windows.
+            PathBuf::from(&input)
         } else if input.starts_with('/') {
             PathBuf::from(input)
         } else {
@@ -139,9 +155,9 @@ impl PathValidator {
         };
 
         let cleaned = raw.clean();
-        // On Windows, path-clean rewrites forward slashes to backslashes.
-        // Our validation contract is POSIX-style (we explicitly reject
-        // backslashes in input), so we force forward slashes on the output.
+        // `path_clean` on Windows can rewrite forward slashes to backslashes
+        // (the platform's native separator). Our output contract is POSIX
+        // forward slashes regardless of host OS, so normalize the result.
         let result = cleaned
             .to_string_lossy()
             .into_owned()
@@ -156,6 +172,19 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
+}
+
+/// Returns true if `input` looks like an absolute path on a Windows drive,
+/// i.e. `<Letter>:` followed by `/` (the backslash variant has already been
+/// normalized to `/` by the caller). We require at least one path component
+/// after the colon so a bare `C:` (which is ambiguous between "current dir
+/// on C:" and "drive root") is rejected by the rest of the validator.
+fn is_windows_drive_prefix(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    bytes.len() >= 4
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/'
 }
 
 #[cfg(test)]
@@ -175,9 +204,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_backslash() {
+    fn normalizes_backslash() {
+        // Backslashes are auto-converted to forward slashes so that Windows
+        // users can paste the path verbatim from File Explorer / PowerShell.
+        let got = PathValidator::validate(r"C:\Users\samuel\project").expect("valid");
+        assert_eq!(got, "C:/Users/samuel/project");
+
+        // Even a path with no drive letter gets normalized (cross-platform
+        // safety — a stray backslash should never escape the validator).
+        let got = PathValidator::validate(r"/foo\bar\baz").expect("valid");
+        assert_eq!(got, "/foo/bar/baz");
+    }
+
+    #[test]
+    fn accepts_windows_drive_path() {
+        // Windows drive-letter absolute path passes prefix check.
+        let got = PathValidator::validate("D:/work/oc-gui").expect("valid");
+        assert_eq!(got, "D:/work/oc-gui");
+
+        // Mixed separators also work after normalization.
+        let got = PathValidator::validate(r"E:/code/rust\app").expect("valid");
+        assert_eq!(got, "E:/code/rust/app");
+
+        // Lower-case drive letter is also accepted.
+        let got = PathValidator::validate("c:/Users/Foo").expect("valid");
+        assert_eq!(got, "c:/Users/Foo");
+    }
+
+    #[test]
+    fn rejects_bare_drive_letter() {
+        // `C:` alone is ambiguous between "current dir on C:" and "drive root";
+        // require a path component after the colon.
         assert!(matches!(
-            PathValidator::validate(r"C:\Users\samuel"),
+            PathValidator::validate("C:"),
+            Err(AppError::PathValidation(_))
+        ));
+        // `C` (no colon) is just a relative path — still rejected by prefix check.
+        assert!(matches!(
+            PathValidator::validate("C"),
             Err(AppError::PathValidation(_))
         ));
     }

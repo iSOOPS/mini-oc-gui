@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::AppError;
-use crate::upgrade::UpgradeResult;
+use crate::upgrade::{UpgradeResult, resolve_command};
 
 /// Run `opencode upgrade`, returning `(result, before_version, after_version)`.
 ///
@@ -37,7 +37,12 @@ pub async fn upgrade_opencode() -> Result<(UpgradeResult, String, String), AppEr
 }
 
 async fn run_version() -> Result<String, AppError> {
-    let out = Command::new("opencode")
+    // Windows 上 opencode 通常以 `opencode.cmd` (npm 全局装的 PATHEXT shim) 而非
+    // `opencode.exe` 存在；`Command::new` 走 CreateProcess，不查 PATHEXT，会报
+    // "program not found"。`resolve_command` 会优先调 `where.exe`，否则手动遍历
+    // PATH + PATHEXT，确保能找到 shim。Unix 上只是把名字透传。
+    let bin = resolve_command("opencode")?;
+    let out = Command::new(&bin)
         .arg("--version")
         .output()
         .await
@@ -52,7 +57,8 @@ async fn run_version() -> Result<String, AppError> {
 }
 
 async fn run_upgrade() -> Result<(), AppError> {
-    let out = Command::new("opencode")
+    let bin = resolve_command("opencode")?;
+    let out = Command::new(&bin)
         .arg("upgrade")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

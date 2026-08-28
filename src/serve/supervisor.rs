@@ -1,6 +1,7 @@
 //! Lifecycle supervisor for `opencode serve` (and optional `rathole`).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,11 +76,7 @@ impl ServeSupervisor {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
-        let spec = ProcessSpec::new(opencode_program())
-            .arg("serve")
-            .arg("--port")
-            .arg(port.to_string())
-            .cwd(cwd);
+        let spec = build_opencode_serve_spec(port, cwd);
         let child = spawn_traced(spec).await?;
         let pid = child.pid;
         self.children.lock().await.insert("opencode".to_string(), child);
@@ -195,48 +192,41 @@ impl Default for ServeSupervisor {
     }
 }
 
-/// 解析 `opencode` 可执行程序名（跨平台）。
+/// 构造 `opencode serve --port <port>` 的 [`ProcessSpec`]（跨平台统一）。
 ///
-/// macOS / Linux 上 `opencode` 是真实可执行文件，直接返回裸名即可；
-/// Windows 上 `opencode` 通常是 npm/bun 生成的 `.cmd` / `.exe` shim，
-/// 裸名 `"opencode"` 无法被 `CreateProcessW` 解析（只会补 `.exe` 后缀），
-/// 必须显式解析成 `opencode.exe` 或 `opencode.cmd`。
+/// 解析路径的优先级：
+/// 1. 环境变量 `OPENCODE_BIN`（绝对路径，跳过任何解析）。
+/// 2. `crate::upgrade::resolve_command("opencode")`：Windows 上调用
+///    `where.exe` + PATHEXT 解析 npm 生成的 `.cmd` / `.exe` shim 拿到
+///    绝对路径；Unix 上直接返回裸名（execvp 自动解析）。
+/// 3. 兜底用裸名 `"opencode"` —— spawn 直接失败时给出明确错误信息。
 ///
-/// 优先级：`OPENCODE_BIN` 环境变量 > 平台默认（可执行文件探测）。
-fn opencode_program() -> String {
-    // 1) 显式覆盖优先（与 `RATHOLE_BIN` 一致的设计）。
-    if let Ok(bin) = std::env::var("OPENCODE_BIN") {
-        return bin;
-    }
-
-    // 2) 平台默认。
-    #[cfg(not(target_os = "windows"))]
-    {
-        "opencode".to_string()
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // 官方安装脚本 / bun 安装会生成 `opencode.exe`；npm 安装生成
-        // `opencode.cmd`。按存在性探测，最后回退裸名让 spawn 报错暴露问题。
-        if in_path("opencode.exe") {
-            "opencode.exe".to_string()
-        } else if in_path("opencode.cmd") {
-            "opencode.cmd".to_string()
-        } else {
-            "opencode".to_string()
-        }
-    }
-}
-
-/// 判断可执行文件是否存在于 `PATH` 中（Windows 专用）。
-#[cfg(target_os = "windows")]
-fn in_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p).any(|dir| dir.join(name).is_file())
-        })
-        .unwrap_or(false)
+/// 为什么不走 PowerShell 包装：之前用 `powershell -Command "opencode serve ..."`
+/// 是为了绕开 npm `.cmd` shim 的 quoting 问题，但副作用太多：
+/// * PowerShell 进程自身是 `/SUBSYSTEM:CONSOLE` 程序，**必然**创建一个可见
+///   控制台窗口，即便 stdio 已被 Rust 进程 pipe 走；
+/// * 窗口里没有内容显示（输出全部流到 Rust 这边）→ Windows 控制台 buffer
+///   长期无写入 → 渲染循环停摆 → 用户感觉"切换窗口才能刷新"；
+/// * 多一层 .NET runtime 启动开销 + 进程树深一层（`mini-oc-gui → powershell
+///   → cmd → node → opencode`），kill 链也跟着变长。
+///
+/// 现在改用 `resolve_command` 直接拿绝对路径，配合 `serve::process` 的
+/// `CREATE_NO_WINDOW` flag，从源头消除中间进程和可见窗口。
+///
+/// 若用户希望走 PowerShell 包装以获得最严格的 shell quoting 兼容，可显式
+/// 设置 `OPENCODE_BIN` 指向 `powershell.exe` 并自己组织参数 —— 本函数不
+/// 再提供 PowerShell 默认行为。
+fn build_opencode_serve_spec(port: u16, cwd: String) -> ProcessSpec {
+    let bin = std::env::var("OPENCODE_BIN")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| crate::upgrade::resolve_command("opencode").ok())
+        .unwrap_or_else(|| PathBuf::from("opencode"));
+    ProcessSpec::new(bin.to_string_lossy().into_owned())
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .cwd(cwd)
 }
 
 async fn wait_alive(
