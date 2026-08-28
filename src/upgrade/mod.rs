@@ -41,6 +41,12 @@ impl UpgradeResult {
 /// Windows strategy:
 ///   1. Run `where.exe <name>` — the Windows-native resolver that *does*
 ///      apply `PATHEXT` and prints the resolved path(s) on stdout.
+///      **Important**: `where.exe` 不只列 PATHEXT 命中 —— nvm4w / Git Bash
+///      等会在 PATH 里放"伪可执行"（如 `C:\nvm4w\nodejs\opencode`，一个
+///      `#!/bin/sh` 开头、几百字节的 bash shim）。这些**没有** PATHEXT
+///      后缀，CreateProcess 直接启动会报 `ERROR_BAD_EXE_FORMAT` (193
+///      "不是有效的 exe 程序")。所以这里必须**按 PATHEXT 后缀过滤**
+///      where.exe 的结果，只接受 Windows 原生能识别的可执行格式。
 ///   2. (Fallback) Walk `PATH` manually, appending each `PATHEXT` suffix and
 ///      checking `is_file()`. Used when `where.exe` itself cannot be reached
 ///      (e.g., minimal Windows containers without it on PATH).
@@ -50,25 +56,7 @@ impl UpgradeResult {
 pub fn resolve_command(name: &str) -> Result<PathBuf, AppError> {
     #[cfg(windows)]
     {
-        // Step 1: try the native resolver.
-        if let Ok(out) = std::process::Command::new("where.exe")
-            .arg(name)
-            .output()
-        {
-            if out.status.success() {
-                // `where` may emit multiple lines (one per hit); take the first.
-                if let Some(line) = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(str::trim)
-                    .find(|s| !s.is_empty())
-                {
-                    return Ok(PathBuf::from(line));
-                }
-            }
-        }
-
-        // Step 2: walk PATH with PATHEXT manually.
-        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        // PATHEXT 列表（用于过滤 where.exe 的结果 + Step 2 手动遍历）。
         let exts: Vec<String> = std::env::var_os("PATHEXT")
             .map(|v| v.to_string_lossy().to_string())
             .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
@@ -76,6 +64,32 @@ pub fn resolve_command(name: &str) -> Result<PathBuf, AppError> {
             .filter(|s| !s.is_empty())
             .map(str::to_ascii_lowercase)
             .collect();
+
+        // Step 1: try the native resolver, **filtering by PATHEXT suffix**.
+        // `where.exe` may emit multiple lines; iterate all and pick the first
+        // one whose extension matches a Windows-recognised executable type.
+        if let Ok(out) = std::process::Command::new("where.exe")
+            .arg(name)
+            .output()
+        {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let lower = line.to_ascii_lowercase();
+                    if exts.iter().any(|ext| lower.ends_with(ext)) {
+                        return Ok(PathBuf::from(line));
+                    }
+                    // 命中但扩展名不在 PATHEXT（典型：Git Bash shim），跳过
+                    // 继续找下一个匹配。
+                }
+            }
+        }
+
+        // Step 2: walk PATH with PATHEXT manually.
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
 
         for dir in std::env::split_paths(&path_var) {
             for ext in &exts {
@@ -87,7 +101,7 @@ pub fn resolve_command(name: &str) -> Result<PathBuf, AppError> {
         }
 
         Err(AppError::Internal(format!(
-            "未在 PATH 中找到 `{name}` (Windows 上 where + PATHEXT 解析都失败)"
+            "未在 PATH 中找到 `{name}` (Windows 上 where + PATHEXT 解析都失败；请确认已 `npm install -g` 安装 .cmd shim，或显式设置 OPENCODE_BIN 指向 .exe / .cmd)"
         )))
     }
 

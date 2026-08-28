@@ -37,148 +37,6 @@ pub struct AttachedSession {
     pub started_at: i64,
 }
 
-/// 在新终端标签页执行命令（macOS，优先 iTerm2，回退 Terminal.app）。
-///
-/// # Errors
-/// 返回可读的错误消息。
-#[cfg(target_os = "macos")]
-pub fn spawn_in_new_terminal(command: &str) -> Result<(), String> {
-    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
-
-    let iterm = format!(
-        "tell application \"iTerm2\"\n\
-         if exists current window then\n\
-         tell current window to create tab with default profile\n\
-         else\n\
-         create window with default profile\n\
-         end if\n\
-         tell current session of current window to write text \"{escaped}\"\n\
-         end tell"
-    );
-    let iterm_status = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&iterm)
-        .status();
-    if matches!(iterm_status, Ok(st) if st.success()) {
-        return Ok(());
-    }
-
-    let terminal = format!(
-        "tell application \"Terminal\"\n\
-         activate\n\
-         do script \"{escaped}\"\n\
-         end tell"
-    );
-    let st = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&terminal)
-        .status()
-        .map_err(|e| format!("osascript 执行失败: {e}"))?;
-    if st.success() {
-        Ok(())
-    } else {
-        Err("无法打开新终端（请确认已安装 iTerm2 或 Terminal.app）".to_string())
-    }
-}
-
-/// 在 Windows 弹出一个新的可见控制台窗口并执行命令。
-///
-/// 实现策略：
-///
-///  1. 把整条命令写到 `%TEMP%\oc-attach-<pid>.bat` 里。
-///     `cmd /K "powershell -NoProfile -Command \"…\""` 这种内嵌 PowerShell 的
-///     `script` 字符串经过 cmd 的二次参数解析、PowerShell 的 -Command 引号剥离
-///     之后行为很难跨 Windows 版本预测；写成 `.bat` 后批处理器把文件内容当作
-///     字面命令行执行，quoting 干净，PowerShell 直接看到原本写好的脚本字符串。
-///  2. 拉起 `cmd.exe /K <bat>`，通过 `creation_flags` 同时打开独立可见控制台
-///     并脱离 TUI 的 Ctrl+C/Break：
-///
-///       * `CREATE_NEW_CONSOLE = 0x0010` —— 子进程获得自己的控制台窗口；
-///         否则会继承 TUI 的控制台，要么不开新窗口要么闪退。
-///       * `CREATE_NEW_PROCESS_GROUP = 0x0200` —— TUI 上的 Ctrl+C / Ctrl+Break
-///         不会传导到新会话，误杀 attach 子进程。
-///
-///  3. `/K` 让 cmd 在 `opencode attach` 异常退出后仍保留窗口，方便用户看错误
-///     信息；用户手动关窗即结束。
-///
-/// 为什么不优先 `wt.exe`：Windows Terminal 在很多机器上是 Microsoft Store 的
-/// `APPEXECUTION_ALIAS` stub，`spawn()` 会返回 `Ok` 但根本不打开标签页——继续
-/// 返回 Ok 等于"无声地告诉用户成了"，反而是更大的故障源。所以直接走 `cmd.exe`。
-#[cfg(target_os = "windows")]
-pub fn spawn_in_new_terminal(command: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-
-    // CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
-    const FLAGS: u32 = 0x0210;
-
-    // 1. 写临时 .bat，避开 cmd / PowerShell 双层引号玄学。
-    let pid = std::process::id();
-    let bat_path = std::env::temp_dir().join(format!("oc-attach-{pid}.bat"));
-    std::fs::write(&bat_path, command.as_bytes())
-        .map_err(|e| format!("无法写入临时脚本 {}: {e}", bat_path.display()))?;
-
-    // 2. 拉起新的 cmd.exe 跑这个 bat。Rust 的 Command 会把 `bat_path`
-    //    自动包成带引号的 argv 项传给 CreateProcess，无需手动转义。
-    let result = std::process::Command::new("cmd.exe")
-        .arg("/K")
-        .arg(&bat_path)
-        .creation_flags(FLAGS)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("无法打开新终端：{e}"));
-
-    // 3. bat 文件保留在 %TEMP% 下，重复运行会覆盖。删除不是必要的，且万一
-    //    新 cmd 启动有延迟、读到一半被删，反而出更隐蔽的 bug。
-    result
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn spawn_in_new_terminal(_command: &str) -> Result<(), String> {
-    Err("新终端标签页打开仅在 macOS / Windows 上受支持".to_string())
-}
-
-/// 构造 attach 会话的「PID 文件路径 + 在新终端执行的命令」（跨平台）。
-///
-/// macOS：`bash -c 'echo $$ > pidfile; exec opencode attach ...'`（`$$` 即
-/// opencode 进程 PID，`kill -9` 可直接终止）。
-/// Windows：PowerShell 写自身 `$PID` 到 pidfile 再 `opencode attach`（作为
-/// 子进程），`taskkill /PID <pid> /T /F` 终止整棵进程树。
-#[cfg(target_os = "windows")]
-pub fn attach_launch_spec(
-    url: &str,
-    directory: &str,
-    session: &str,
-    user: &str,
-    password: &str,
-) -> (String, String) {
-    let pid_file = std::env::temp_dir()
-        .join(format!("oc-attach-{session}.pid"))
-        .to_string_lossy()
-        .into_owned();
-    // PowerShell 脚本：写自身 PID，再运行 opencode attach。
-    let script = format!(
-        "$PID | Set-Content -Encoding ascii '{pid_file}'; opencode attach '{url}' --dir '{directory}' --session '{session}' -u '{user}' -p '{password}'"
-    );
-    let command = format!("powershell -NoProfile -Command \"{script}\"");
-    (pid_file, command)
-}
-
-/// macOS / Linux 版：保持原有 `bash -c` 方案不变。
-#[cfg(not(target_os = "windows"))]
-pub fn attach_launch_spec(
-    url: &str,
-    directory: &str,
-    session: &str,
-    user: &str,
-    password: &str,
-) -> (String, String) {
-    let pid_file = format!("/tmp/oc-attach-{session}.pid");
-    let attach_cmd = format!(
-        "opencode attach \"{url}\" --dir \"{directory}\" --session \"{session}\" -u \"{user}\" -p \"{password}\""
-    );
-    let command = format!("bash -c 'echo $$ > {pid_file}; exec {attach_cmd}'");
-    (pid_file, command)
-}
 
 /// 按 PID 终止进程（跨平台）。attach 会话的「杀掉会话」用。
 #[cfg(target_os = "windows")]
@@ -219,6 +77,67 @@ pub async fn choose_folder() -> Result<String, String> {
     }
 }
 
+/// 在 Windows 上查找可用的 PowerShell 可执行文件。
+///
+/// 优先选择 PowerShell 7+ (`pwsh.exe`)，回退到 Windows PowerShell 5.1
+/// (`powershell.exe`)。同时尊重环境变量 `OC_POWERSHELL_BIN` —— 用户可
+/// 显式指定一个 PowerShell 路径（适用于自定义安装位置）。
+///
+/// # 返回
+/// `(binary_name, version_label)`：如 `("pwsh.exe", "PowerShell 7+")` 或
+/// `("powershell.exe", "Windows PowerShell 5.1")`。
+fn resolve_powershell_bin() -> (&'static str, &'static str) {
+    // 1) 显式环境变量优先 —— 用户说了算。
+    if let Ok(custom) = std::env::var("OC_POWERSHELL_BIN") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            // 借用 'static 生命周期：直接把 trimmed 拷贝到泄漏的 Box<str>。
+            let leaked: &'static str = Box::leak(trimmed.to_owned().into_boxed_str());
+            return (leaked, "PowerShell (OC_POWERSHELL_BIN)");
+        }
+    }
+
+    // 2) 优先 pwsh.exe（PowerShell 7+，跨平台一致的二进制名）。
+    if let Ok(pwsh) = which_powershell("pwsh.exe") {
+        let _ = pwsh; // 仅用作存在性探测
+        return ("pwsh.exe", "PowerShell 7+");
+    }
+
+    // 3) 回退到 powershell.exe（Windows PowerShell 5.1，仅 Windows 自带）。
+    if let Ok(ps) = which_powershell("powershell.exe") {
+        let _ = ps;
+        return ("powershell.exe", "Windows PowerShell 5.1");
+    }
+
+    // 4) 都没找到 —— 让 spawn 失败，再由调用方报告清晰错误。
+    ("pwsh.exe", "PowerShell 7+")
+}
+
+/// 通过 `where` (Windows) / `which` (Unix) 检查可执行文件是否在 PATH 中。
+/// 注意：仅用于探测存在性，不会修改全局 PATH。出错时返回 Err，让调用方
+/// 走默认分支（pwsh 优先）。
+fn which_powershell(name: &str) -> Result<std::path::PathBuf, ()> {
+    #[cfg(target_os = "windows")]
+    let mut probe = std::process::Command::new("where");
+    #[cfg(not(target_os = "windows"))]
+    let mut probe = std::process::Command::new("which");
+
+    let output = probe.arg(name).output().ok().filter(|o| o.status.success());
+    match output {
+        Some(o) => {
+            let path = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_owned());
+            match path {
+                Some(p) if !p.is_empty() => Ok(std::path::PathBuf::from(p)),
+                _ => Err(()),
+            }
+        }
+        None => Err(()),
+    }
+}
+
 /// Windows：通过 `Shell.Application` COM 弹出 Windows 原生"选择文件夹"对话框。
 ///
 /// 用 PowerShell 子进程承载对话框（不会阻塞 TUI 的 tokio 事件循环）。
@@ -226,6 +145,10 @@ pub async fn choose_folder() -> Result<String, String> {
 /// **不要求 STA 线程**，因此可以直接通过 `-Command` 跑，PowerShell 进程
 /// 会等用户点完才退出——`tokio::process::Command::output()` 就能直接拿到
 /// 用户选中的路径。
+///
+/// **PowerShell 版本选择**：优先 PowerShell 7+ (`pwsh.exe`)，回退到
+/// Windows PowerShell 5.1 (`powershell.exe`)。可通过环境变量
+/// `OC_POWERSHELL_BIN=<path>` 显式指定使用的 PowerShell 二进制路径。
 ///
 /// flags = 0x41：
 /// * `BIF_RETURNONLYFSDIRS = 0x01` —— 只允许选目录，禁止"选文件"
@@ -239,13 +162,20 @@ pub async fn choose_folder() -> Result<String, String> {
         $folder = $shell.BrowseForFolder(0, '选择项目目录', 0x41, 0); \
         if ($folder) { Write-Output $folder.Self.Path }";
 
-    let output = tokio::process::Command::new("powershell.exe")
+    let (bin, version_label) = resolve_powershell_bin();
+    let output = tokio::process::Command::new(bin)
         .arg("-NoProfile")
         .arg("-Command")
         .arg(SCRIPT)
         .output()
         .await
-        .map_err(|e| format!("启动 PowerShell 失败（请确认 PowerShell 在 PATH 中）：{e}"))?;
+        .map_err(|e| {
+            format!(
+                "启动 {version_label}（{bin}）失败：{e}。\
+                 请确认 PowerShell 已安装并在 PATH 中；\
+                 可设置 OC_POWERSHELL_BIN 指向自定义路径。"
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -372,4 +302,91 @@ impl OpencodeClient {
             .map_err(|e| format!("POST /api/session 响应解析失败: {e}"))?;
         Ok(r.data.id)
     }
+}
+
+/// 同步运行 `opencode attach`，**接管当前进程的控制台**。
+///
+/// 设计意图：attach 必须与用户**直接交互**（用户在 attach 自己的 prompt
+/// 里输入命令、看输出、按 `Ctrl+C`）。任何"弹到独立窗口"的方案都需要中间层
+/// （PowerShell / Windows Terminal），这些中间层跟 attach 共享控制台时会
+/// 出现"输入不显示 / 切换窗口才刷新"的渲染冲突（实测均无法稳定使用）。
+///
+/// 因此唯一稳定的方案是 **同窗口接管**：
+///
+/// 1. mini-oc-gui TUI 先 **suspend**（`LeaveAlternateScreen` + `disable_raw_mode`
+///    + `DisableMouseCapture`），把控制台交还给"普通模式 + 主屏幕"；
+/// 2. spawn `opencode attach ...`，stdin/stdout/stderr **inherit** 父进程的
+///    控制台 —— attach 独占控制台读写；
+/// 3. `child.wait()` 阻塞直到 attach 自然退出（用户在 attach 自己的 prompt
+///    里 `/exit` 或 `Ctrl+C`）；
+/// 4. TUI **resume**（`EnterAlternateScreen` + `enable_raw_mode` +
+///    `EnableMouseCapture` + `terminal.clear()`），force redraw 恢复 TUI 视图。
+///
+/// **多开/多选限制**：attach 期间 TUI 冻结，无法在 TUI 里同时启动或管理多个
+/// attach 会话。这是"同窗口接管"方案的根本取舍 —— 详见 README "Known limitations"
+/// 章节以及设计文档中的"多会话管理方案"讨论。
+///
+/// 进程树（npm 全局装的 opencode 是 .cmd shim，Rust 启动 .cmd 时 Windows
+/// 内部用 cmd.exe 解释）：
+/// ```
+/// mini-oc-gui TUI (suspend 后，attach 期间不响应 TUI 输入)
+/// └── cmd.exe (解释 .cmd shim；自身在等 node.exe 退出，不写控制台)
+///     └── node.exe
+///         └── opencode attach (独占控制台)
+/// ```
+///
+/// `cmd.exe` 在 attach 期间**同步等** node.exe，自己不写控制台 buffer，
+/// 不会与 attach 的渲染冲突 —— 这是与之前 `cmd.exe /K <bat>` 方案的关键区别：
+/// 之前 cmd.exe /K 是被 spawn 来"持有" bat 跑完后的窗口，attach 退出时 cmd.exe
+/// 会**主动刷新 prompt**覆盖 attach 残留；这里 cmd.exe 只是 npm shim 的隐式
+/// 解释器，attach 退出时它跟着 node 一起退，不留任何 prompt 干扰。
+///
+/// `pid_file` 用于 `kill_session` 强杀 attach（万一 attach 卡死，用户切回
+/// TUI 后能从"当前服务"栏触发 taskkill /T /F）。
+///
+/// # Errors
+/// spawn 失败时返回 `std::io::Error`。
+#[allow(clippy::too_many_arguments)]
+pub fn run_attach_blocking(
+    url: &str,
+    directory: &str,
+    session: &str,
+    user: &str,
+    password: &str,
+    pid_file: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::process::{Command, Stdio};
+
+    // 解析 opencode 绝对路径（避免 npm `.cmd` shim 的 quoting 问题）。
+    // Unix 上 resolve_command 直接返回裸名（execvp 自动解析）。
+    let bin = crate::upgrade::resolve_command("opencode")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+
+    let mut child = Command::new(bin.to_string_lossy().as_ref())
+        .arg("attach")
+        .arg(url)
+        .arg("--dir")
+        .arg(directory)
+        .arg("--session")
+        .arg(session)
+        .arg("-u")
+        .arg(user)
+        .arg("-p")
+        .arg(password)
+        // 关键：stdin/stdout/stderr **inherit** 父进程（mini-oc-gui）的控制台。
+        // TUI 已经 suspend，控制台回到 cooked mode + main screen，attach 接管。
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    // 立即写 PID 文件：spawn 返回时 kernel 已分配 PID；如果是 .cmd shim，
+    // child.id() 返回 cmd.exe（解释器）的 PID —— taskkill /T /F <cmd_pid>
+    // 能沿着 cmd.exe → node.exe → attach 整棵树杀干净。
+    let pid = child.id();
+    if let Err(e) = std::fs::write(pid_file, pid.to_string()) {
+        tracing::warn!("写入 attach pid_file {pid_file} 失败: {e}");
+    }
+
+    child.wait()
 }

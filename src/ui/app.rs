@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::attach::{AttachedSession, OcSession, OpencodeClient, attach_launch_spec, choose_folder, kill_process, spawn_in_new_terminal};
+use crate::attach::{AttachedSession, OcSession, OpencodeClient, choose_folder, kill_process};
 use crate::auth::AuthConfig;
 use crate::config::{
     PortsConfig, RatholeConfig, SbConfig, read_persisted_env, write_persisted_env,
@@ -247,6 +247,22 @@ enum ColumnKind {
     Projects,
 }
 
+/// 待执行的 attach 会话 —— 由 trigger_attach 填充，run() 主循环检测后
+/// 调用 `run_attach` 接管控制台跑 `opencode attach`。
+///
+/// 为什么需要这个 flag：trigger_attach 是 `&mut self` 方法，被 click/key
+/// handler 在事件循环里调用，没法直接拿 `DefaultTerminal`（terminal
+/// 是 run() 的局部变量，borrow checker 不允许跨 await 持有）。所以改成：
+/// trigger_attach 把 attach 信息打包塞进 `pending_attach`，run() 主循环
+/// 下一轮迭代开头检测这个 flag，调 `run_attach(&mut terminal)` 执行。
+struct PendingAttach {
+    url: String,
+    directory: String,
+    session: String,
+    user: String,
+    password: String,
+}
+
 /// Main TUI application state.
 pub struct TuiApp {
     /// Process supervisor (opencode + rathole).
@@ -328,6 +344,8 @@ pub struct TuiApp {
     click_regions: Vec<ClickRegion>,
     /// 最近一次鼠标移动的位置（用于日志面板边框 hover 高亮）。
     mouse_pos: Option<(u16, u16)>,
+    /// 待执行的 attach 会话；run() 主循环检测到非 None 后接管控制台跑 attach。
+    pending_attach: Option<PendingAttach>,
 }
 
 impl TuiApp {
@@ -402,6 +420,7 @@ impl TuiApp {
             mouse_pos: None,
             last_main_column_area: ratatui::layout::Rect::default(),
             last_sub_page_area: ratatui::layout::Rect::default(),
+            pending_attach: None,
         }
     }
 
@@ -442,6 +461,20 @@ impl TuiApp {
         }
 
         while !self.should_quit {
+            // 优先检查 pending_attach：trigger_attach 把 attach 信息塞进来后，
+            // run() 主循环下一轮迭代开头检测到，调 `run_attach` 接管控制台。
+            // 这里不能直接 `if let Some(...) = self.pending_attach.take()`，
+            // 因为 `run_attach` 需要 `&mut terminal`，terminal 是 run() 的
+            // 局部变量；需要把 terminal 借用传进去。
+            if self.pending_attach.is_some() {
+                self.run_attach(&mut terminal).await;
+                // 强制重画下一帧（TUI resume 后内容可能变化大）
+                if let Err(e) = terminal.draw(|f| self.render(f)) {
+                    tracing::error!("post-attach draw error: {e}");
+                }
+                continue;
+            }
+
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = terminal.draw(|f| self.render(f)) {
@@ -1475,35 +1508,119 @@ impl TuiApp {
 
     fn trigger_attach(&mut self, directory: String, session: String) {
         let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let (pid_file, wrapped) = attach_launch_spec(
-            &self.attach_url,
-            &directory,
-            &session,
-            &auth.basic_user,
-            &auth.basic_password,
-        );
-        let sessions = self.attached_sessions.clone();
-        let dir_clone = directory.clone();
-        let sess_clone = session.clone();
-        let status = self.status_message.clone();
-        let started_at = chrono::Utc::now().timestamp();
-        tokio::spawn(async move {
-            match spawn_in_new_terminal(&wrapped) {
-                Ok(()) => {
-                    sessions.lock().unwrap().push(AttachedSession {
-                        directory: dir_clone,
-                        session: sess_clone.clone(),
-                        pid_file,
-                        started_at,
-                    });
-                    *status.lock().unwrap() = format!("🚀 已在新终端启动会话 {}", sess_clone);
-                }
-                Err(e) => {
-                    *status.lock().unwrap() = format!("❌ 新终端启动失败：{e}");
-                }
-            }
+        // 不再调 `spawn_in_new_terminal` 弹新窗口 —— 用户从 explorer 双击启动
+        // 时没有"当前 PowerShell"可开新 tab，最干净的方案是让 attach 接管
+        // mini-oc-gui 自己的 conhost 控制台（同窗口、不弹新、TUI 短暂冻结后
+        // resume）。`pending_attach` 携带 attach 信息，run() 主循环下一轮检测
+        // 到后调 `run_attach` 接管控制台。
+        self.pending_attach = Some(PendingAttach {
+            url: self.attach_url.clone(),
+            directory: directory.clone(),
+            session: session.clone(),
+            user: auth.basic_user,
+            password: auth.basic_password,
         });
         self.sub_page = None;
+        *self.status_message.lock().unwrap() =
+            format!("🚀 接管控制台启动 attach 会话 {session}…");
+    }
+
+    /// 接管终端跑 attach：suspend TUI → spawn attach + wait → resume TUI。
+    ///
+    /// 这是**当前唯一稳定的 attach 启动方式**：attach 必须与用户直接交互，
+    /// 任何"弹到独立窗口"的中间层方案（PowerShell 7 / Windows Terminal）
+    /// 都会与 attach 共享控制台，导致渲染冲突（实测均不可用）。
+    ///
+    /// 这是一个**会冻结 TUI** 的同步流程：attach 接管控制台期间，mini-oc-gui
+    /// 不响应任何 TUI 事件。attach 自己的 prompt / Ctrl+C 让它自然退出后，
+    /// TUI resume 重新渲染。这是 tmux / screen 的工作方式 —— 用户进 attach
+    /// 就是为了跟 opencode 交互，TUI 冻结可接受。
+    ///
+    /// **多开/多选限制**：attach 期间 TUI 冻结，无法在 TUI 里同时启动或管理
+    /// 多个 attach 会话。详见 `Known limitations` 设计文档中讨论的"多会话
+    /// 管理方案"（ConPTY 后台会话 + TUI 输入路由）。
+    async fn run_attach(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) {
+        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        use crossterm::execute;
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+
+        let info = match self.pending_attach.take() {
+            Some(i) => i,
+            None => return,
+        };
+
+        // pid_file 在 spawn attach 后由 run_attach_blocking 写入，
+        // 这里预先算路径供后续 kill_session 使用。
+        let pid_file = std::env::temp_dir()
+            .join(format!("oc-attach-{}.pid", info.session))
+            .to_string_lossy()
+            .into_owned();
+
+        // 1) Suspend TUI —— 顺序很重要：先 leave alt screen 再 disable raw mode，
+        //    否则 raw mode 下 leave 之后控制台回到 cooked mode 看着会很乱。
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+
+        // 2) Spawn attach + wait。`spawn_blocking` 把 wait 放到专用线程，
+        //    不阻塞 tokio runtime 的其他后台任务（supervisor status refresh、
+        //    log buffer 等），但 TUI 主循环本身不响应（控制台被 attach 接管）。
+        let url = info.url.clone();
+        let directory = info.directory.clone();
+        let session_id = info.session.clone();
+        let user = info.user;
+        let password = info.password;
+        let pid_file_for_blocking = pid_file.clone();
+        let result =
+            tokio::task::spawn_blocking(move || {
+                crate::attach::run_attach_blocking(
+                    &url,
+                    &directory,
+                    &session_id,
+                    &user,
+                    &password,
+                    &pid_file_for_blocking,
+                )
+            })
+            .await;
+
+        // 3) Resume TUI —— 顺序与 suspend 对称：先 enable mouse + raw mode，
+        //    再 enter alt screen，最后 clear 强制重画（否则 ratatui 内部状态
+        //    与终端实际状态不一致，会显示陈旧画面）。
+        let _ = enable_raw_mode();
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        let _ = terminal.clear();
+
+        // 4) 把这次 attach 加到 attached_sessions，供"当前服务"栏 + kill_session
+        //    使用（万一 attach 卡死，用户切回 TUI 后可触发 taskkill /T /F）。
+        let started_at = chrono::Utc::now().timestamp();
+        self.attached_sessions.lock().unwrap().push(AttachedSession {
+            directory: info.directory.clone(),
+            session: info.session.clone(),
+            pid_file: pid_file.clone(),
+            started_at,
+        });
+
+        // 5) 更新状态栏
+        let msg = match result {
+            Ok(Ok(status)) if status.success() => {
+                format!("✅ attach 会话 {} 已结束", info.session)
+            }
+            Ok(Ok(status)) => format!(
+                "⚠️ attach 会话 {} 退出码 {:?}",
+                info.session,
+                status.code()
+            ),
+            Ok(Err(e)) => format!("❌ attach 启动失败：{e}"),
+            Err(e) => format!("❌ attach 任务异常：{e}"),
+        };
+        *self.status_message.lock().unwrap() = msg;
     }
 
     async fn pop_sub_page(&mut self) {

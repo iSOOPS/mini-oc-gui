@@ -162,5 +162,15 @@ fn build_command(spec: &ProcessSpec) -> Command {
     if let Some(dir) = &spec.working_dir {
         cmd.current_dir(dir);
     }
+    // Windows: 给所有 spawn 出去的子进程加 CREATE_NO_WINDOW，避免它们
+    // 弹出可见控制台窗口。所有 stdio 在 `spawn_traced` / `ChildProcess::spawn`
+    // 里都已被 piped，子进程拿到控制台也没有内容可显示，只会徒增视觉干扰。
+    // 0x08000000 = CREATE_NO_WINDOW；仅影响"是否分配新控制台"，不影响
+    // stdio 继承行为，所以 PowerShell → node → opencode 之类链上的子进程
+    // 同样不会建窗口。
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
     cmd
 }
