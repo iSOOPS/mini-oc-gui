@@ -328,7 +328,7 @@ impl OpencodeClient {
 ///
 /// 进程树（npm 全局装的 opencode 是 .cmd shim，Rust 启动 .cmd 时 Windows
 /// 内部用 cmd.exe 解释）：
-/// ```
+/// ```text
 /// mini-oc-gui TUI (suspend 后，attach 期间不响应 TUI 输入)
 /// └── cmd.exe (解释 .cmd shim；自身在等 node.exe 退出，不写控制台)
 ///     └── node.exe
@@ -389,4 +389,199 @@ pub fn run_attach_blocking(
     }
 
     child.wait()
+}
+
+// ============================================================================
+// 新窗口 attach 模式（思路 2）
+// ============================================================================
+//
+// ## 历史失败路径（全部规避，勿回退）
+//
+// | # | 之前的做法 | 失败现象 | 根因 |
+// |---|-----------|---------|------|
+// | 1 | `powershell -Command "opencode serve ..."` 包装子进程 | serve 场景：中间 PowerShell 必然创建可见控制台，输出被 pipe 走 → 新控制台 buffer 长期无写入 → 渲染循环停摆 → "切窗口才刷新"（supervisor.rs 注释记录） | stdio piped + 子进程又分配了新控制台，两者错位 |
+// | 2 | spawn pwsh + `CREATE_NEW_CONSOLE` 直启 attach | "启动正常、显示正常，但输入不显示、不刷新，切换窗口后才显示" | **Rust std 的 CreateProcess 默认 STARTF_USESTDHANDLES**：即使分配了新 conhost，子进程 stdio 仍指向父进程（mini-oc-gui）的 ConPTY/管道 → attach 的渲染输出全部流回父进程，新窗口 screen buffer 零写入 → conhost 无重绘；切换窗口触发焦点事件才用残留 buffer 全量重绘；raw mode 下回显由 TUI 负责，TUI 输出走错句柄 → "输入不显示" |
+// | 3 | 复用 `serve::process::build_command` 的通用 spawn 路径 | 根本不弹窗 | 该路径全局加 `CREATE_NO_WINDOW (0x08000000)`（process.rs:171-174） |
+// | 4 | `cmd.exe /K <bat>` 持有窗口 | attach 退出时 cmd 主动刷新 prompt，覆盖 attach 残留画面（attach.rs 历史注释记录） | cmd /K 在 attach 结束后回到交互态、重写控制台 |
+// | 5 | 经 npm `.cmd` shim 启动 opencode | 放大 #2 的错位 | `pwsh → cmd.exe → node` 多一层 stdio 转发 |
+// | 6 | 凭据走命令行 `-u -p` | 泄露风险 | 新窗口进程命令行可被 tasklist / WMI / 窗口属性直接看到 |
+//
+// ## 本实现的规避清单
+//
+// 1. **`cmd /c start`（ShellExecute 族）创建新窗口**：`start` 启动的新进程
+//    stdio 由 Windows shell 连接到新分配的控制台，**完全不经过 Rust 进程的
+//    任何句柄** —— 从源头消灭 #1/#2 的句柄错位。启动器 cmd.exe 本身
+//    stdio 全 piped（`.output()`），附着在 TUI 控制台上但零写入、
+//    `start` 异步返回后立即退出，不闪窗、不残留。
+// 2. **不走 `serve::process::build_command`**：此处独立构造 Command，
+//    不加 `CREATE_NO_WINDOW`（规避 #3）。
+// 3. **凭据全部走环境变量**（`OC_ATTACH_*`）：环境块沿
+//    Rust → cmd.exe → start → 新 pwsh 完整继承，命令行里只有脚本路径
+//    （规避 #6）。launcher 脚本内容只引用 `$env:` 变量名，无敏感信息。
+// 4. **优先 `.ps1` shim 直连 node**：`resolve_command` 结果若为 `.cmd`，
+//    且同目录存在 npm 生成的 `.ps1`，改用 `.ps1`（pwsh 原生脚本，
+//    `pwsh → node` 单层，规避 #5）；缺失时回退 `.cmd`——新窗口场景下
+//    整条链的 stdio 都连着同一个新控制台，cmd.exe 同步等 node 退出、
+//    自身不写控制台（同窗口模式已论证无害）。
+// 5. **PID 由新窗口内的 pwsh 自写**：`start` 创建的进程不是 Rust 的子进程，
+//    Rust 拿不到其 PID；脚本第一行把 `$PID` 写入 `OC_ATTACH_PIDFILE`
+//    （兼容现有 kill_session 的 taskkill /T /F 语义，pwsh → node 整树回收）。
+// 6. **`-NoExit` 保持窗口**：attach 退出/失败后窗口留在桌面，用户能看
+//    到退出码与错误输出（规避"失败无声无息"）。
+
+/// 新窗口 attach 的参数集。
+///
+/// 凭据不进命令行（见上 #6），全部经 `OC_ATTACH_*` 环境变量传递。
+#[derive(Debug, Clone)]
+pub struct AttachWindowSpec {
+    /// opencode serve 地址（如 `http://127.0.0.1:9464`）。
+    pub url: String,
+    /// 项目目录。
+    pub directory: String,
+    /// 会话 id。
+    pub session: String,
+    /// HTTP Basic 用户名 → `OC_ATTACH_USER`。
+    pub user: String,
+    /// HTTP Basic 密码 → `OC_ATTACH_PASS`。
+    pub password: String,
+    /// 新窗口 pwsh 把自身 PID 写到这里（kill_session 用）。
+    pub pid_file: String,
+    /// 临时 launcher `.ps1` 路径（内容无敏感信息，可随 pid_file 一并清理）。
+    pub launcher_script: String,
+}
+
+/// launcher 脚本模板：只引用 `$env:` 变量，不含任何敏感值。
+///
+/// - 第一行写 `$PID`（pwsh 自身）→ 兼容 kill_session 的 `taskkill /T /F`
+///   （pwsh → node 进程树整杀）；
+/// - `&` 调用符 + 变量路径：pwsh 自行处理含空格路径，无引号地狱；
+/// - 结尾打印退出码；配合 `-NoExit` 窗口保留，错误可见。
+#[cfg(target_os = "windows")]
+fn launcher_ps1_body() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+$PID | Set-Content -NoNewline -Path $env:OC_ATTACH_PIDFILE
+Write-Host ("== oc attach {0} ==" -f $env:OC_ATTACH_SESSION)
+Write-Host ("dir: {0}" -f $env:OC_ATTACH_DIR)
+Write-Host ("url: {0}" -f $env:OC_ATTACH_URL)
+Write-Host ""
+& $env:OC_ATTACH_BIN attach $env:OC_ATTACH_URL --dir $env:OC_ATTACH_DIR --session $env:OC_ATTACH_SESSION -u $env:OC_ATTACH_USER -p $env:OC_ATTACH_PASS
+$code = $LASTEXITCODE
+Write-Host ""
+Write-Host ("attach 已退出（退出码 {0}），此窗口可安全关闭。" -f $code)
+"#
+}
+
+/// 解析 PowerShell 完整路径（优先 pwsh 7+，回退 5.1，尊重 OC_POWERSHELL_BIN）。
+#[cfg(target_os = "windows")]
+fn resolve_powershell_full_path() -> Result<std::path::PathBuf, String> {
+    if let Ok(custom) = std::env::var("OC_POWERSHELL_BIN") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return Ok(std::path::PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(p) = which_powershell("pwsh.exe") {
+        return Ok(p);
+    }
+    if let Ok(p) = which_powershell("powershell.exe") {
+        return Ok(p);
+    }
+    Err("未找到 PowerShell（pwsh.exe / powershell.exe 都不在 PATH）。可设置 OC_POWERSHELL_BIN 指定路径".to_string())
+}
+
+/// 解析 attach 用的 opencode 入口，优先 `.ps1` shim（pwsh 原生，见规避 #4）。
+#[cfg(target_os = "windows")]
+fn resolve_opencode_for_window() -> Result<std::path::PathBuf, String> {
+    let bin = std::env::var("OPENCODE_BIN")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::upgrade::resolve_command("opencode").ok())
+        .ok_or_else(|| {
+            "未找到 opencode（where + PATHEXT 解析失败）。可设置 OPENCODE_BIN 指向可执行文件".to_string()
+        })?;
+    let is_cmd = bin
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("cmd"))
+        .unwrap_or(false);
+    if is_cmd {
+        let ps1 = bin.with_extension("ps1");
+        if ps1.is_file() {
+            return Ok(ps1);
+        }
+    }
+    Ok(bin)
+}
+
+/// 在**新的 PowerShell 窗口**中启动 `opencode attach`（fire-and-forget）。
+///
+/// 调用后 TUI 不冻结：`cmd /c start` 异步创建新窗口后立即返回。
+/// 失败（找不到 pwsh / opencode、写脚本失败、start 报错）同步返回 Err，
+/// 由调用方在状态栏提示，**不自动回退**同窗口模式（避免掩盖问题）。
+///
+/// **环境前提**：调用进程必须附着真实控制台（TUI 模式天然满足——无论从
+/// Windows Terminal / conhost 启动，还是 explorer 双击 console 程序分配的
+/// 控制台）。`start` 在**无控制台（DETACHED / 全重定向）父上下文**中行为
+/// 退化：新进程不获得独立控制台而是继承管道句柄（实测：cmd 返回 0 但
+/// 脚本不执行、父会话 stdio 管道被 -NoExit 的子进程挂住）。若将来需要
+/// 从无控制台上下文（HTTP API / 服务化）触发，必须改用 `wt.exe` 或
+/// ConPTY 自托管方案，勿复用本函数。
+///
+/// # Errors
+/// 返回可读的中文错误消息。
+#[cfg(target_os = "windows")]
+pub fn spawn_attach_new_window(spec: &AttachWindowSpec) -> Result<(), String> {
+    // 1. 预解析全部路径 —— 错误在 Rust 侧先暴露（cmd/start 的 stderr 已被
+    //    piped 收集，但预检的报错信息更精确）。
+    let pwsh = resolve_powershell_full_path()?;
+    let bin = resolve_opencode_for_window()?;
+
+    // 2. 写 launcher 脚本（内容无敏感信息，见规避 #3/#6）。
+    std::fs::write(&spec.launcher_script, launcher_ps1_body())
+        .map_err(|e| format!("写入 launcher 脚本失败（{}）：{e}", spec.launcher_script))?;
+
+    // 3. 窗口标题：项目目录名，便于用户在任务栏辨识。
+    //    显式给 start 提供标题是关键 —— start 会把第一个带引号的参数当标题，
+    //    不给的话 pwsh 路径（含空格时被引号包裹）会被误当成标题。
+    let name = std::path::Path::new(&spec.directory)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| spec.directory.clone());
+    let title = format!("oc-attach {name}");
+
+    // 4. cmd /c start：ShellExecute 族创建新窗口（规避 #1/#2/#3）。
+    //    `.output()` 等 cmd /c 退出（start 异步，秒回），同时收集
+    //    "找不到 pwsh"之类的启动期错误。
+    let output = std::process::Command::new("cmd")
+        .arg("/c")
+        .arg("start")
+        .arg(title)
+        .arg(&pwsh)
+        .args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass"])
+        .arg("-File")
+        .arg(&spec.launcher_script)
+        // 环境变量链：Rust → cmd.exe → start → 新窗口 pwsh。
+        .env("OC_ATTACH_BIN", &bin)
+        .env("OC_ATTACH_URL", &spec.url)
+        .env("OC_ATTACH_DIR", &spec.directory)
+        .env("OC_ATTACH_SESSION", &spec.session)
+        .env("OC_ATTACH_USER", &spec.user)
+        .env("OC_ATTACH_PASS", &spec.password)
+        .env("OC_ATTACH_PIDFILE", &spec.pid_file)
+        .output()
+        .map_err(|e| format!("启动 cmd /c start 失败：{e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!("新窗口启动失败（cmd start）：{detail}"));
+    }
+    Ok(())
+}
+
+/// 非 Windows 平台：新窗口模式暂未实现，提示回退同窗口模式。
+#[cfg(not(target_os = "windows"))]
+pub fn spawn_attach_new_window(_spec: &AttachWindowSpec) -> Result<(), String> {
+    Err("新窗口模式当前仅支持 Windows，请用 Enter（同窗口 attach）".to_string())
 }

@@ -1301,6 +1301,10 @@ impl TuiApp {
             }
         }
         let _ = std::fs::remove_file(&removed.pid_file);
+        // 新窗口模式：顺带清理 launcher 脚本（与 pid_file 同 basename，
+        // 内容只有 $env: 引用，无敏感信息；留着无害但及时清理更干净）。
+        let launcher = std::path::Path::new(&removed.pid_file).with_extension("launcher.ps1");
+        let _ = std::fs::remove_file(launcher);
         *self.status_message.lock().unwrap() = format!("✅ 已杀死会话：{}", removed.session);
     }
 
@@ -1479,6 +1483,22 @@ impl TuiApp {
         }
     }
 
+    /// 新窗口版的"创建会话并 attach"（W 键在「新建会话」卡片上触发）。
+    async fn create_and_attach_window(&mut self, project: String) {
+        let client = self.build_oc_client();
+        *self.status_message.lock().unwrap() = "🚀 正在创建会话（新窗口模式）…".to_string();
+        match client.create_session(&project).await {
+            Ok(sid) => {
+                let _ = self.store.append_session(&project, &sid).await;
+                let _ = self.store.touch_path(&project).await;
+                self.trigger_attach_window(project, sid);
+            }
+            Err(e) => {
+                *self.status_message.lock().unwrap() = format!("❌ 创建会话失败：{e}");
+            }
+        }
+    }
+
     async fn delete_project(&mut self, project: String) {
         let _ = self.store.remove_path(&project).await;
         *self.status_message.lock().unwrap() = format!("✅ 已删除项目记录：{project}");
@@ -1523,6 +1543,48 @@ impl TuiApp {
         self.sub_page = None;
         *self.status_message.lock().unwrap() =
             format!("🚀 接管控制台启动 attach 会话 {session}…");
+    }
+
+    /// 在新 PowerShell 窗口启动 attach（思路 2，W 键触发）。
+    ///
+    /// 与 [`Self::trigger_attach`]（同窗口接管）的关键差异：
+    /// - TUI **不冻结**：`cmd /c start` 异步创建新窗口后立即返回，
+    ///   可连续开多个 attach 窗口（突破同窗口模式"一次一个"的根本限制）；
+    /// - 不走 suspend/resume 流程，控制台始终归 TUI 所有；
+    /// - PID 由新窗口里的 pwsh 自写 pid_file（start 创建的进程不是本进程
+    ///   子进程，Rust 侧拿不到 PID），kill_session 语义不变。
+    ///
+    /// 失败不自动回退同窗口模式 —— 状态栏提示用户可按 Enter 走稳定路径，
+    /// 避免掩盖新窗口路径的问题。
+    fn trigger_attach_window(&mut self, directory: String, session: String) {
+        let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let base = std::env::temp_dir().join(format!("oc-attach-{session}"));
+        let spec = crate::attach::AttachWindowSpec {
+            url: self.attach_url.clone(),
+            directory: directory.clone(),
+            session: session.clone(),
+            user: auth.basic_user,
+            password: auth.basic_password,
+            pid_file: base.with_extension("pid").to_string_lossy().into_owned(),
+            launcher_script: base.with_extension("launcher.ps1").to_string_lossy().into_owned(),
+        };
+        match crate::attach::spawn_attach_new_window(&spec) {
+            Ok(()) => {
+                self.sub_page = None;
+                self.attached_sessions.lock().unwrap().push(AttachedSession {
+                    directory,
+                    session: session.clone(),
+                    pid_file: spec.pid_file.clone(),
+                    started_at: chrono::Utc::now().timestamp(),
+                });
+                *self.status_message.lock().unwrap() =
+                    format!("🪟 attach 会话 {session} 已在新窗口启动（TUI 保持可用）");
+            }
+            Err(e) => {
+                *self.status_message.lock().unwrap() =
+                    format!("❌ 新窗口启动失败：{e}（可按 T 用本窗口模式）");
+            }
+        }
     }
 
     /// 接管终端跑 attach：suspend TUI → spawn attach + wait → resume TUI。
@@ -1640,7 +1702,15 @@ impl TuiApp {
             InputEvent::Quit | InputEvent::Left => self.pop_sub_page().await,
             InputEvent::Up | InputEvent::Char('k') => self.sub_page_move(-1),
             InputEvent::Down | InputEvent::Char('j') => self.sub_page_move(1),
+            // Enter/→ 默认走**新窗口** attach（思路 2）；T = Takeover 显式选择
+            // 同窗口接管（原模式，稳定回退）。仅 Sessions 子页生效 ——
+            // Projects/ManualPath 等子页的字符键仍作文本输入/导航用。
             InputEvent::Select | InputEvent::Right => self.sub_page_select().await,
+            InputEvent::Char('t') | InputEvent::Char('T')
+                if matches!(&self.sub_page, Some(SubPage::Sessions { .. })) =>
+            {
+                self.sub_page_select_takeover().await;
+            }
             InputEvent::Char(c) => self.sub_page_input(c),
             InputEvent::Backspace => self.sub_page_backspace(),
             _ => {}
@@ -1726,11 +1796,39 @@ impl TuiApp {
                 self.sub_page = Some(SubPage::ManualPath { input: String::new(), error: None });
             }
             SelectAction::EnterSessions(path) => self.enter_sessions(path).await,
-            SelectAction::CreateSession(project) => self.create_and_attach(project).await,
-            SelectAction::Attach(project, sid) => self.trigger_attach(project, sid),
+            // attach 类操作默认走**新窗口**模式（思路 2，Enter/鼠标点击）。
+            SelectAction::CreateSession(project) => self.create_and_attach_window(project).await,
+            SelectAction::Attach(project, sid) => self.trigger_attach_window(project, sid),
             SelectAction::DeleteProject(project) => self.delete_project(project).await,
             SelectAction::ConfirmPath(input) => self.confirm_manual_path(input).await,
             SelectAction::None => {}
+        }
+    }
+
+    /// T 键分支：对 Sessions 子页当前选中项执行**同窗口接管** attach（原模式）。
+    ///
+    /// Enter/鼠标默认新窗口；本路径是新窗口失败时的稳定回退（T = Takeover）。
+    async fn sub_page_select_takeover(&mut self) {
+        let action = match &self.sub_page {
+            Some(SubPage::Sessions { list_state, sessions, project }) => {
+                let i = list_state.selected().unwrap_or(0);
+                if i == 0 {
+                    SelectAction::CreateSession(project.clone())
+                } else if i <= sessions.len() {
+                    SelectAction::Attach(project.clone(), sessions[i - 1].id.clone())
+                } else {
+                    SelectAction::None
+                }
+            }
+            _ => SelectAction::None,
+        };
+        match action {
+            SelectAction::CreateSession(project) => self.create_and_attach(project).await,
+            SelectAction::Attach(project, sid) => self.trigger_attach(project, sid),
+            _ => {
+                *self.status_message.lock().unwrap() =
+                    "💡 T 键用于在会话列表中「新建会话」或选中会话后本窗口接管 attach".to_string();
+            }
         }
     }
 
@@ -2874,8 +2972,14 @@ impl TuiApp {
                 "➕ 新建会话（attach）",
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled("创建新会话并 attach", Style::default().fg(Color::DarkGray))),
-            Line::from(""),
+            Line::from(Span::styled(
+                "创建新会话并 attach",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "Enter 新窗口 · T 本窗口",
+                Style::default().fg(Color::Yellow),
+            )),
         ]
     }
 
@@ -2888,7 +2992,7 @@ impl TuiApp {
             )),
             Line::from(Span::styled(title, Style::default().fg(Color::DarkGray))),
             Line::from(Span::styled(
-                "Enter attach 到此会话",
+                "Enter 新窗口 attach · T 本窗口接管",
                 Style::default().fg(Color::Yellow),
             )),
         ]
