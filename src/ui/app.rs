@@ -1295,17 +1295,41 @@ impl TuiApp {
             }
             sessions.remove(idx)
         };
-        if let Ok(pid_str) = std::fs::read_to_string(&removed.pid_file) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                kill_process(pid);
+        // 杀进程并把结果同时写日志面板（tracing）与状态栏（status_message），
+        // 不让 taskkill 的输出泄漏到终端画面（见 kill_process 注释）。
+        let kill_detail = match std::fs::read_to_string(&removed.pid_file) {
+            Ok(pid_str) => match pid_str.trim().parse::<i32>() {
+                Ok(pid) => kill_process(pid),
+                Err(_) => Err(format!("pid 文件内容无效：{pid_str:?}")),
+            },
+            Err(e) => Err(format!("读取 pid 文件失败（{e}）")),
+        };
+        let msg = match &kill_detail {
+            Ok(detail) => {
+                tracing::info!("已杀死会话 {}：{detail}", removed.session);
+                format!("✅ 已杀死会话：{}（{detail}）", removed.session)
             }
-        }
+            Err(e) => {
+                // taskkill 的「没有找到进程 / not found」= 进程已不在运行，
+                // 会话照样移除，对用户而言结果就是"已终止"。
+                if e.contains("没有找到") || e.to_lowercase().contains("not found") {
+                    tracing::info!(
+                        "会话 {} 的进程已不在运行，无需终止（{e}）",
+                        removed.session
+                    );
+                    format!("✅ 会话 {} 进程已退出（无需终止）", removed.session)
+                } else {
+                    tracing::warn!("杀死会话 {} 失败：{e}", removed.session);
+                    format!("⚠️ 会话 {} 终止异常：{e}", removed.session)
+                }
+            }
+        };
         let _ = std::fs::remove_file(&removed.pid_file);
         // 新窗口模式：顺带清理 launcher 脚本（与 pid_file 同 basename，
         // 内容只有 $env: 引用，无敏感信息；留着无害但及时清理更干净）。
         let launcher = std::path::Path::new(&removed.pid_file).with_extension("launcher.ps1");
         let _ = std::fs::remove_file(launcher);
-        *self.status_message.lock().unwrap() = format!("✅ 已杀死会话：{}", removed.session);
+        *self.status_message.lock().unwrap() = msg;
     }
 
     async fn activate_item(&mut self, item: MenuItem) {
@@ -1491,7 +1515,7 @@ impl TuiApp {
             Ok(sid) => {
                 let _ = self.store.append_session(&project, &sid).await;
                 let _ = self.store.touch_path(&project).await;
-                self.trigger_attach_window(project, sid);
+                self.trigger_attach_window(project, sid).await;
             }
             Err(e) => {
                 *self.status_message.lock().unwrap() = format!("❌ 创建会话失败：{e}");
@@ -1548,15 +1572,17 @@ impl TuiApp {
     /// 在新 PowerShell 窗口启动 attach（思路 2，W 键触发）。
     ///
     /// 与 [`Self::trigger_attach`]（同窗口接管）的关键差异：
-    /// - TUI **不冻结**：`cmd /c start` 异步创建新窗口后立即返回，
-    ///   可连续开多个 attach 窗口（突破同窗口模式"一次一个"的根本限制）；
+    /// - TUI **不冻结**：spawn 走 `tokio::task::spawn_blocking`（写临时
+    ///   脚本 + CreateProcess 的同步耗时不再占用事件循环线程），
+    ///   `cmd /c start` 创建新窗口后立即返回，可连续开多个 attach 窗口
+    ///   （突破同窗口模式"一次一个"的根本限制）；
     /// - 不走 suspend/resume 流程，控制台始终归 TUI 所有；
     /// - PID 由新窗口里的 pwsh 自写 pid_file（start 创建的进程不是本进程
     ///   子进程，Rust 侧拿不到 PID），kill_session 语义不变。
     ///
-    /// 失败不自动回退同窗口模式 —— 状态栏提示用户可按 Enter 走稳定路径，
+    /// 失败不自动回退同窗口模式 —— 状态栏提示用户可按 T 用本窗口模式，
     /// 避免掩盖新窗口路径的问题。
-    fn trigger_attach_window(&mut self, directory: String, session: String) {
+    async fn trigger_attach_window(&mut self, directory: String, session: String) {
         let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
         let base = std::env::temp_dir().join(format!("oc-attach-{session}"));
         let spec = crate::attach::AttachWindowSpec {
@@ -1568,13 +1594,22 @@ impl TuiApp {
             pid_file: base.with_extension("pid").to_string_lossy().into_owned(),
             launcher_script: base.with_extension("launcher.ps1").to_string_lossy().into_owned(),
         };
-        match crate::attach::spawn_attach_new_window(&spec) {
+        // spawn_blocking：内部含同步文件写入 + CreateProcess；即便未来
+        // 再出现同步慢调用（杀软扫描等），也只挂住 blocking 线程池，
+        // 不会冻结 TUI 的 select! 事件循环（渲染 + 输入）。
+        let pid_file = spec.pid_file.clone();
+        let spawn_result = tokio::task::spawn_blocking(move || {
+            crate::attach::spawn_attach_new_window(&spec)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("新窗口启动任务异常（panic）：{e}")));
+        match spawn_result {
             Ok(()) => {
                 self.sub_page = None;
                 self.attached_sessions.lock().unwrap().push(AttachedSession {
                     directory,
                     session: session.clone(),
-                    pid_file: spec.pid_file.clone(),
+                    pid_file,
                     started_at: chrono::Utc::now().timestamp(),
                 });
                 *self.status_message.lock().unwrap() =
@@ -1798,7 +1833,7 @@ impl TuiApp {
             SelectAction::EnterSessions(path) => self.enter_sessions(path).await,
             // attach 类操作默认走**新窗口**模式（思路 2，Enter/鼠标点击）。
             SelectAction::CreateSession(project) => self.create_and_attach_window(project).await,
-            SelectAction::Attach(project, sid) => self.trigger_attach_window(project, sid),
+            SelectAction::Attach(project, sid) => self.trigger_attach_window(project, sid).await,
             SelectAction::DeleteProject(project) => self.delete_project(project).await,
             SelectAction::ConfirmPath(input) => self.confirm_manual_path(input).await,
             SelectAction::None => {}

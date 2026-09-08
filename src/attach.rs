@@ -39,19 +39,49 @@ pub struct AttachedSession {
 
 
 /// 按 PID 终止进程（跨平台）。attach 会话的「杀掉会话」用。
+///
+/// stdio 必须 piped：TUI 模式下子进程的 stdio 默认继承本进程的 ConPTY，
+/// `taskkill` 的「成功: 已终止 PID …」会以裸字节直接刷到终端画面上，
+/// 与 ratatui 的 alt-screen 渲染叠加造成显示错乱，且不会进日志面板。
+/// taskkill 是短命进程（杀完即退），piped + `.output()` 无孙进程挂管道
+/// 问题（区别于 `cmd /c start` 场景，见 `spawn_attach_new_window`）。
+///
+/// # Errors
+/// 进程启动失败或 taskkill 退出码非 0 时返回其 stderr/stdout 文本。
 #[cfg(target_os = "windows")]
-pub fn kill_process(pid: i32) {
-    let _ = std::process::Command::new("taskkill")
+pub fn kill_process(pid: i32) -> Result<String, String> {
+    let out = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .status();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("taskkill 启动失败：{e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        let detail = if stdout.is_empty() { stderr } else { stdout };
+        Ok(if detail.is_empty() { format!("taskkill /T /F {pid}") } else { detail })
+    } else {
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn kill_process(pid: i32) {
-    let _ = std::process::Command::new("kill")
+pub fn kill_process(pid: i32) -> Result<String, String> {
+    let out = std::process::Command::new("kill")
         .arg("-9")
         .arg(pid.to_string())
-        .status();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("kill 启动失败：{e}"))?;
+    if out.status.success() {
+        Ok(format!("kill -9 {pid}"))
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 /// 弹出 macOS 目录选择对话框（Finder），返回用户选择的目录路径。
@@ -410,9 +440,11 @@ pub fn run_attach_blocking(
 //
 // 1. **`cmd /c start`（ShellExecute 族）创建新窗口**：`start` 启动的新进程
 //    stdio 由 Windows shell 连接到新分配的控制台，**完全不经过 Rust 进程的
-//    任何句柄** —— 从源头消灭 #1/#2 的句柄错位。启动器 cmd.exe 本身
-//    stdio 全 piped（`.output()`），附着在 TUI 控制台上但零写入、
-//    `start` 异步返回后立即退出，不闪窗、不残留。
+//    任何句柄** —— 从源头消灭 #1/#2 的句柄错位。启动器 cmd.exe 自身
+//    stdio 显式全 null + `.spawn()`（fire-and-forget）：**绝不能**用
+//    `.output()` / `.status()` 把 cmd stdio 管道化再读至 EOF —— `start`
+//    启动的 pwsh（-NoExit 常驻）会把 cmd 的可继承管道写端继承进句柄表，
+//    管道永无 EOF，父进程永久阻塞（历史实测 bug，详见函数注释）。
 // 2. **不走 `serve::process::build_command`**：此处独立构造 Command，
 //    不加 `CREATE_NO_WINDOW`（规避 #3）。
 // 3. **凭据全部走环境变量**（`OC_ATTACH_*`）：环境块沿
@@ -527,6 +559,16 @@ fn resolve_opencode_for_window() -> Result<std::path::PathBuf, String> {
 /// 从无控制台上下文（HTTP API / 服务化）触发，必须改用 `wt.exe` 或
 /// ConPTY 自托管方案，勿复用本函数。
 ///
+/// **历史 bug（已修复，勿回退）**：曾用 `.output()` 等 cmd 退出并收集启动
+/// 报错，结果 TUI 整体冻结、关掉新窗口才恢复。根因：触发"管道被 -NoExit
+/// 孙进程挂住"的条件是 **cmd.exe 自身 stdio 被管道化**（`.output()` 的
+/// 必然产物），与 Rust 父进程是否附着控制台无关——`start` 内部
+/// CreateProcess 时孙进程 pwsh 把 cmd 的可继承管道写端继承进句柄表
+/// （即使其 stdio 连的是新控制台），管道永无 EOF，`.output()` 的
+/// `read_to_end` 永久阻塞，TUI 事件循环随之冻结。现改为 stdio 全 null +
+/// `.spawn()`：null 句柄即使被孙进程继承也无管道可挂；cmd/start 的启动期
+/// 报错已由下方步骤 1 的 Rust 侧预解析覆盖，无需收集其输出。
+///
 /// # Errors
 /// 返回可读的中文错误消息。
 #[cfg(target_os = "windows")]
@@ -550,9 +592,14 @@ pub fn spawn_attach_new_window(spec: &AttachWindowSpec) -> Result<(), String> {
     let title = format!("oc-attach {name}");
 
     // 4. cmd /c start：ShellExecute 族创建新窗口（规避 #1/#2/#3）。
-    //    `.output()` 等 cmd /c 退出（start 异步，秒回），同时收集
-    //    "找不到 pwsh"之类的启动期错误。
-    let output = std::process::Command::new("cmd")
+    //    stdio 显式全 null + `.spawn()`（fire-and-forget）——绝不能用
+    //    `.output()` / `.status()`：那会把 cmd.exe 的 stdout/stderr 变成
+    //    管道并读取至 EOF，而 `start` 启动的 pwsh（-NoExit 常驻）会把
+    //    cmd 的可继承管道写端继承进句柄表，管道永无 EOF，调用方永久
+    //    阻塞（历史 bug：TUI 冻结直到用户关掉新窗口）。null 句柄即使
+    //    被孙进程继承也无管道可挂；启动期报错已由步骤 1 的 Rust 侧
+    //    预解析覆盖。cmd.exe 秒退，Child 句柄随 drop 释放，无需 wait。
+    let _cmd_child = std::process::Command::new("cmd")
         .arg("/c")
         .arg("start")
         .arg(title)
@@ -568,15 +615,12 @@ pub fn spawn_attach_new_window(spec: &AttachWindowSpec) -> Result<(), String> {
         .env("OC_ATTACH_USER", &spec.user)
         .env("OC_ATTACH_PASS", &spec.password)
         .env("OC_ATTACH_PIDFILE", &spec.pid_file)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|e| format!("启动 cmd /c start 失败：{e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(format!("新窗口启动失败（cmd start）：{detail}"));
-    }
     Ok(())
 }
 

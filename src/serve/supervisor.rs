@@ -310,7 +310,10 @@ async fn terminate_gracefully(child: &mut tokio::process::Child) {
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .output()
             {
-                tracing::debug!(
+                // info（非 debug）：TUI 日志面板默认 filter 是 info，
+                // 让「已终止 PID …」在面板可见；stdio 已 piped，不会泄漏
+                // 到终端画面。
+                tracing::info!(
                     "taskkill /T /F {pid}: {}",
                     String::from_utf8_lossy(&out.stdout).trim()
                 );

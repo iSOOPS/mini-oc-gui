@@ -81,15 +81,22 @@ pub async fn upgrade_omo(
         tracing::info!("detected bun at {}", bun.display());
         tracing::info!("updating {}/node_modules/oh-my-openagent", oc_config_dir.display());
         if oc_config_dir.is_dir() {
-            let status = Command::new(&bun)
+            // piped output（tokio output() 自动 piped + null stdin）：避免
+            // bun 的输出以继承 stdio 的方式直接刷到 TUI 终端画面上；
+            // 结果转发 tracing 进日志面板。
+            let out = Command::new(&bun)
                 .arg("add")
                 .arg("--cwd")
                 .arg(oc_config_dir)
                 .arg("oh-my-openagent@latest")
-                .status()
+                .output()
                 .await
                 .map_err(|e| AppError::Internal(format!("bun add failed: {e}")))?;
-            if status.success() {
+            tracing::info!(
+                "bun add oh-my-openagent@latest: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+            if out.status.success() {
                 return Ok(UpgradeResult::Upgraded);
             }
             tracing::warn!("bun add failed; falling back to npm");
@@ -128,26 +135,34 @@ pub async fn upgrade_omo(
             .arg("--yes")
             .arg("oh-my-openagent@latest")
             .arg("version")
-            .status(),
+            .output(),
     )
     .await
     .map_err(|_| AppError::Internal("npx version probe timed out after 120s".to_string()))?
     .map_err(|e| AppError::Internal(format!("npx version probe failed: {e}")))?;
-    if !npx_probe.success() {
+    tracing::info!(
+        "npx oh-my-openagent@latest version: {}",
+        String::from_utf8_lossy(&npx_probe.stdout).trim()
+    );
+    if !npx_probe.status.success() {
         tracing::warn!("npx oh-my-openagent@latest version exited non-zero");
     }
 
     let node_modules = oc_config_dir.join("node_modules").join("oh-my-openagent");
     if node_modules.exists() {
-        let status = Command::new(&npm)
+        let out = Command::new(&npm)
             .arg("install")
             .arg("oh-my-openagent@latest")
             .arg("--save")
             .current_dir(oc_config_dir)
-            .status()
+            .output()
             .await
             .map_err(|e| AppError::Internal(format!("npm install failed: {e}")))?;
-        if status.success() {
+        tracing::info!(
+            "npm install oh-my-openagent@latest: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+        if out.status.success() {
             Ok(UpgradeResult::Upgraded)
         } else {
             Ok(UpgradeResult::Failed(
