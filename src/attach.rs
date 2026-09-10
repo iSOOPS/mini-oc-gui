@@ -295,6 +295,30 @@ impl OpencodeClient {
             .map_err(|e| format!("GET /session 解析失败: {e}"))
     }
 
+    /// `DELETE /session/{id}` → 在 opencode serve 端删除一个会话。
+    ///
+    /// 与 `list_sessions` 一样不带 `directory` query —— opencode serve 是用
+    /// session id 作为权威键的。404 也算成功（已经被外部删过，幂等）。
+    ///
+    /// # Errors
+    /// 返回可读的错误消息（连接错误 / 非 2xx 状态码）。
+    pub async fn delete_session(&self, sid: &str) -> Result<(), String> {
+        let url = format!("{}/session/{sid}", self.base_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| format!("DELETE /session 请求失败: {e}"))?;
+        let status = resp.status().as_u16();
+        match status {
+            200..=299 => Ok(()),
+            404 => Ok(()), // 幂等：远端已删过
+            s => Err(format!("DELETE /session 返回 HTTP {s}")),
+        }
+    }
+
     /// `POST /api/session` → 创建会话，返回 session id。
     ///
     /// # Errors

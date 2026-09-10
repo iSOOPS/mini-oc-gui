@@ -208,7 +208,7 @@ impl PathListStore {
         }
         let snapshot = entries.clone();
         drop(entries);
-        self.persist(&snapshot).await?;
+        self.persist(&snapshot, false).await?;
         Ok(snapshot)
     }
 
@@ -230,7 +230,7 @@ impl PathListStore {
         let _ = found;
         let snapshot = entries.clone();
         drop(entries);
-        self.persist(&snapshot).await?;
+        self.persist(&snapshot, false).await?;
         Ok(snapshot)
     }
 
@@ -257,26 +257,172 @@ impl PathListStore {
         }
         let snapshot = entries.clone();
         drop(entries);
-        self.persist(&snapshot).await?;
+        self.persist(&snapshot, false).await?;
         Ok(snapshot)
     }
 
     /// Remove a path entry. No-op if absent.
+    ///
+    /// The remote PUT is awaited synchronously (3 retries, 1s backoff);
+    /// a network/server error is returned to the caller rather than
+    /// silently logged, because otherwise the next refresh would
+    /// resurrect the entry from the still-intact remote file.
     pub async fn remove_path(&self, target: &str) -> Result<Vec<PathEntry>, AppError> {
         let target = PathValidator::validate(target)?;
         let mut entries = self.inner.write().await;
         entries.retain(|e| e.path != target);
         let snapshot = entries.clone();
         drop(entries);
-        self.persist(&snapshot).await?;
+        tracing::info!(
+            target: "sync",
+            "remove_path: {} (snapshot now {} entries)",
+            target,
+            snapshot.len()
+        );
+        self.persist(&snapshot, true).await?;
+        Ok(snapshot)
+    }
+
+    /// Remove a single session id from a path's `sections`.
+    ///
+    /// No-op if the path or session id does not exist (idempotent). The
+    /// path entry itself is kept even when `sections` becomes empty — we
+    /// do not auto-delete the project just because its last session was
+    /// removed, since the user may add a new session later.
+    ///
+    /// Like [`remove_path`](Self::remove_path), the remote PUT is awaited
+    /// synchronously; a network/server error is returned to the caller so
+    /// a stale remote cannot resurrect the section on the next refresh.
+    ///
+    /// # Errors
+    /// Returns [`AppError::PathValidation`] if `target` fails validation,
+    /// or [`AppError::Internal`] if the remote push fails after retries.
+    pub async fn remove_session(
+        &self,
+        target: &str,
+        sid: &str,
+    ) -> Result<Vec<PathEntry>, AppError> {
+        let target = PathValidator::validate(target)?;
+        let mut entries = self.inner.write().await;
+        let mut found = false;
+        for e in entries.iter_mut() {
+            if e.path == target {
+                let before = e.sections.len();
+                e.sections.retain(|s| s != sid);
+                if e.sections.len() != before {
+                    found = true;
+                }
+                break;
+            }
+        }
+        let _ = found;
+        let snapshot = entries.clone();
+        drop(entries);
+        tracing::info!(
+            target: "sync",
+            "remove_session: {target} sid={sid} (found={found}, snapshot {} entries)",
+            snapshot.len()
+        );
+        self.persist(&snapshot, true).await?;
         Ok(snapshot)
     }
 
     /// Persist the snapshot to local cache, then push to remote.
-    async fn persist(&self, snapshot: &[PathEntry]) -> Result<(), AppError> {
+    ///
+    /// `is_delete` flips the semantics for **delete** operations
+    /// (`remove_path` / `remove_session`): those must propagate remote
+    /// failures back to the caller — otherwise the user sees a green
+    /// "deleted" status bar while the remote still holds the entry, and
+    /// the next [`refresh`](Self::refresh) will resurrect it from the
+    /// server. For **upsert** operations (add / touch / append) the
+    /// push stays fire-and-forget — losing an add to a transient network
+    /// blip is recoverable via the next refresh; failing loudly every
+    /// time the network flickers would be much worse UX.
+    async fn persist(&self, snapshot: &[PathEntry], is_delete: bool) -> Result<(), AppError> {
         self.cache.write(snapshot).await?;
-        self.async_push(snapshot.to_vec()).await;
-        Ok(())
+        if is_delete {
+            self.push_blocking(snapshot.to_vec()).await
+        } else {
+            self.async_push(snapshot.to_vec()).await;
+            Ok(())
+        }
+    }
+
+    /// Synchronous push used by delete operations. 3 attempts with 1s
+    /// backoff, each transition logged at `info` / `warn` / `error`. On
+    /// exhaustion returns `AppError::Internal` with a short, actionable
+    /// message — the caller (TUI status bar) is expected to surface it.
+    async fn push_blocking(&self, entries: Vec<PathEntry>) -> Result<(), AppError> {
+        let Some(remote_arc) = self.remote.read().await.clone() else {
+            // No remote configured: delete is "local-only" by definition.
+            // Still log so it's clear in the audit trail why we silently
+            // returned Ok.
+            tracing::info!(
+                target: "sync",
+                "remote not configured; delete applied to local cache only ({} entries)",
+                entries.len()
+            );
+            return Ok(());
+        };
+
+        let body = serde_json::to_string_pretty(&entries).map_err(|e| {
+            tracing::error!(target: "sync", "push serialize failed: {}", e);
+            AppError::Internal(format!("serialize path-list: {e}"))
+        })?;
+
+        let mut remote = remote_arc;
+        let path = RemotePaths::new(remote.user.as_deref().unwrap_or("unknown"))
+            .path_list_with_slash();
+
+        tracing::info!(
+            target: "sync",
+            "delete push start: PUT {path} ({} entries)",
+            entries.len()
+        );
+
+        for attempt in 1..=3 {
+            match remote.put(&path, &body).await {
+                Ok(200..=299) => {
+                    tracing::info!(
+                        target: "sync",
+                        "delete push ok: PUT {path} succeeded on attempt {attempt}"
+                    );
+                    return Ok(());
+                }
+                Ok(status) if status == 0 => {
+                    tracing::warn!(
+                        target: "sync",
+                        "delete push attempt {attempt}/3: network unreachable (PUT {path})"
+                    );
+                }
+                Ok(status) => {
+                    tracing::warn!(
+                        target: "sync",
+                        "delete push attempt {attempt}/3: PUT {path} returned HTTP {status}"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "sync",
+                        "delete push attempt {attempt}/3: PUT {path} errored: {e}"
+                    );
+                }
+            }
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+
+        tracing::error!(
+            target: "sync",
+            "delete push failed after 3 attempts: PUT {path} — local cache was already updated; \
+             remote is out of sync until next refresh or manual retry"
+        );
+        Err(AppError::Internal(
+            "remote path-list push failed after 3 attempts (see logs); \
+             local cache updated but remote still holds the deleted entry"
+                .to_string(),
+        ))
     }
 
     async fn async_push(&self, entries: Vec<PathEntry>) {
@@ -588,5 +734,63 @@ mod tests {
 
         let report = store.migrate_from_legacy_remote().await.expect("migrate");
         assert_eq!(report.migrated_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_path_without_remote_returns_ok_and_drops_locally() {
+        // Without a remote configured, removing a path is a local-only
+        // operation and must succeed. Locks the "is_delete=true path is
+        // exercised, no remote -> Ok" branch of push_blocking.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache.clone());
+
+        store
+            .upsert_path("/proj/keep")
+            .await
+            .expect("upsert /proj/keep");
+        store
+            .upsert_path("/proj/drop")
+            .await
+            .expect("upsert /proj/drop");
+
+        let after = store
+            .remove_path("/proj/drop")
+            .await
+            .expect("remove_path must succeed when no remote");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].path, "/proj/keep");
+
+        // Local cache must reflect the delete — otherwise the next
+        // process restart would resurrect the entry from disk.
+        let on_disk = cache.read().await.expect("read cache");
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].path, "/proj/keep");
+    }
+
+    #[tokio::test]
+    async fn remove_session_without_remote_returns_ok() {
+        // Same contract for remove_session: no remote -> Ok, local
+        // snapshot has the sid filtered out.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        store.upsert_path("/proj").await.expect("upsert");
+        store
+            .append_session("/proj", "ses_keep")
+            .await
+            .expect("append keep");
+        store
+            .append_session("/proj", "ses_drop")
+            .await
+            .expect("append drop");
+
+        let after = store
+            .remove_session("/proj", "ses_drop")
+            .await
+            .expect("remove_session must succeed when no remote");
+        let entry = after.iter().find(|e| e.path == "/proj").expect("/proj");
+        assert_eq!(entry.sections, vec!["ses_keep".to_string()]);
     }
 }

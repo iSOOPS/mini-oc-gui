@@ -66,6 +66,93 @@ impl ServeSupervisor {
         Ok(())
     }
 
+    /// 找出占用 `port` 的所有进程 PID，并强杀它们（Windows 用 `taskkill /T /F`，
+    /// Unix 用 `kill -9`）。返回成功终止的 PID 列表。
+    ///
+    /// 设计意图：当用户在 TUI 弹框中确认「端口 X 被占用，是否杀死进程并继续？」
+    /// 后调用此函数，把占用进程整树杀掉，再让 `launch_opencode` 重新检查端口
+    /// （此时 `is_port_busy` 应返回 false）。
+    ///
+    /// 实现要点：
+    /// - **PID 收集**：Windows 上用 `netstat -ano` + grep `:PORT` → 取最后一列 PID；
+    ///   Unix 上用 `lsof -nP -tiTCP:<PORT> -sTCP:LISTEN`。两条命令都是同步阻塞，
+    ///   但调用方在 tokio 上下文里（`spawn_blocking` 适合，但命令通常 < 100ms）。
+    ///   为避免在 async 上下文中阻塞，这里用 `tokio::process::Command` 异步版本。
+    /// - **去重 + 过滤**：多个 PID 可能指向同一进程组，杀两次无害（taskkill /T /F
+    ///   已杀进程时返回错误，filter 掉）。
+    /// - **不递归等待**：每个 PID 单独 spawn 杀进程命令，不 wait 退出码
+    ///   （避免占用进程的子进程还在 spawn 时，taskkill 已 SIGKILL 父进程导致
+    ///   孙进程成为孤儿；taskkill /T /F 自身会整树清理）。
+    ///
+    /// # Errors
+    /// 找出占用 `port` 的所有进程 PID 并强杀它们（Windows `taskkill /T /F`，
+    /// Unix `kill -9`），返回成功终止的 PID 列表。
+    ///
+    /// **与上一版的区别**：
+    /// 1. `kill_pid_force` 现在严格检查 taskkill exit code + stderr —— 失败的
+    ///    进程不会被加入 `killed` 列表，避免上层误判"已杀"。
+    /// 2. 杀完后会重试一次 `find_port_listeners` —— 第一次可能漏掉 child PID
+    ///    （如 opencode.exe 是 shim 启动的多层进程树，外层父进程退出后，
+    ///    内层 node 进程才接管 socket），重试确保不留活口。
+    /// 3. 每一步都打 tracing 日志，便于用户复盘 kill 流程。
+    ///
+    /// 调用方拿到结果后应再调 `is_port_busy` 做最终验证（socket 释放有延迟）。
+    pub async fn kill_port_listener(port: u16) -> Vec<u32> {
+        tracing::info!(target: "kill_port", "开始清理端口 {port} 占用进程");
+        let mut all_killed = Vec::new();
+        for attempt in 1..=2u8 {
+            let pids = match find_port_listeners(port).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("查询端口 {port} 占用进程失败：{e}");
+                    return all_killed;
+                }
+            };
+            if pids.is_empty() {
+                tracing::info!("端口 {port} 未发现占用进程（第 {attempt} 次扫描）");
+                break;
+            }
+            tracing::info!(
+                "端口 {port} 第 {attempt} 次扫描发现占用进程: {:?}",
+                pids
+            );
+            for pid in pids {
+                if all_killed.contains(&pid) {
+                    continue;
+                }
+                match kill_pid_force(port, pid).await {
+                    Ok(()) => {
+                        all_killed.push(pid);
+                        tracing::info!("端口 {port}: 已终止 PID {pid}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "端口 {port}: 终止 PID {pid} 失败（已记日志，由上层决定是否重试）：{e}"
+                        );
+                    }
+                }
+            }
+            // 第一次杀完后稍等 socket 释放 + 可能的 child 进程接管。
+            if attempt == 1 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        if all_killed.is_empty() {
+            tracing::warn!(
+                target: "kill_port",
+                "端口 {port} 清理完成：未终止任何进程（可能权限不足或 PID 已退出）"
+            );
+        } else {
+            tracing::info!(
+                target: "kill_port",
+                "端口 {port} 清理完成：已终止 PID {:?}（共 {} 个）",
+                all_killed,
+                all_killed.len()
+            );
+        }
+        all_killed
+    }
+
     /// Launch `opencode serve --port <port>`. Returns the PID.
     ///
     /// # Errors
@@ -322,4 +409,144 @@ async fn terminate_gracefully(child: &mut tokio::process::Child) {
     }
 
     let _ = child.kill().await;
+}
+
+/// 列出正在监听 `port` 的所有进程 PID。供 [`ServeSupervisor::kill_port_listener`] 使用。
+///
+/// - Windows：`netstat -ano` 输出用 GBK/UTF-8 解码（中文 Windows 默认 GBK；
+///   PowerShell 7+ 的 netstat 通常输出 UTF-8；逐字节解析不需要关心编码）。
+/// - Unix：`lsof -nP -tiTCP:<PORT> -sTCP:LISTEN` 输出是 PID 列表（每行一个）。
+///
+/// 两个平台都用 `tokio::process::Command` 异步跑，避免阻塞 TUI 事件循环。
+async fn find_port_listeners(port: u16) -> Result<Vec<u32>, AppError> {
+    #[cfg(windows)]
+    {
+        let out = tokio::process::Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(format!("netstat 启动失败：{e}"))))?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let needle = format!(":{}", port);
+        let mut pids = std::collections::HashSet::new();
+        for line in text.lines() {
+            // netstat -ano 输出行格式：`  TCP    0.0.0.0:9464    0.0.0.0:0    LISTENING    1234`
+            // 取最后一列作 PID；只取 LISTENING 状态的行（避免误伤已建立的连接）。
+            let upper = line.to_ascii_uppercase();
+            if !upper.contains("LISTENING") {
+                continue;
+            }
+            if !line.contains(&needle) {
+                continue;
+            }
+            if let Some(pid_str) = line.split_whitespace().last() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if pid > 0 {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+        Ok(pids.into_iter().collect())
+    }
+    #[cfg(unix)]
+    {
+        let out = tokio::process::Command::new("lsof")
+            .args([
+                "-nP",
+                &format!("-iTCP:{}", port),
+                "-sTCP:LISTEN",
+                "-t", // terse: only PIDs
+            ])
+            .output()
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(format!("lsof 启动失败：{e}"))))?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pids = Vec::new();
+        for line in text.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                if pid > 0 {
+                    pids.push(pid);
+                }
+            }
+        }
+        Ok(pids)
+    }
+}
+
+/// 强杀单个 PID（进程树）。Windows 走 `taskkill /T /F`，Unix 走 `kill -9`。
+///
+/// **关键**：必须检查 exit code + stderr！taskkill 把成功信息写 stdout、
+/// 错误信息写 stderr；旧实现只读 stdout、忽略退出码，导致 taskkill 失败
+/// 时（如权限不足、PID 不存在）仍返回 Ok，上层以为杀成功了。
+///
+/// 返回 `Ok(())` 表示进程**确实**被终止（taskkill exit code 0）。
+/// 返回 `Err(...)` 表示 kill 命令失败，错误消息包含 stdout + stderr 摘要
+/// 供上层日志和用户提示使用。
+async fn kill_pid_force(port: u16, pid: u32) -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        let out = tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(format!("taskkill 启动失败：{e}"))))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let exit_code = out.status.code();
+        if out.status.success() {
+            tracing::info!("taskkill /T /F PID {pid} (port {port}) 成功: {stdout}");
+            Ok(())
+        } else {
+            // 把 stderr 当作主要错误源（taskkill 把错误信息写 stderr），
+            // 若 stderr 空则用 exit code。
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit code {:?}", exit_code)
+            };
+            tracing::warn!(
+                "taskkill /T /F PID {pid} (port {port}) 失败 (exit={:?}): {detail}",
+                exit_code
+            );
+            Err(AppError::Internal(format!(
+                "taskkill /T /F PID {pid} 失败：{detail}"
+            )))
+        }
+    }
+    #[cfg(unix)]
+    {
+        let out = tokio::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(format!("kill 启动失败：{e}"))))?;
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if out.status.success() {
+            tracing::info!("kill -9 PID {pid} (port {port}) 成功");
+            Ok(())
+        } else {
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else {
+                format!("exit code {:?}", out.status.code())
+            };
+            tracing::warn!("kill -9 PID {pid} (port {port}) 失败: {detail}");
+            Err(AppError::Internal(format!(
+                "kill -9 PID {pid} 失败：{detail}"
+            )))
+        }
+    }
 }

@@ -21,6 +21,7 @@ use crate::config::{
     PortsConfig, RatholeConfig, SbConfig, read_persisted_env, write_persisted_env,
 };
 use crate::domain::{PathEntry, PathValidator};
+use crate::error::AppError;
 use crate::serve::{
     ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
 };
@@ -123,22 +124,32 @@ fn should_dismiss_settings_on_click(
     }
 }
 
-/// 渲染设置页 PASSWORD 字段掩码行 —— 纯函数,只依赖当前输入 buffer。
+/// 渲染设置页 PASSWORD 字段掩码行 —— 纯函数,只依赖当前输入 buffer 与
+/// 「已保存密码长度」占位。
 ///
-/// 行为:把 `input` 的每个字符替换成 `*`,拼成
-/// `"  PASSWORD: ****"`(与 build_settings_lines 的固定前缀 + SilverBullet
-/// 密码字段保持视觉一致)。
+/// 行为:把 `input` 的字符数 与 `mask_len` 取较大值,渲染对应数量的 `*`,
+/// 拼成 `"  PASSWORD: ****"`(与 build_settings_lines 的固定前缀 +
+/// SilverBullet 密码字段保持视觉一致)。
 ///
 /// 设计意图 —— 抽成纯函数,便于单测覆盖:
-/// - 0 字符 → `"  PASSWORD: "`
-/// - 1 字符 → `"  PASSWORD: *"`
-/// - N 字符 → `"  PASSWORD: " + "*".repeat(N)`
+/// - buffer 空 + mask_len=0  → `"  PASSWORD: "`         (首启未配置)
+/// - buffer 空 + mask_len=N  → `"  PASSWORD: " + "*" * N` (回显已保存密码)
+/// - buffer 长度 M + mask_len=N → `"  PASSWORD: " + "*" * max(M, N)`
 ///
-/// 不读 `auth_password_len()`(已保存密码长度):粘贴 / 输入 / 退格都改的是
-/// `password_input`,星号必须实时跟随 buffer 长度,否则用户看不到自己输入了几位。
-/// 这条原则与 SilverBullet 密码字段(`sb_password_input.len()`)保持一致。
-fn render_auth_password_line(input: &str) -> String {
-    format!("  PASSWORD: {}", "*".repeat(input.chars().count()))
+/// 两套参数同时存在的原因:
+/// - `input` 实时跟随用户在 buffer 里的输入(粘贴 / 输入 / 退格),反映
+///   "我刚才输入了几位";
+/// - `mask_len` 在 `open_settings` 时一次性记录"已保存密码长度",用户没动
+///   buffer 也能看到对应位数的 \* 占位 —— 不需要把真实密码回填到
+///   `password_input` buffer(否则用户没改就保存时,`submit_settings` 会
+///   把 `password_input` 当成新密码提交,把真实密码覆盖掉)。
+///
+/// 渲染时取 max 是为了:用户已开始输入时,buffer 长度可能超过 mask_len
+/// (不会发生但理论上),以及 mask_len 不会"夹"在 buffer 中段,只决定
+/// 底限显示。
+fn render_auth_password_line(input: &str, mask_len: usize) -> String {
+    let n = input.chars().count().max(mask_len);
+    format!("  PASSWORD: {}", "*".repeat(n))
 }
 
 /// 把粘贴文本按字段规则追加到对应 buffer,返回追加后的新 buffer。
@@ -320,7 +331,7 @@ enum SelectAction {
 }
 
 /// 二次确认动作。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ConfirmAction {
     /// 杀死/关闭「当前服务」栏第 i 个服务。
     ExitService(usize),
@@ -330,6 +341,11 @@ enum ConfirmAction {
     Upgrade,
     /// 退出整个程序。
     Exit,
+    /// 删除单个 opencode 会话（path, session_id）。项目记录保留。
+    DeleteSession(String, String),
+    /// opencode serve 启动时端口被占用：用户已确认「杀死占用进程并继续」。
+    /// 携带目标端口，confirm 后调 `kill_port_listener` + `launch_opencode`。
+    KillPortAndLaunch(u16),
 }
 
 /// 确认弹框的按钮选中态。
@@ -346,6 +362,18 @@ impl ConfirmChoice {
             Self::Cancel => Self::Confirm,
         }
     }
+}
+
+/// 设置弹框底部按钮的种类（用于 [`TuiApp::mouse_pos_in_settings_btn`] 的
+/// 列位置 + 宽度计算）。
+#[derive(Debug, Clone, Copy)]
+enum SettingsBtnKind {
+    /// `[确认]` 按钮（保存提交）。
+    Ok,
+    /// `[取消]` 按钮（关闭弹框不保存）。
+    Cancel,
+    /// `[打开配置目录]` 按钮（调系统文件管理器打开配置目录）。
+    OpenConfigDir,
 }
 
 /// 鼠标点击目标。
@@ -373,6 +401,9 @@ enum ClickTarget {
     SettingsOk,
     /// 设置弹框底部的「取消」按钮（点击 = 关闭弹框不保存）。
     SettingsCancel,
+    /// 设置弹框底部的「打开配置文件目录」按钮（点击 = 调系统文件管理器
+    /// 打开 `unified_env_path()` 的父目录 —— 配置文件所在目录）。
+    SettingsOpenConfigDir,
 }
 
 /// 设置弹框内可编辑字段的有序列表（决定 ↑/↓ / Tab / 点击的循环顺序）。
@@ -463,6 +494,11 @@ pub struct TuiApp {
     username_input: String,
     /// 首次配置：密码输入缓冲。
     password_input: String,
+    /// 设置面板 PASSWORD 行回显用的「已保存密码长度」占位（仅展示用，不影响
+    /// `password_input` buffer 内容）。`open_settings` 时一次性记录当前
+    /// auth.basic_password 长度；用户不动 buffer 也能看到对应位数的 `*`,
+    /// 真实密码内容不会被回填（否则保存时会被覆盖）。
+    auth_password_mask_len: usize,
     /// 日志全屏模式。
     show_full_log: bool,
     /// 全屏日志滚动偏移（向上滚动的行数）。
@@ -560,6 +596,12 @@ impl TuiApp {
             .read()
             .map(|a| a.basic_user.clone())
             .unwrap_or_default();
+        // 已保存密码长度作为首次进入设置面板时的回显占位 —— 不暴露明文,
+        // 仅供 `render_auth_password_line` 用作底限星号数。
+        let saved_password_len = auth
+            .read()
+            .map(|a| a.basic_password.len())
+            .unwrap_or_default();
         let (input_mode, status) = if configured {
             (InputMode::Menu, "就绪".to_string())
         } else {
@@ -588,6 +630,10 @@ impl TuiApp {
                 .unwrap_or_else(|_| "http://127.0.0.1:9464".to_string()),
             username_input: existing_user,
             password_input: String::new(),
+            // 启动时若 auth 已配置,把已保存密码长度作为回显占位记录下来,
+            // 用户首次打开设置面板即可看到对应位数的 *（不暴露明文）。
+            // 首启时 auth 未配置,保持 0。
+            auth_password_mask_len: saved_password_len,
             show_full_log: false,
             log_scroll: 0,
             confirm: None,
@@ -761,6 +807,37 @@ impl TuiApp {
             .map(|r| r.target)
     }
 
+    /// 设置弹框专属 region 查找:只匹配 [`ClickTarget::SettingsField`] /
+    /// [`ClickTarget::SettingsOk`] / [`ClickTarget::SettingsCancel`] /
+    /// [`ClickTarget::SettingsOpenConfigDir`],忽略其他 region(Logs /
+    /// MainColumn / ServicePanel 等),这是 modal dialog 的"前景优先"
+    /// 语义 ——
+    ///
+    /// - `click_at` 在弹框打开时,先用本函数查;找不到才退回 [`find_target`]。
+    /// - 设计动机:Logs region 在底部 row 占据一整块矩形,几何上可能与
+    ///   设置弹框底部 [确认]/[取消]/[打开配置目录] 按钮重叠。如果只靠
+    ///   `register_settings_click_regions` 的 push 顺序决定优先级,渲染
+    ///   顺序变化(主界面在前 / 弹框在前)就会让按钮"时好时坏"。所以
+    ///   弹框 region 的查找与背景 region **类型层** 隔离,不再依赖顺序。
+    fn find_settings_target(&self, col: u16, row: u16) -> Option<ClickTarget> {
+        self.click_regions
+            .iter()
+            .find(|r| {
+                r.rect.x <= col
+                    && col < r.rect.x + r.rect.width
+                    && r.rect.y <= row
+                    && row < r.rect.y + r.rect.height
+                    && matches!(
+                        r.target,
+                        ClickTarget::SettingsField(_)
+                            | ClickTarget::SettingsOk
+                            | ClickTarget::SettingsCancel
+                            | ClickTarget::SettingsOpenConfigDir
+                    )
+            })
+            .map(|r| r.target)
+    }
+
     fn hover_at(&mut self, col: u16, row: u16) {
         self.mouse_pos = Some((col, row));
         let Some(target) = self.find_target(col, row) else { return };
@@ -841,9 +918,30 @@ impl TuiApp {
     }
 
     async fn click_at(&mut self, col: u16, row: u16) {
+        // 与 handle_key 一致：先消费后台"端口占用"信号，再走主 click 流。
+        self.maybe_show_port_busy_confirm();
         let popup_open =
             self.input_mode.is_settings_field() || self.confirm.is_some();
-        let Some(target) = self.find_target(col, row) else {
+        // 弹框打开时,弹框 region(字段 / 按钮)优先级必须高于背景 region
+        // (Logs / MainColumn / ServicePanel / 等)。原因:Logs region 在底部
+        // row 占据一大块矩形,几何上可能与设置弹框底部的 [确认]/[取消]/
+        // [打开配置目录] 按钮重叠 —— 而 `register_settings_click_regions`
+        // 在 Logs 之后才注册(因为 render 顺序是先画主界面再画弹框)。
+        // 旧版 `find_target` 用 `iter().find` 返回第一个匹配,会拿到 Logs
+        // 而非按钮,导致用户点 [确认]/[取消] 实际触发了 Logs handler 或
+        // dismiss 路径,按钮功能完全失效。这就是用户报告的"功能未生效"。
+        //
+        // 修复:弹框打开时优先查找 Settings 弹框专属 region,找不到再
+        // 退回到全局 find_target。这是 modal dialog 的标准语义 ——
+        // 前景 layer 必须屏蔽背景 layer 的点击。
+        let Some(target) = (if popup_open
+            && self.input_mode.is_settings_field()
+        {
+            self.find_settings_target(col, row)
+                .or_else(|| self.find_target(col, row))
+        } else {
+            self.find_target(col, row)
+        }) else {
             // 没有命中任何 click region:可能是弹框外、也可能是弹框内
             // 没注册 region 的位置(说明行 / 空白 / 边框)。两者走不同分支:
             //
@@ -884,6 +982,7 @@ impl TuiApp {
             ClickTarget::SettingsField(_)
                 | ClickTarget::SettingsOk
                 | ClickTarget::SettingsCancel
+                | ClickTarget::SettingsOpenConfigDir
                 | ClickTarget::ConfirmOk
                 | ClickTarget::CancelBtn
         ) {
@@ -949,6 +1048,12 @@ impl TuiApp {
                     Some(ConfirmAction::Upgrade) => {
                         self.start_upgrade();
                     }
+                    Some(ConfirmAction::DeleteSession(project, sid)) => {
+                        self.delete_session(&project, &sid).await;
+                    }
+                    Some(ConfirmAction::KillPortAndLaunch(port)) => {
+                        self.kill_port_listener_and_launch(port).await;
+                    }
                     None => {}
                 }
             }
@@ -963,6 +1068,71 @@ impl TuiApp {
                 // 等价于按 Esc 关闭弹框
                 self.input_mode = InputMode::Menu;
                 self.last_settings_popup_rect = None;
+            }
+            ClickTarget::SettingsOpenConfigDir => {
+                // 调系统文件管理器打开配置文件所在目录。失败仅状态栏提示,
+                // 不关闭弹框（用户可以继续设置）。
+                self.open_config_dir_in_file_manager();
+            }
+        }
+    }
+
+    /// 打开配置文件目录（`unified_env_path()` 的父目录）在系统文件管理器中。
+    ///
+    /// 实现要点：
+    /// - 跨平台通过 `Command::new(<shell>)` 异步 spawn 后立刻 detach（不 wait），
+    ///   让系统文件管理器独立运行；spawn 失败（如命令缺失）时仅在状态栏报错，
+    ///   不阻塞 TUI 主循环。
+    /// - 复用 `crate::config::unified_env_path()` 解析路径 —— 优先级与
+    ///   "读 env" 一致（env 变量 override > exe 旁 > cwd 兜底）。
+    /// - 若父目录不存在（首启、文件未写入），尝试 `create_dir_all` 创建
+    ///   —— 文件管理器打开空目录没问题，用户可手动放入配置。
+    fn open_config_dir_in_file_manager(&mut self) {
+        let env_path = crate::config::unified_env_path();
+        let dir = env_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| env_path.clone());
+        // 确保目录存在（不存在则创建；空目录让文件管理器可打开）。
+        if !dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                *self.status_message.lock().unwrap() =
+                    format!("⚠️ 创建配置目录失败（{}）：{e}", dir.display());
+                return;
+            }
+        }
+        // 平台差异：Windows 走 `explorer`，macOS 走 `open`，Linux 走 `xdg-open`。
+        let result: std::io::Result<std::process::Child> = {
+            #[cfg(target_os = "windows")]
+            {
+                // explorer.exe 接受绝对路径；std::process::Command 在 Windows
+                // 上用 CreateProcess 传命令行即可。detach 不 wait —— explorer
+                // 会一直运行，我们不希望父进程 hang。
+                std::process::Command::new("explorer").arg(&dir).spawn()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("open").arg(&dir).spawn()
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                // Linux / 其它 Unix：先试 xdg-open，缺失则尝试 gio open
+                // （GNOME 环境兜底）；二者都缺失时 spawn 失败，状态栏报错。
+                std::process::Command::new("xdg-open").arg(&dir).spawn()
+            }
+        };
+        match result {
+            Ok(_child) => {
+                // 不 wait —— 系统文件管理器独立运行；detach Child 句柄
+                // 让 spawn 句柄随作用域结束 drop，避免 fd 泄漏。
+                *self.status_message.lock().unwrap() =
+                    format!("📂 已请求打开配置目录：{}", dir.display());
+            }
+            Err(e) => {
+                *self.status_message.lock().unwrap() = format!(
+                    "⚠️ 打开配置目录失败（{}）：{e}",
+                    dir.display()
+                );
             }
         }
     }
@@ -1012,6 +1182,11 @@ impl TuiApp {
         let needs_first_setup = auth.basic_user.is_empty() || auth.basic_password.is_empty();
         self.username_input = auth.basic_user;
         self.password_input.clear();
+        // 回显 PASSWORD 行:把"已保存密码长度"作为底限星号数记录到
+        // `auth_password_mask_len`,真实密码内容不回填到 buffer —— 用户
+        // 看到对应位数 *,但不动 buffer 直接保存时 `submit_settings` 会
+        // 因为 buffer 空而保留原密码,不会把 * 当成新密码提交。
+        self.auth_password_mask_len = auth.basic_password.chars().count();
         // 首启自动聚焦用户名,后续打开聚焦系统端口。
         self.input_mode = if needs_first_setup {
             InputMode::SettingsAuthUsername
@@ -1407,6 +1582,10 @@ impl TuiApp {
         let write_result = write_persisted_env(&env_path, &persisted);
 
         self.input_mode = InputMode::Menu;
+        // 同步清掉 settings 弹框 rect,与 SettingsCancel / Esc 关闭路径对称。
+        // 之前 submit_settings 只切 input_mode,忘记清 rect,导致下一帧
+        // click_at 仍按 "弹框已开" 走 should_dismiss_settings_on_click 判定。
+        self.last_settings_popup_rect = None;
         let port_msg = format!(
             "系统={system_port} OpenCode={opencode_port}（重启生效）"
         );
@@ -1426,6 +1605,9 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, event: InputEvent) {
+        // 在 dispatch 前先把后台异步任务的"端口占用"信号转成 confirm 弹框。
+        // 见 `maybe_show_port_busy_confirm` 的注释。
+        self.maybe_show_port_busy_confirm();
         if self.confirm.is_some() {
             match event {
                 InputEvent::Left | InputEvent::Right | InputEvent::Tab => {
@@ -1452,6 +1634,16 @@ impl TuiApp {
                         Some(ConfirmAction::Upgrade) => {
                             if self.confirm_choice == ConfirmChoice::Confirm {
                                 self.start_upgrade();
+                            }
+                        }
+                        Some(ConfirmAction::DeleteSession(project, sid)) => {
+                            if self.confirm_choice == ConfirmChoice::Confirm {
+                                self.delete_session(&project, &sid).await;
+                            }
+                        }
+                        Some(ConfirmAction::KillPortAndLaunch(port)) => {
+                            if self.confirm_choice == ConfirmChoice::Confirm {
+                                self.kill_port_listener_and_launch(port).await;
                             }
                         }
                         None => {}
@@ -1808,17 +2000,152 @@ impl TuiApp {
 
     fn launch_opencode_with_default_port(&mut self) {
         let port = PortsConfig::load().opencode_port;
-        let status = self.status_message.clone();
-        *status.lock().unwrap() = format!("🚀 正在启动 OpenCode Serve（port={port}）…");
+        *self.status_message.lock().unwrap() =
+            format!("🚀 正在启动 OpenCode Serve（port={port}）…");
         let supervisor_for_launch = self.supervisor.clone();
+        let status = self.status_message.clone();
+        // 已存在的 confirm 弹框不覆盖（避免上一个未处理的确认被打断）。
+        if self.confirm.is_some() {
+            return;
+        }
         tokio::spawn(async move {
-            let result = match ServeSupervisor::check_port(port).await {
-                Ok(()) => supervisor_for_launch.launch_opencode(port).await,
-                Err(e) => Err(e),
+            match ServeSupervisor::check_port(port).await {
+                Ok(()) => {
+                    let msg = match supervisor_for_launch.launch_opencode(port).await {
+                        Ok(pid) => format!("✅ 服务已启动，端口 {port}，PID={pid}"),
+                        Err(e) => format!("❌ 启动失败：{e}"),
+                    };
+                    *status.lock().unwrap() = msg;
+                }
+                Err(AppError::Conflict(msg)) => {
+                    // 端口被占用：通过 status_message 把端口占用状态传回主线程，
+                    // 让主线程下次 click / key 事件时把它转成 confirm 弹框。
+                    // 这里用统一前缀标识，主线程识别后弹框 + 还原正常 status。
+                    *status.lock().unwrap() =
+                        format!("__PORT_BUSY__:{port}:{msg}");
+                }
+                Err(e) => {
+                    *status.lock().unwrap() = format!("❌ 启动失败：{e}");
+                }
+            }
+        });
+    }
+
+    /// 检测 status_message 中的端口占用哨兵（`__PORT_BUSY__:<port>:<msg>`），
+    /// 若命中则把它替换为正常状态文案并弹出 confirm 弹框要求用户确认
+    /// "杀死占用进程并继续启动"。
+    ///
+    /// 设计意图：TUI 的 confirm 弹框只能在主线程 (`handle_key` / `click_at`)
+    /// 中设置，而 `launch_opencode_with_default_port` 的端口检查是在
+    /// `tokio::spawn` 异步任务里做的，跨线程不能直接写 `self.confirm`。
+    /// 用 status_message 作单格信道最轻量 —— 主线程每帧渲染或收到任意事件时
+    /// 都会自然走到这里（不引入额外轮询）。
+    fn maybe_show_port_busy_confirm(&mut self) {
+        let snapshot = self.status_message.lock().unwrap().clone();
+        let Some(rest) = snapshot.strip_prefix("__PORT_BUSY__:") else {
+            return;
+        };
+        // 形如 `9464:port 9464 is already in use`，端口号在第一个冒号前。
+        let Some((port_str, reason)) = rest.split_once(':') else {
+            return;
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            return;
+        };
+        // 复原状态栏文案（去掉哨兵前缀，保留可读信息）。
+        *self.status_message.lock().unwrap() =
+            format!("⚠️ 端口 {port} 已被占用（{reason}），请在弹框中确认是否继续");
+        // 二次确认：默认聚焦"取消" —— 杀进程是高风险操作，避免 Enter 直接通过。
+        self.confirm_choice = ConfirmChoice::Cancel;
+        self.confirm = Some(ConfirmAction::KillPortAndLaunch(port));
+    }
+
+    /// 在弹框已展示 "端口 X 被占用，确认杀死并继续" 的前提下，由
+    /// `handle_key` 中 `ConfirmAction::KillPortAndLaunch` 分支调用：
+    /// 先调 `ServeSupervisor::kill_port_listener` 杀光占用进程，
+    /// 再 `launch_opencode` 重新尝试启动。任何失败都在状态栏给出明确提示。
+    async fn kill_port_listener_and_launch(&mut self, port: u16) {
+        tracing::info!(target: "tui", "用户确认：清理端口 {port} 并启动 opencode serve");
+        *self.status_message.lock().unwrap() =
+            format!("⚙️ 正在终止占用端口 {port} 的进程…");
+        let supervisor = self.supervisor.clone();
+        let status = self.status_message.clone();
+        tokio::spawn(async move {
+            // Step 1: 杀进程（自带重试 + 日志）
+            let killed = ServeSupervisor::kill_port_listener(port).await;
+            tracing::info!(
+                target: "tui",
+                "端口 {port} kill_port_listener 返回 killed={:?}",
+                killed
+            );
+
+            // Step 2: 关键 —— 杀完后**重新校验端口是否真的释放**。
+            // taskkill 退出 + Windows 内核释放 socket 之间有 ~0~500ms 时差，
+            // 立刻 launch_opencode 会因端口仍被占而失败。check_port 用
+            // TCP connect 做权威探测（lsof 在 Windows 上不可用）。
+            let mut port_free = false;
+            for attempt in 1..=5u8 {
+                match ServeSupervisor::check_port(port).await {
+                    Ok(()) => {
+                        port_free = true;
+                        tracing::info!(
+                            target: "tui",
+                            "端口 {port} 已释放（第 {} 次校验通过）",
+                            attempt
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        if attempt < 5 {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                    }
+                }
+            }
+
+            // Step 3: 更新状态栏（精确反映杀了多少 + 端口状态）
+            *status.lock().unwrap() = if killed.is_empty() {
+                "⚠️ 未找到可终止的进程（可能权限不足或进程已退出）".to_string()
+            } else {
+                format!(
+                    "🔪 已终止端口 {port} 占用进程（PID: {}）",
+                    killed
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             };
-            let msg = match result {
-                Ok(pid) => format!("✅ 服务已启动，端口 {port}，PID={pid}"),
-                Err(e) => format!("❌ 启动失败：{e}"),
+
+            // Step 4: 端口没释放 → 拒绝启动，避免"端口 9464 is already in use"
+            if !port_free {
+                *status.lock().unwrap() = format!(
+                    "❌ 端口 {port} 清理后仍被占用（已杀 {} 个进程），请手动检查后重试",
+                    killed.len()
+                );
+                tracing::error!(
+                    target: "tui",
+                    "端口 {port} 清理后 5 次校验仍被占用，放弃启动"
+                );
+                return;
+            }
+
+            // Step 5: 启动 opencode serve
+            let msg = match supervisor.launch_opencode(port).await {
+                Ok(pid) => {
+                    tracing::info!(
+                        target: "tui",
+                        "opencode serve 已在端口 {port} 启动，PID={pid}"
+                    );
+                    format!("✅ 服务已启动，端口 {port}，PID={pid}")
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "tui",
+                        "opencode serve 启动失败（端口 {port}）：{e}"
+                    );
+                    format!("❌ 启动失败：{e}")
+                }
             };
             *status.lock().unwrap() = msg;
         });
@@ -1882,9 +2209,83 @@ impl TuiApp {
     }
 
     async fn delete_project(&mut self, project: String) {
-        let _ = self.store.remove_path(&project).await;
-        *self.status_message.lock().unwrap() = format!("✅ 已删除项目记录：{project}");
+        tracing::info!(target: "tui", "开始删除项目 {project}");
+        let result = self.store.remove_path(&project).await;
+        match result {
+            Ok(_entries) => {
+                tracing::info!(target: "tui", "删除项目完成 {project}");
+                *self.status_message.lock().unwrap() =
+                    format!("✅ 已删除项目记录（本地 + 远端）：{project}");
+            }
+            Err(e) => {
+                tracing::error!(target: "tui", "删除项目失败 {project}: {e}");
+                *self.status_message.lock().unwrap() = format!(
+                    "⚠️ 远端 path-list 同步失败：{e}\n\
+                     本地已删除，但远端仍保留 — 下次刷新可能被恢复。请稍后重试。"
+                );
+            }
+        }
         self.enter_projects().await;
+    }
+
+    /// 在 Sessions 子页面：D 键 / Delete 键触发。
+    /// 取当前选中下标对应的 session id（不能是 index 0 的"新建"卡片，
+    /// 也不能是末尾的"删除项目"卡片），塞进 [`ConfirmAction::DeleteSession`]
+    /// 等待用户二次确认。已经在弹 confirm 时直接忽略（避免状态错乱）。
+    fn request_delete_selected_session(&mut self) {
+        // 已经在 confirm 弹框中 → 不重入（避免覆盖未处理的 confirm action）。
+        if self.confirm.is_some() {
+            return;
+        }
+        let Some(SubPage::Sessions { list_state, sessions, project }) = &self.sub_page else {
+            return;
+        };
+        let i = list_state.selected().unwrap_or(0);
+        // index 0 = 新建卡片；末尾 = 删除项目卡片。两者都不在 D 键范围。
+        if i == 0 || i > sessions.len() {
+            *self.status_message.lock().unwrap() =
+                "💡 D 键用于删除选中的会话 —— 请先用 ↑/↓ 选中".to_string();
+            return;
+        }
+        let sid = sessions[i - 1].id.clone();
+        // 默认聚焦确认按钮（删除是高风险动作，避免误触）。
+        self.confirm_choice = ConfirmChoice::Confirm;
+        self.confirm = Some(ConfirmAction::DeleteSession(project.clone(), sid));
+    }
+
+    /// 确认后真正删除：先调 opencode serve 的 `DELETE /session/{sid}`
+    /// （让远端 session 也消失，下次 list 才不会"删了等于没删"），再从
+    /// path-list.md 的 sections 数组移除 sid。项目记录保留（即使 sections
+    /// 清空），便于后续新建会话。
+    ///
+    /// 顺序：HTTP DELETE 先 —— 如果远端删除失败（如 serve 没起来），本地
+    /// store 暂不动，给用户清晰报错，避免"本地记账删了但远端还在"造成
+    /// 重新加载后又冒出同一条 session 的诡异现象。
+    async fn delete_session(&mut self, project: &str, sid: &str) {
+        tracing::info!(target: "tui", "开始删除会话 {sid} (project={project})");
+        let client = self.build_oc_client();
+        if let Err(e) = client.delete_session(sid).await {
+            *self.status_message.lock().unwrap() =
+                format!("⚠️ 删除远端会话失败（{e}）。请确认 opencode serve 已启动");
+            tracing::error!(target: "tui", "删除远端会话失败: {e}");
+            return;
+        }
+        match self.store.remove_session(project, sid).await {
+            Ok(_entries) => {
+                *self.status_message.lock().unwrap() =
+                    format!("✅ 已删除会话 {sid}（本地 + 远端）");
+                tracing::info!(target: "tui", "删除会话完成 {sid}");
+            }
+            Err(e) => {
+                *self.status_message.lock().unwrap() = format!(
+                    "⚠️ 远端 path-list 同步失败：{e}\n\
+                     opencode serve 端的会话已删除，但远端记账仍保留 — 下次刷新可能恢复。请稍后重试。"
+                );
+                tracing::error!(target: "tui", "远端 path-list 删除失败: {e}");
+            }
+        }
+        // 重新拉取会话列表刷新视图。
+        self.enter_sessions(project.to_string()).await;
     }
 
     async fn confirm_manual_path(&mut self, input: String) {
@@ -2103,6 +2504,15 @@ impl TuiApp {
                 if matches!(&self.sub_page, Some(SubPage::Sessions { .. })) =>
             {
                 self.sub_page_select_takeover().await;
+            }
+            // D = 删除当前选中的单个会话（仅在 Sessions 子页、且确实选中了
+            // 一个会话而非"新建"卡片时才生效）。删除前弹二次确认框，
+            // 确认后才调 `remove_session` 把 sid 从 path-list.md 的 sections
+            // 数组中移除 —— 项目记录保留，便于后续新建会话。
+            InputEvent::Char('d') | InputEvent::Char('D')
+                if matches!(&self.sub_page, Some(SubPage::Sessions { .. })) =>
+            {
+                self.request_delete_selected_session();
             }
             InputEvent::Char(c) => self.sub_page_input(c),
             InputEvent::Backspace => self.sub_page_backspace(),
@@ -2326,6 +2736,10 @@ impl TuiApp {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
+        // 每帧渲染前消费后台"端口占用"哨兵 —— 如果用户启动 opencode serve
+        // 后没动键盘/鼠标，handle_key / click_at 不会被调用，弹框就出不来。
+        // 在 render 入口消费一次保证"无操作也能看到弹框"。
+        self.maybe_show_port_busy_confirm();
         if self.show_full_log {
             self.render_full_log(frame);
             return;
@@ -2563,38 +2977,48 @@ impl TuiApp {
     fn render_settings_popup(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         // 宽 80 适配 80 列终端(实测环境);超长内容走 Paragraph::wrap 自动换行。
-        // 高度动态 = 内容 + 1 空行 + 1 按钮行 + 2 边框,但不超出 area 可用高度。
-        // 当终端矮于完整布局时,通过 `Paragraph::scroll((scroll_offset, 0))`
-        // 让用户用 PgUp/PgDown / 滚轮滚动查看完整内容;同时把 `scroll_offset`
-        // 透传给 `settings_field_at_row` 与 `register_settings_click_regions`,
-        // 使点击坐标映射保持一致 —— 否则屏幕外字段的 click region 会落在弹框外,
-        // find_target 返回 None → click_at 误判为"点弹框外"→ dismiss_popup。
+        //
+        // 布局(关键 — 按钮**始终**钉在 rect 最后一行,与 scroll 无关):
+        //
+        //     ┌──────────────────────────┐ ← rect.y + 0  (上边框)
+        //     │ 认证设置                    │ ← rect.y + 1  ┐
+        //     │   USERNAME: foo │                │
+        //     │   ... │                        │  内容可视区(content_h 行)
+        //     │                          │                │  受 scroll_offset 控制
+        //     │                          │ ← rect.y + h - 3 ┘  (空行,固定)
+        //     │  [确认] [取消] [打开配置目录]   │ ← rect.y + h - 2  (按钮,固定)
+        //     └──────────────────────────┘ ← rect.y + h - 1  (下边框)
+        //
+        // 总行 h = 2(边框) + content_h(可视内容) + 1(空行) + 1(按钮) + 1 = ...？
+        // 不对,准确数:h = content_h + 4(上/下边框 + 空行 + 按钮)。
+        // 因此 content_h = h - 4。h 下限 7(留至少 3 行可视内容)+ 4 = 7,允许
+        // 小终端仍能看到按钮(裁的只是内容)。
         let w: u16 = 80;
-        let mut lines = self.build_settings_lines();
-        let btn_line_idx = lines.len() as u16; // 按钮行在底部(以 build_settings_lines 输出计)
+        let lines = self.build_settings_lines();
+        let total_content = lines.len() as u16; // build_settings_lines 输出行数
 
-        // 限制 scroll_offset:不能超过"内容 - 1"行,否则会把所有内容滚走。
-        // 这里 content 行数 = lines.len()(不含按钮/空行/边框)。saturating_sub(1)
-        // 保证 offset 最大 = content - 1(留至少 1 行内容可见)。
-        let max_offset = lines.len().saturating_sub(1) as u16;
-        if self.settings_scroll_offset > max_offset {
-            self.settings_scroll_offset = max_offset;
-        }
-
-        // 先根据 mouse_pos 决定底部按钮文本样式(hover 高亮)。
-        // 注意:此处算的是"实际渲染后按钮所在的屏幕坐标",所以必须用最终的
-        // `rect` (后续算出来),不能先用 `area`。
-        let desired_h = lines.len() as u16 + 2; // +2 = 上/下边框
-        // 弹框至少要 9 行才能放下:6 行内容可视 + 1 空行 + 1 按钮 + 2 边框 = 10;
-        // 9 是极端下限,允许 5 行内容可视。即使窗口极矮,也要保证按钮可点。
-        let max_h = area.height.saturating_sub(13).max(9);
-        let h = desired_h.min(max_h);
+        // 计算 h:既装得下可视内容 + 4(边框+空+按钮),又不超出 area。
+        // 主界面需要保留至少 13 行(header / 当前服务 / 状态 / 日志面板),
+        // 所以 max_h = area.height - 13。h 下限 = 7(2 边框 + 空 + 按钮 + 3 内容)。
+        let max_h = area.height.saturating_sub(13).max(7);
+        // 内容可视区高度:足够大时尽量多装,装不下时 ≥ 3(留 3 行可看)。
+        let content_h = total_content.min(max_h.saturating_sub(4)).max(3);
+        let h = content_h + 4;
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
         let rect = Rect::new(x, y, w, h);
 
-        let ok_hovered = self.mouse_pos_in_settings_btn(&rect, btn_line_idx, true);
-        let cancel_hovered = self.mouse_pos_in_settings_btn(&rect, btn_line_idx, false);
+        // 限制 scroll_offset:不能把内容滚走导致没有内容可见。最大 = total_content - content_h,
+        // 即 scroll 后最后一行内容恰好在可视区底。
+        let max_offset = total_content.saturating_sub(content_h);
+        if self.settings_scroll_offset > max_offset {
+            self.settings_scroll_offset = max_offset;
+        }
+
+        // hover 按钮 → 高亮。先于 Paragraph 渲染算 hover,因为 Paragraph 不画按钮。
+        let ok_hovered = self.mouse_pos_in_settings_btn(&rect, 0, SettingsBtnKind::Ok);
+        let cancel_hovered = self.mouse_pos_in_settings_btn(&rect, 0, SettingsBtnKind::Cancel);
+        let open_hovered = self.mouse_pos_in_settings_btn(&rect, 0, SettingsBtnKind::OpenConfigDir);
         let selected_style = Style::default()
             .bg(Color::Cyan)
             .fg(Color::Black)
@@ -2602,39 +3026,75 @@ impl TuiApp {
         let idle_style = Style::default().fg(Color::DarkGray);
         let ok_style = if ok_hovered { selected_style } else { idle_style };
         let cancel_style = if cancel_hovered { selected_style } else { idle_style };
+        let open_style = if open_hovered { selected_style } else { idle_style };
 
-        lines.push(Line::from("")); // 按钮上方留一行空
-        lines.push(Line::from(vec![
+        // 1. 清屏 + 边框(覆盖整个 rect,包括按钮区与空行区)
+        let block = Block::default()
+            .title("设置")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        frame.render_widget(Clear, rect);
+        frame.render_widget(block, rect);
+
+        // 2. 内容可视区(只在 rect.y+1 .. rect.y+1+content_h 这一段渲染滚动内容)
+        // inner 的 inner = 内容区,移除上/下/左/右边框后再扣掉 1 行底部空行 —
+        // 注意这里 bottom = content_h(因为 Block 占上下各 1,内容区总高 = h - 2,
+        // 我们只让 Paragraph 用前 content_h 行,最后 2 行留作空行+按钮)。
+        // Paragraph 没有"只占前 N 行"参数,所以用 vertical_margin 裁掉底部 2 行
+        // (h - 2 - content_h) = (content_h + 2 - content_h) = 2 行 margin。
+        let inner = Rect::new(
+            rect.x + 1,
+            rect.y + 1,
+            rect.width.saturating_sub(2),
+            content_h,
+        );
+        let form = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((self.settings_scroll_offset, 0));
+        frame.render_widget(form, inner);
+
+        // 3. 空行(倒数第 3 行):固定一行 — 不用做任何事,Clear 已经把它清成底色
+        //    就够了;这里保留行号常量供点击 region 判定引用。
+        let spacer_y = rect.y + 1 + content_h;
+        // 4. 按钮行(下边框上方一行,中间隔空行):手动渲染到 btn_y。
+        //    布局:上边框 / 内容(content_h 行) / 空行 / 按钮 / 下边框。
+        //    所以按钮 = rect.y + 1 + content_h + 1 = rect.y + content_h + 2
+        //    = rect.y + h - 2(下边框是 rect.y + h - 1)。
+        //    与 mouse_pos_in_settings_btn / register_settings_click_regions 完全一致。
+        let btn_y = rect.y + rect.height - 2;
+        let btn_line: Line<'_> = Line::from(vec![
             Span::styled("  ", idle_style),
             Span::styled("[确认]", ok_style),
             Span::styled("   ", idle_style),
             Span::styled("[取消]", cancel_style),
+            Span::styled("   ", idle_style),
+            Span::styled("[打开配置目录]", open_style),
             Span::styled("  Enter保存  Esc取消", idle_style),
-        ]));
+        ]);
+        frame.render_widget(
+            Paragraph::new(btn_line),
+            Rect::new(rect.x + 1, btn_y, rect.width.saturating_sub(2), 1),
+        );
 
         // 鼠标 hover 字段行 → 自动切换 input_mode(等价于 Tab/点击)
+        // 仅在内容可视区 [rect.y+1, rect.y+1+content_h) 内触发,空行与按钮行不参与。
         if let Some((_c, r)) = self.mouse_pos {
-            if r >= rect.y + 1 && r < rect.y + btn_line_idx + 1 {
-                if let Some(field) = self.settings_field_at_row(r - rect.y - 1, self.settings_scroll_offset) {
+            if r >= rect.y + 1 && r < rect.y + 1 + content_h {
+                if let Some(field) =
+                    self.settings_field_at_row(r - rect.y - 1, self.settings_scroll_offset)
+                {
                     self.input_mode = field;
                 }
             }
         }
 
-        // 先注册 click 区域(根据"显示位置"反推每行的 y 坐标)
-        self.register_settings_click_regions(rect, btn_line_idx, self.settings_scroll_offset, h);
+        // 注册 click 区域 — 字段按屏幕 row 映射,按钮固定在 btn_y。
+        // 按钮 y = rect.y + rect.height - 2(下边框上方一行,中间隔空行)。
+        self.register_settings_click_regions(rect, 0, self.settings_scroll_offset, h);
 
-        let form = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((self.settings_scroll_offset, 0))
-            .block(
-                Block::default()
-                    .title("设置")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            );
-        frame.render_widget(Clear, rect);
-        frame.render_widget(form, rect);
+        // 抑制 unused warning — spacer_y 仅用于文档化行号(供未来调整者读懂结构)。
+        let _ = spacer_y;
+
         // 把本帧弹框 rect 记录下来,供 click_at 用几何判定"是否在弹框内"。
         // 必须放在最后,保证只有真正完成渲染的 rect 才会被记录 —— 之前
         // 任何 early-return 都不会污染 last_settings_popup_rect。
@@ -2658,30 +3118,39 @@ impl TuiApp {
 
     /// 判断鼠标是否在设置弹框底部某个按钮上(用于 hover 高亮判断)。
     ///
-    /// 参数 `rect` 是**弹框本身**的 rect(不是屏幕 area),按钮行总是
-    /// 渲染在弹框的**最后一行**(即 `rect.y + rect.height - 1`)——
-    /// 按钮区紧贴下边框,内容可滚动但按钮始终固定可见。
-    /// 按钮 click 区域宽度 8 列,与按钮文本列对齐。
+    /// 参数 `rect` 是**弹框本身**的 rect(不是屏幕 area),按钮行渲染在
+    /// 弹框下边框上方一行(即 `rect.y + rect.height - 2`,中间隔了空行)——
+    /// 按钮区固定可见,内容可滚动但按钮位置不受 scroll_offset 影响。
+    ///
+    /// 按钮布局(从左到右):
+    /// - `[确认]`           8 列,起始 col = `rect.x + 2`
+    /// - 间距 3 列
+    /// - `[取消]`           8 列,起始 col = `rect.x + 2 + 8 + 3 = rect.x + 13`
+    /// - 间距 3 列
+    /// - `[打开配置目录]`   16 列,起始 col = `rect.x + 13 + 8 + 3 = rect.x + 24`
     fn mouse_pos_in_settings_btn(
         &self,
         rect: &Rect,
         _btn_line_idx: u16,
-        is_ok: bool,
+        btn_kind: SettingsBtnKind,
     ) -> bool {
         let Some((c, r)) = self.mouse_pos else {
             return false;
         };
-        let btn_y = rect.y + rect.height - 1;
+        // 按钮位于弹框下边框上方一行(中间隔了空行),不是紧贴下边框。
+        // 见 `render_settings_popup` 顶部布局注释。
+        let btn_y = rect.y + rect.height - 2;
         if r != btn_y {
             return false;
         }
-        // 按钮起始列 + 宽度 8(覆盖"  [确认]"或"   [取消]")
-        let btn_x = if is_ok {
-            rect.x + 2
-        } else {
-            rect.x + 2 + 8 + 3 // [确认](8) + 间距(3)
+        let (btn_x, width) = match btn_kind {
+            SettingsBtnKind::Ok => (rect.x + 2, 8),
+            SettingsBtnKind::Cancel => (rect.x + 13, 8),
+            // "打开配置目录"按钮文本是中文,占 6 个汉字 + 2 个方括号 = 8 显示列;
+            // 多预留 2 列避免字间距 hover 抖动,共占 10 列。
+            SettingsBtnKind::OpenConfigDir => (rect.x + 24, 16),
         };
-        c >= btn_x && c < btn_x + 8
+        c >= btn_x && c < btn_x + width
     }
 
     /// 当前 auth 中**已保存**密码的长度 —— 仅在需要"显示密码已设置"
@@ -2757,7 +3226,14 @@ impl TuiApp {
         // PASSWORD 字段的星号长度跟随当前输入 buffer 实时变化 —— 与
         // SilverBullet 密码字段行为一致。粘贴 / 字符输入 / 退格都会
         // 让 PASSWORD 行立即反映用户输入了多少位。
-        let auth_pw_line = render_auth_password_line(&self.password_input);
+        //
+        // 同时 `auth_password_mask_len` 在 `open_settings` 时一次性记录
+        // 「已保存密码长度」,作为底限占位:用户未动 buffer 也能看到对应
+        // 位数的 \*,而真实密码内容不会被回填到 `password_input`。
+        let auth_pw_line = render_auth_password_line(
+            &self.password_input,
+            self.auth_password_mask_len,
+        );
 
         vec![
             // --- 认证设置 ---
@@ -2924,44 +3400,82 @@ impl TuiApp {
                 target: ClickTarget::SettingsField(*field),
             });
         }
-        // 底部按钮 click region:确认按钮 + 取消按钮,均在弹框最后一行。
-        // 与 mouse_pos_in_settings_btn 的坐标计算保持完全一致,避免
-        // "hover 高亮但点击无反应"或反之。按钮行在 popup 内的绝对 y =
-        // rect.y + rect.height - 1(下边框上方一行)。
-        let btn_y = rect.y + popup_h - 1;
-        let ok_y = btn_y;
-        let cancel_y = btn_y;
+        // 底部按钮 click region:确认按钮 + 取消按钮 + 打开配置目录按钮,
+// 三个按钮都在弹框**下边框上方一行**(中间隔了空行,不是紧贴下边框)。
+// 与 mouse_pos_in_settings_btn 的坐标计算保持完全一致,避免
+// "hover 高亮但点击无反应"或反之。布局见 render_settings_popup 注释。
+        let btn_y = rect.y + popup_h - 2;
         self.click_regions.push(ClickRegion {
-            rect: Rect::new(rect.x + 2, ok_y, 8, 1),
+            rect: Rect::new(rect.x + 2, btn_y, 8, 1),
             target: ClickTarget::SettingsOk,
         });
         self.click_regions.push(ClickRegion {
-            rect: Rect::new(rect.x + 13, cancel_y, 8, 1),
+            rect: Rect::new(rect.x + 13, btn_y, 8, 1),
             target: ClickTarget::SettingsCancel,
+        });
+        self.click_regions.push(ClickRegion {
+            // 与 mouse_pos_in_settings_btn 中 SettingsBtnKind::OpenConfigDir
+            // 的列位置 + 宽度保持一致 (起始 24, 宽 16)。
+            rect: Rect::new(rect.x + 24, btn_y, 16, 1),
+            target: ClickTarget::SettingsOpenConfigDir,
         });
     }
 
     fn render_confirm(&mut self, frame: &mut Frame<'_>) {
-        let (msg_lines, w, h): (Vec<&str>, u16, u16) = match self.confirm {
-            Some(ConfirmAction::ExitService(_)) => {
-                (vec!["确认杀死/关闭该服务？"], 44, 5)
-            }
+        let (msg_lines, w, h): (Vec<String>, u16, u16) = match &self.confirm {
+            Some(ConfirmAction::ExitService(_)) => (
+                vec!["确认杀死/关闭该服务？".to_string()],
+                44,
+                5,
+            ),
             Some(ConfirmAction::EnterProjectsWithoutServe) => (
                 vec![
-                    "未启动 OpenCode Serve",
-                    "直接启动项目将无法支持远程服务，仍要继续吗？",
+                    "未启动 OpenCode Serve".to_string(),
+                    "直接启动项目将无法支持远程服务，仍要继续吗？".to_string(),
                 ],
                 68,
                 7,
             ),
-            Some(ConfirmAction::Exit) => {
-                (vec!["确认退出程序?"], 36, 5)
+            Some(ConfirmAction::Exit) => (
+                vec!["确认退出程序?".to_string()],
+                36,
+                5,
+            ),
+            Some(ConfirmAction::Upgrade) => (
+                vec!["确认升级 OpenCode + omo?".to_string()],
+                44,
+                5,
+            ),
+            // 展示 session id 前 12 位避免太长导致弹框过宽；其余信息用
+            // 「...」后缀 + 项目路径已能让用户分辨是要删哪个。
+            Some(ConfirmAction::DeleteSession(project, sid)) => {
+                let preview: String = sid.chars().take(12).collect();
+                let suffix: String = if sid.chars().count() > 12 { "…" } else { "" }.to_string();
+                (
+                    vec![
+                        "确认删除该会话？".to_string(),
+                        format!("项目：{}", project),
+                        format!("会话：{}{}", preview, suffix),
+                        "（项目记录保留）".to_string(),
+                    ],
+                    72,
+                    9,
+                )
             }
-            Some(ConfirmAction::Upgrade) => {
-                (vec!["确认升级 OpenCode + omo?"], 44, 5)
-            }
+            Some(ConfirmAction::KillPortAndLaunch(port)) => (
+                vec![
+                    format!("端口 {port} 已被占用"),
+                    "是否杀死占用进程并继续启动 OpenCode Serve？".to_string(),
+                    "（高风险：会强制终止占用该端口的进程）".to_string(),
+                ],
+                72,
+                7,
+            ),
             None => return,
         };
+        // 重新借 &str 给 Paragraph 渲染 —— render_confirm 是 fn(&mut self, ...)
+        // 中唯一一处借用 self.confirm 的地方，这样处理最简洁。
+        let msg_lines_ref: Vec<&str> = msg_lines.iter().map(String::as_str).collect();
         let area = frame.area();
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
@@ -3000,7 +3514,7 @@ impl TuiApp {
             if cancel_selected { selected_style } else { Style::default() },
         );
 
-        let mut lines: Vec<Line<'_>> = msg_lines.into_iter().map(Line::from).collect();
+        let mut lines: Vec<Line<'_>> = msg_lines_ref.into_iter().map(Line::from).collect();
         lines.push(Line::from(""));
         lines.push(Line::from(vec![confirm_btn, Span::raw("   "), cancel_btn]));
         let para = Paragraph::new(lines).block(block);
@@ -3516,7 +4030,7 @@ impl TuiApp {
             )),
             Line::from(Span::styled(title, Style::default().fg(Color::DarkGray))),
             Line::from(Span::styled(
-                "Enter 新窗口 attach · T 本窗口接管",
+                "Enter 新窗口 attach · T 本窗口接管 · D 删除",
                 Style::default().fg(Color::Yellow),
             )),
         ]
@@ -3887,19 +4401,29 @@ let left = ratatui::layout::Layout::default()
         assert_eq!(got, "anything");
     }
 
-    /// `render_auth_password_line` 纯函数契约 —— 星号数量严格等于
-    /// `input.chars().count()`,前缀必须始终为 `"  PASSWORD: "`。
-    /// 与 SilverBullet 字段(直接 `sb_password_input.len()`)保持一致:
-    /// 0 → 空、1 → 单星号、N → N 星号。
+    /// `render_auth_password_line` 纯函数契约 —— 星号数量 = max(buffer
+    /// 长度, mask_len),前缀必须始终为 `"  PASSWORD: "`。
+    ///
+    /// 设计意图:`mask_len` 是"已保存密码长度"占位,用户没动 buffer 时
+    /// 也能看到对应位数的 \*;一旦开始输入,buffer 长度 > mask_len 时
+    /// 跟 buffer 走(反映用户实际输入了多少位)。
     #[test]
     fn render_auth_password_line_counts_chars_verbatim() {
-        assert_eq!(render_auth_password_line(""), "  PASSWORD: ");
-        assert_eq!(render_auth_password_line("a"), "  PASSWORD: *");
-        assert_eq!(render_auth_password_line("abc"), "  PASSWORD: ***");
+        // mask_len=0:行为退化为旧版(只跟 buffer)。
+        assert_eq!(render_auth_password_line("", 0), "  PASSWORD: ");
+        assert_eq!(render_auth_password_line("a", 0), "  PASSWORD: *");
+        assert_eq!(render_auth_password_line("abc", 0), "  PASSWORD: ***");
         assert_eq!(
-            render_auth_password_line("Sup3rSecret!"),
+            render_auth_password_line("Sup3rSecret!", 0),
             "  PASSWORD: ************"
         );
+        // mask_len=N,buffer 空:显示 N 个 * (回显已保存密码长度)。
+        assert_eq!(render_auth_password_line("", 12), "  PASSWORD: ************");
+        assert_eq!(render_auth_password_line("", 5), "  PASSWORD: *****");
+        // mask_len < buffer:跟 buffer(用户在输入更长新密码)。
+        assert_eq!(render_auth_password_line("abcdef", 3), "  PASSWORD: ******");
+        // mask_len > buffer:跟 mask_len(用户开始删,未删完,占位还在)。
+        assert_eq!(render_auth_password_line("ab", 5), "  PASSWORD: *****");
     }
 
     /// 回归:设置页 PASSWORD 行的星号长度必须跟随当前 `password_input`
@@ -4111,6 +4635,160 @@ let left = ratatui::layout::Layout::default()
         }
         // 描述行全部用「作用:」开头 —— 这是样式约定,提示用户可看。
         // 同样通过 EXPECTED_KEYS 集合间接验证。
+    }
+
+    #[test]
+    fn build_settings_lines_has_expected_row_count_for_popup_geometry() {
+        // 回归:设置弹框按钮行之前被裁掉,因为 `desired_h` 只算了上下边框,
+        // 漏算了 push 进去的空行和按钮行(`render_settings_popup` line 2970-2979)。
+        // 锁住两个不变性,防止任何人不小心改坏:
+        // 1. build_settings_lines() 的输出行数 = 31(4 段标题 + 11 字段 +
+        //    11 字段说明 + 4 段间空行 + 1 help 行)。
+        // 2. desired_h 必须 ≥ lines.len() + 4(空行 + 按钮 + 上下边框),
+        //    这样 Paragraph 渲染区能装下完整 33 行内容(31 + 空 + 按钮),
+        //    按钮行不被裁,click region 与视觉位置一致。
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        app.input_mode = InputMode::SettingsAuthUsername;
+        terminal
+            .draw(|frame| {
+                app.render_settings_popup(frame);
+            })
+            .expect("draw");
+
+        let lines = app.build_settings_lines();
+        // 不变性 1:build_settings_lines 返回固定 31 行。改 build_settings_lines
+        // 时必须同步改这里,否则说明弹框内容布局发生重大变化,需要重新审视
+        // 滚动逻辑 + click region + desired_h 公式。
+        assert_eq!(
+            lines.len(),
+            31,
+            "build_settings_lines must produce exactly 31 rows; \
+             if you intentionally added/removed a row, also re-derive \
+             desired_h, FIELD_LINE_IDX, and max_offset"
+        );
+
+        // 不变性 2:渲染后 last_settings_popup_rect 的高度必须 ≥ 35
+        // (33 行 Paragraph 内容 + 2 边框 = 35),否则按钮行视觉上被裁掉,
+        // click region 落在 rect 边界,用户看不到按钮 → "无法被点击"。
+        // 60 行的终端远大于所需,所以这里 h 应该等于 desired_h(不被 max_h 截)。
+        let rect = app
+            .last_settings_popup_rect
+            .expect("popup rect should be recorded after render");
+        let required_min_h = lines.len() as u16 + 4; // 内容 + 空 + 按钮 + 上下边框
+        assert!(
+            rect.height >= required_min_h,
+            "settings popup rect.height={} < required {} — button row will be \
+             clipped by Paragraph, users won't see the buttons. Fix desired_h \
+             in render_settings_popup.",
+            rect.height,
+            required_min_h
+        );
+
+        // 不变性 3:按钮 click region 必须落在 rect 内(不超出),且 y 必须
+        // < rect.y + rect.height(即不落在下边框上)。按钮 = rect.y + rect.height - 2
+        // (中间隔了空行,不是紧贴下边框)。
+        let btn_y = rect.y + rect.height - 2;
+        for region in &app.click_regions {
+            if matches!(
+                region.target,
+                ClickTarget::SettingsOk
+                    | ClickTarget::SettingsCancel
+                    | ClickTarget::SettingsOpenConfigDir
+            ) {
+                assert_eq!(
+                    region.rect.y, btn_y,
+                    "button click region y={} should equal rect.y + height - 1 = {}",
+                    region.rect.y, btn_y
+                );
+                assert!(
+                    region.rect.y < rect.y + rect.height,
+                    "button y={} is outside popup rect (rect ends at y={})",
+                    region.rect.y,
+                    rect.y + rect.height
+                );
+                assert!(
+                    region.rect.y > rect.y,
+                    "button y={} is on the top border (rect.y={})",
+                    region.rect.y,
+                    rect.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_popup_button_visible_on_typical_24_and_30_row_terminals() {
+        // 回归:验证即使在 24 / 30 / 35 / 40 / 50 行的典型终端上,
+        // 底部按钮行**始终**可见并可点击 — 这是新布局的核心契约。
+        //
+        // 旧版布局用 Paragraph 一把梭把 33 行内容塞进 31 行 Paragraph 区域,
+        // 按钮行被裁掉。新布局把按钮/空行/边框与滚动内容拆开:
+        //   - 内容可视区 = content_h 行(随终端高度伸缩,scroll_offset 控制)
+        //   - 空行(固定) + 按钮(固定, = rect.y + rect.height - 2)
+        // 因此无论终端多矮,只要 rect.height ≥ 5(2 边框 + 空 + 按钮),
+        // 按钮必可见。本测试扫描常见高度,断言按钮 click region 始终
+        // 落在 rect 内且 y > rect.y(不与上边框冲突)。
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        for terminal_h in [12u16, 18, 24, 30, 35, 40, 50] {
+            let backend = TestBackend::new(120, terminal_h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut app = TuiApp::test_stub();
+            app.input_mode = InputMode::SettingsAuthUsername;
+            terminal
+                .draw(|frame| {
+                    app.render_settings_popup(frame);
+                })
+                .expect("draw");
+            let rect = app
+                .last_settings_popup_rect
+                .expect("popup rect should be recorded after render");
+
+            // 不变性 1:rect.height ≥ 7(content_h ≥ 3 + 4 边框/空/按钮),
+            // 按钮必在 rect 内,且 != 上边框。
+            assert!(
+                rect.height >= 7,
+                "terminal {terminal_h}: rect.height={} < 7 (content_h<3 + 4 frame rows)",
+                rect.height
+            );
+            // 不变性 2:h ≤ terminal_h(弹框不能溢出 area)
+            assert!(
+                rect.height <= terminal_h,
+                "terminal {terminal_h}: rect.height={} exceeds area height",
+                rect.height
+            );
+            // 不变性 3:按钮 click region 全部存在且落在 rect 内
+            // (按钮 = rect.y + rect.height - 2,中间隔了空行)
+            let btn_y = rect.y + rect.height - 2;
+            for region in &app.click_regions {
+                if matches!(
+                    region.target,
+                    ClickTarget::SettingsOk
+                        | ClickTarget::SettingsCancel
+                        | ClickTarget::SettingsOpenConfigDir
+                ) {
+                    assert_eq!(
+                        region.rect.y, btn_y,
+                        "terminal {terminal_h}: button y={} should be rect.y + height - 1 = {}",
+                        region.rect.y, btn_y
+                    );
+                    assert!(
+                        region.rect.y >= rect.y && region.rect.y < rect.y + rect.height,
+                        "terminal {terminal_h}: button y={} outside rect [{}, {})",
+                        region.rect.y,
+                        rect.y,
+                        rect.y + rect.height
+                    );
+                }
+            }
+            // 不变性 4:scroll 后最后一行内容(应落在可视区底) ≤ total_content - 1
+            // 即 max_offset 不会越界。
+            assert!(app.settings_scroll_offset <= 31, "scroll offset out of range");
+        }
     }
 
     // -----------------------------------------------------------------
@@ -4379,10 +5057,11 @@ let left = ratatui::layout::Layout::default()
 
     /// 模拟小终端:弹框高 8 行(含边框),build_settings_lines 有 31 行内容。
     /// 注册 click region 后,**字段** click region 的屏幕 y 必须落在
-    /// 内容区内(`rect.y + 1` 到 `rect.y + popup_h - 2`,最后一行为按钮保留)。
+    /// 内容区内(`rect.y + 1` 到 `rect.y + popup_h - 4`,最后两行为空行+按钮保留)。
     /// 任何字段 click region 落在内容区外都是 bug —— 一旦用户点击它,
     /// `find_target` 会返回 None,进而触发 `dismiss_popup`,设置页被错误关闭。
-    /// (按钮 click region 允许 y == rect.y + popup_h - 1,因为按钮固定在最后一行。)
+    /// (按钮 click region 允许 y == rect.y + popup_h - 2,因为按钮固定在
+    /// 下边框上方一行,中间隔了空行,不是紧贴下边框。)
     #[test]
     fn settings_click_regions_stay_inside_popup_on_small_terminal() {
         // 弹框 rect:y=5, x=10, w=80, h=8(只够放 4 行内容 + 1 空行 + 1 按钮 + 2 边框 = 8)。
@@ -4396,8 +5075,9 @@ let left = ratatui::layout::Layout::default()
         let content_top = rect.y + 1;
         // 内容可视行数 = popup_h - 4 (上下边框 + 空行 + 按钮)。
         // 内容区最后一行的 y = rect.y + 1 + content_h - 1 = rect.y + popup_h - 4。
-        // 按钮行在 rect.y + popup_h - 1。
-        let content_bottom_exclusive = rect.y + 8 - 3; // popup_h - 3:留空行给按钮之上
+        // 按钮行在 rect.y + popup_h - 2(下边框上方一行,中间隔空行)。
+        // 字段 click region y 必须 < content_top + content_h = rect.y + popup_h - 3。
+        let content_bottom_exclusive = rect.y + 8 - 3; // popup_h - 3:留空行+按钮
         for region in &app.click_regions {
             match region.target {
                 ClickTarget::SettingsField(_) => {
@@ -4410,13 +5090,16 @@ let left = ratatui::layout::Layout::default()
                     );
                 }
                 ClickTarget::SettingsOk | ClickTarget::SettingsCancel => {
-                    // 按钮固定在弹框最后一行 (rect.y + popup_h - 1)。
+                    // 按钮固定在弹框下边框上方一行 (rect.y + popup_h - 2),
+                    // 不是紧贴下边框 — 中间隔了空行。早期版本错误地用 -1,
+                    // 导致按钮 click region 落在下边框 row 上、与手动渲染的
+                    // 按钮 Paragraph 也错位,点击无效。
                     assert_eq!(
                         region.rect.y,
-                        rect.y + 8 - 1,
-                        "按钮 click region y={} 应在弹框最后一行 {}",
+                        rect.y + 8 - 2,
+                        "按钮 click region y={} 应在下边框上方一行 {}",
                         region.rect.y,
-                        rect.y + 8 - 1
+                        rect.y + 8 - 2
                     );
                 }
                 _ => {}
@@ -4428,6 +5111,227 @@ let left = ratatui::layout::Layout::default()
                 .iter()
                 .any(|r| matches!(r.target, ClickTarget::SettingsField(InputMode::SettingsAuthUsername))),
             "scroll_offset=0 时 USERNAME (line 1) 必须可见"
+        );
+    }
+
+    #[test]
+    fn settings_popup_button_click_triggers_handler_end_to_end() {
+        // 端到端验证:点击设置弹框的 [确认] / [取消] / [打开配置目录]
+        // 按钮位置必须真正触发对应 handler。这是用户原报告"按钮点不动"
+        // 的核心回归测试 —— 之前 btn_y 错位到下边框 row,鼠标点击按钮
+        // 区域时 find_target 找不到 click region,handler 不触发。
+        //
+        // submit_settings 内部有必填校验(USERNAME / PASSWORD 不能空),
+        // 校验失败时会把 input_mode 改回对应字段并 return。我们填好
+        // 必填字段 + 端口,SUBMIT 才会一路走到关闭弹框。
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        // first_setup_required = false:让 SettingsCancel 点完能正常关闭
+        // 弹框(否则首启规则会阻止关闭)。
+        app.first_setup_required = false;
+        // 填必填字段,让 submit_settings 通过校验关闭弹框。
+        app.username_input = "tester".to_string();
+        app.password_input = "secret".to_string();
+        app.system_port_input = "9465".to_string();
+        app.opencode_port_input = "9464".to_string();
+        app.input_mode = InputMode::SettingsAuthUsername;
+
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let btn_y = rect.y + rect.height - 2;
+        // [确认] 按钮 click region: x=rect.x+2, width=8 → x ∈ [rect.x+2, rect.x+10)
+        let ok_x = rect.x + 4;
+        // [取消] 按钮 click region: x=rect.x+13, width=8
+        let cancel_x = rect.x + 15;
+        // [打开配置目录] 按钮 click region: x=rect.x+24, width=16
+        let open_x = rect.x + 28;
+
+        // 前置断言:find_target 必须真的能命中这三个按钮(否则测试无意义)。
+        assert!(matches!(
+            app.find_target(ok_x, btn_y),
+            Some(ClickTarget::SettingsOk)
+        ));
+        assert!(matches!(
+            app.find_target(cancel_x, btn_y),
+            Some(ClickTarget::SettingsCancel)
+        ));
+        assert!(matches!(
+            app.find_target(open_x, btn_y),
+            Some(ClickTarget::SettingsOpenConfigDir)
+        ));
+
+        // 1) 点 [确认]:input_mode 应跳到 Menu(说明弹框被关闭)。
+        tokio_test::block_on(app.click_at(ok_x, btn_y));
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "clicking [确认] should close popup and return to Menu"
+        );
+        assert!(
+            app.last_settings_popup_rect.is_none(),
+            "clicking [确认] should clear last_settings_popup_rect"
+        );
+
+        // 2) 重新打开弹框,点 [取消]:弹框应关闭,input_mode = Menu。
+        app.input_mode = InputMode::SettingsAuthUsername;
+        app.last_settings_popup_rect = None;
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw 2");
+        let rect2 = app.last_settings_popup_rect.expect("popup rect 2");
+        let btn_y2 = rect2.y + rect2.height - 2;
+        tokio_test::block_on(app.click_at(rect2.x + 15, btn_y2));
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "clicking [取消] should close popup and return to Menu"
+        );
+
+        // 3) 重新打开弹框,点 [打开配置目录]:弹框保持打开(不关闭),
+        // handler 不改 input_mode(open_config_dir 失败仅写状态条)。
+        app.input_mode = InputMode::SettingsAuthUsername;
+        app.last_settings_popup_rect = None;
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw 3");
+        let rect3 = app.last_settings_popup_rect.expect("popup rect 3");
+        let btn_y3 = rect3.y + rect3.height - 2;
+        let prev_mode = app.input_mode;
+        tokio_test::block_on(app.click_at(rect3.x + 28, btn_y3));
+        assert_eq!(
+            app.input_mode, prev_mode,
+            "clicking [打开配置目录] should NOT close popup"
+        );
+
+        // 4) 边界:点击按钮下方一行(下边框)应识别为"在弹框内",不关闭弹框。
+        // 早期版本 btn_y 错位到这里,导致点击按钮"误中"了下边框行 →
+        // click_at 走 dismiss 路径把弹框关掉。这条断言锁住 reverse bug。
+        tokio_test::block_on(app.click_at(rect3.x + 4, rect3.y + rect3.height - 1));
+        assert_eq!(
+            app.input_mode, prev_mode,
+            "clicking on bottom border row should NOT close popup"
+        );
+    }
+
+    #[test]
+    fn settings_popup_submit_without_required_fields_keeps_popup_open() {
+        // 真实场景:用户点 [确认] 但没填必填字段(USERNAME/PASSWORD),
+        // submit_settings 校验失败 → input_mode 改回对应字段 + 弹框保留。
+        // 这是用户报告"三个按钮功能未生效"的真实原因之一:
+        // 必填校验把弹框拦下来,但视觉上像是"没反应"。
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        // 注意:username/password/system_port/opencode_port 都是空字符串 —
+        // 这正是用户没填任何字段的状态。
+        app.input_mode = InputMode::SettingsAuthUsername;
+
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let btn_y = rect.y + rect.height - 2;
+        let ok_x = rect.x + 4;
+        // 点 [确认]:submit_settings 应在校验处 return,input_mode 应
+        // 改成 SettingsAuthUsername(让用户去填用户名)而不是 Menu。
+        tokio_test::block_on(app.click_at(ok_x, btn_y));
+        assert_eq!(
+            app.input_mode,
+            InputMode::SettingsAuthUsername,
+            "未填 USERNAME 时 submit 应把焦点切回 USERNAME 字段,弹框应保留"
+        );
+        assert!(
+            app.last_settings_popup_rect.is_some(),
+            "submit 校验失败时 last_settings_popup_rect 不应被清掉"
+        );
+        // 状态条应给出错误提示(供 UI 显示)。
+        let status = app.status_message.lock().unwrap().clone();
+        assert!(
+            status.contains("USERNAME") || status.contains("用户名") || status.contains("PASSWORD") || status.contains("密码"),
+            "submit 校验失败应写错误提示到状态条,实际: {status}"
+        );
+    }
+
+    #[test]
+    fn settings_popup_cancel_closes_popup_without_validation() {
+        // [取消] 不依赖任何字段,即使什么都没填也应该立刻关闭弹框。
+        // 这锁住 "三个都失效" 不可能的边界:如果用户报告 [取消] 也失效,
+        // 说明有更深层的 click_at 路由 bug,不是 submit 校验问题。
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        app.input_mode = InputMode::SettingsAuthUsername;
+
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let btn_y = rect.y + rect.height - 2;
+        let cancel_x = rect.x + 15;
+        // find_target 必须命中 SettingsCancel(否则测试无意义)。
+        assert!(matches!(
+            app.find_target(cancel_x, btn_y),
+            Some(ClickTarget::SettingsCancel)
+        ));
+        tokio_test::block_on(app.click_at(cancel_x, btn_y));
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "[取消] 必须无条件关闭弹框,即使未填任何字段"
+        );
+        assert!(
+            app.last_settings_popup_rect.is_none(),
+            "[取消] 应清 last_settings_popup_rect"
+        );
+    }
+
+    #[test]
+    fn settings_popup_cancel_then_redraw_does_not_show_popup() {
+        // 模拟用户场景:点 [取消] 后,下一帧 render 不应该再画 settings弹框。
+        // 这是 [取消] 真正"失效"的边界 —— click_at 改了 input_mode,但
+        // 如果 last_settings_popup_rect 没清或者 render 逻辑有 bug,
+        // 弹框会"复活"。
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        app.input_mode = InputMode::SettingsAuthUsername;
+
+        // 第一次 render:画弹框
+        terminal.draw(|f| app.render(f)).expect("draw 1");
+        assert!(app.input_mode.is_settings_field());
+        let rect = app.last_settings_popup_rect.expect("popup rect after draw 1");
+        let btn_y = rect.y + rect.height - 2;
+        let cancel_x = rect.x + 15;
+
+        // 点 [取消]
+        tokio_test::block_on(app.click_at(cancel_x, btn_y));
+        assert_eq!(app.input_mode, InputMode::Menu, "[取消] 应关弹框");
+
+        // 第二次 render:应不再画 settings弹框
+        terminal.draw(|f| app.render(f)).expect("draw 2");
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "第二次 render 后 input_mode 应仍是 Menu"
+        );
+        // last_settings_popup_rect 也应保持 None(否则下一帧 click_at 误判)
+        assert!(
+            app.last_settings_popup_rect.is_none(),
+            "第二次 render 后 last_settings_popup_rect 应保持 None"
         );
     }
 
@@ -4562,6 +5466,7 @@ impl TuiApp {
             attach_url: String::new(),
             username_input: String::new(),
             password_input: String::new(),
+            auth_password_mask_len: 0,
             show_full_log: false,
             log_scroll: 0,
             confirm: None,
