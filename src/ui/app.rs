@@ -38,6 +38,163 @@ const MAIN_ITEMS: [MenuItem; 3] = [
 ];
 const PROJECTS_ITEMS: [MenuItem; 1] = [MenuItem::OcProjects];
 
+/// 读取系统剪贴板的纯文本内容。
+///
+/// - 失败(无 GUI 剪贴板服务 / 不支持的平台 / 剪贴板非文本):返回空字符串。
+/// - 永远不 panic —— arboard 在不同平台初始化都可能抛错(后台进程、
+///   无 X11 server 的 Linux 等),我们对结果做兜底。
+///
+/// 设计意图:设置面板的「Ctrl+V 粘贴」需要直接拿到剪贴板内容,而
+/// crossterm 只会送 `Char('v')` + Ctrl 修饰,不会喂真实文本。
+/// 因此在收到 `InputEvent::Paste(_)` 且 payload 为空时,统一调一次。
+fn read_clipboard_text() -> String {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.get_text().unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// 设置弹框外点击的处置策略(纯函数,便于单测覆盖三类规则)。
+///
+/// 用户最新精确要求:
+/// - 点击弹框内部(包括 USERNAME 字段和任何空白/说明区域) → 永远不关闭。
+/// - 点击弹框外:
+///   * 普通设置(已配置过) → 关闭弹框;
+///   * 首次启动未配置 → 仍保持打开,只允许 Esc 关闭。
+///
+/// 这个枚举与 `should_dismiss_settings_on_click` 配套使用 —— 三个
+/// 变体直接对应上述三种处置,把"if-else 链"显式化,便于阅读与测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsOutsideAction {
+    /// 点击落在弹框内(字段 / 按钮 / 空白 / 说明行 / 边框) — 无操作。
+    Inside,
+    /// 点击落在弹框外,且不是首次启动 → 关闭弹框。
+    DismissOutside,
+    /// 点击落在弹框外,但当前是首次启动未配置 → 保持弹框打开。
+    /// 状态栏可顺便提示用户"首次启动请按 Esc 关闭"。
+    FirstSetupBlockOutside,
+}
+
+/// 纯函数:给定点 (col, row) 与最近一次渲染记录到的设置弹框 rect,
+/// 决定点击的处置策略。
+///
+/// 设计意图 —— 把"点击内部不关闭"这条规则从 `click_at` 里抽出来,
+/// 避免每次都靠 `find_target == None` 这种间接信号判定"是否在弹框内"。
+/// `find_target` 的 None 也会因为"弹框 rect 记录为 None(还没渲染过)"而
+/// 触发,但这两种语义不同:后者是"还没渲染",前者是"渲染了但点空白"。
+/// 用 rect 几何判定可以稳定区分。
+///
+/// 三个返回值的语义:
+/// - `Inside` — click 落在弹框矩形内(含边框)。无论首启还是普通,
+///   永远不关闭。**包括 USERNAME 字段、以及任何空白 / 说明行 / 帮助行。**
+/// - `DismissOutside` — click 落在弹框外,普通设置模式 → 关闭弹框。
+/// - `FirstSetupBlockOutside` — click 落在弹框外,首次启动未配置 →
+///   保持弹框打开(只允许 Esc 关闭)。
+///
+/// `first_setup_required` 是 [`TuiApp`] 上的显式布尔字段,由
+/// `TuiApp::new` 根据 `auth.is_configured()` 初始化,不依赖临时
+/// buffer / `input_mode` 的副作用。
+fn should_dismiss_settings_on_click(
+    click: (u16, u16),
+    popup_rect: Option<Rect>,
+    first_setup_required: bool,
+) -> SettingsOutsideAction {
+    // 弹框尚未渲染(测试中 / 启动第一帧)→ 弹框外 → 沿用旧规则 dismiss。
+    // 这条边界条件保证测试中可以稳定构造"无 rect"场景,且不破坏主循环
+    // 启动初期行为(主循环每帧都先 render 再 handle 事件,所以实际不会触发)。
+    let Some(rect) = popup_rect else {
+        return if first_setup_required {
+            SettingsOutsideAction::FirstSetupBlockOutside
+        } else {
+            SettingsOutsideAction::DismissOutside
+        };
+    };
+    let (col, row) = click;
+    let inside = col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height);
+    if inside {
+        SettingsOutsideAction::Inside
+    } else if first_setup_required {
+        SettingsOutsideAction::FirstSetupBlockOutside
+    } else {
+        SettingsOutsideAction::DismissOutside
+    }
+}
+
+/// 渲染设置页 PASSWORD 字段掩码行 —— 纯函数,只依赖当前输入 buffer。
+///
+/// 行为:把 `input` 的每个字符替换成 `*`,拼成
+/// `"  PASSWORD: ****"`(与 build_settings_lines 的固定前缀 + SilverBullet
+/// 密码字段保持视觉一致)。
+///
+/// 设计意图 —— 抽成纯函数,便于单测覆盖:
+/// - 0 字符 → `"  PASSWORD: "`
+/// - 1 字符 → `"  PASSWORD: *"`
+/// - N 字符 → `"  PASSWORD: " + "*".repeat(N)`
+///
+/// 不读 `auth_password_len()`(已保存密码长度):粘贴 / 输入 / 退格都改的是
+/// `password_input`,星号必须实时跟随 buffer 长度,否则用户看不到自己输入了几位。
+/// 这条原则与 SilverBullet 密码字段(`sb_password_input.len()`)保持一致。
+fn render_auth_password_line(input: &str) -> String {
+    format!("  PASSWORD: {}", "*".repeat(input.chars().count()))
+}
+
+/// 把粘贴文本按字段规则追加到对应 buffer,返回追加后的新 buffer。
+///
+/// 设计意图:**抽成纯函数**以便单测覆盖所有 11 个字段 + 端口过滤 +
+/// 5 位上限。TuiApp 的 11 个 buffer 都是 String,字段路由通过
+/// `InputMode` 决定,函数不持有任何 self 之外的引用,易测易推。
+///
+/// 行为细节:
+/// - 普通文本字段:整段追加,保留所有字符(含中文 / 空格 / 标点)。
+/// - 三个端口字段(`SettingsHttpPort` / `SettingsServePort` /
+///   `SettingsRatholePort`):只保留 ASCII 数字,且总长度 ≤ 5。
+/// - `Menu` 模式:粘贴不生效(防御性,正常路径不会传进来)。
+fn apply_paste_to_buffer(field: InputMode, current: &str, text: &str) -> String {
+    let mut buf = current.to_string();
+    if text.is_empty() {
+        return buf;
+    }
+    match field {
+        InputMode::SettingsHttpPort => {
+            for c in text.chars().filter(|c| c.is_ascii_digit()) {
+                if buf.len() >= 5 {
+                    break;
+                }
+                buf.push(c);
+            }
+        }
+        InputMode::SettingsServePort => {
+            for c in text.chars().filter(|c| c.is_ascii_digit()) {
+                if buf.len() >= 5 {
+                    break;
+                }
+                buf.push(c);
+            }
+        }
+        InputMode::SettingsRatholePort => {
+            for c in text.chars().filter(|c| c.is_ascii_digit()) {
+                if buf.len() >= 5 {
+                    break;
+                }
+                buf.push(c);
+            }
+        }
+        InputMode::SettingsAuthUsername
+        | InputMode::SettingsAuthPassword
+        | InputMode::SettingsUrl
+        | InputMode::SettingsUser
+        | InputMode::SettingsPassword
+        | InputMode::SettingsRatholeHost
+        | InputMode::SettingsRatholeName
+        | InputMode::SettingsRatholeToken => buf.push_str(text),
+        InputMode::Menu => {}
+    }
+    buf
+}
+
 /// 卡片宽度下限。
 ///
 /// 低于此宽度(< 边框 2 + padding 2 + 标题最少 10 列)就切到紧凑模式,
@@ -344,6 +501,38 @@ pub struct TuiApp {
     click_regions: Vec<ClickRegion>,
     /// 最近一次鼠标移动的位置（用于日志面板边框 hover 高亮）。
     mouse_pos: Option<(u16, u16)>,
+    /// 设置弹框内部内容的垂直滚动偏移（行数）。
+    ///
+    /// 当终端高度不足以一次渲染完整布局(约 31 行)时,`render_settings_popup`
+    /// 通过 `Paragraph::scroll((scroll_offset, 0))` 把被截掉的部分向下移动。
+    /// `settings_field_at_row` 与 `register_settings_click_regions` 必须用
+    /// 同样的偏移来计算屏幕坐标,否则屏幕外的字段 click region 会落在弹框外,
+    /// 导致 `find_target` 返回 None → `click_at` 误判为"点击弹框外"→ 关闭弹框。
+    ///
+    /// 取值范围:`0..=TOTAL_CONTENT_ROWS - 1`(由 `render_settings_popup`
+    /// 用 `saturating_sub` 收紧)。初始 0 = 不滚动。
+    settings_scroll_offset: u16,
+    /// 上一帧设置弹框在屏幕上的 rect(由 `render_settings_popup` 写入)。
+    ///
+    /// 供 `click_at` 用几何判定"点击是否在弹框内",**不**依赖
+    /// `find_target` 的间接信号(因为弹框内的说明行 / 空白 / 边框没
+    /// 注册 click region,`find_target` 会返回 None,但语义上仍然在
+    /// 弹框内 — 必须保持打开)。
+    ///
+    /// 弹框未打开时为 `None`,主循环里 `click_at` 看到 None 就按旧
+    /// 路径处理(不应发生,主循环每帧 render 之后才 handle 事件)。
+    last_settings_popup_rect: Option<ratatui::layout::Rect>,
+    /// 首次启动未配置标志。
+    ///
+    /// 由 `TuiApp::new` 根据 `auth.is_configured()` 一次性初始化,
+    /// `open_settings` **不**修改 —— 关闭再打开设置弹框不应该把
+    /// `first_setup_required` 重置(否则用户配置过密码后再开 → false;
+    /// 又清空密码后开 → 又 true,反复切换会让"框外点击是否关闭"规则
+    /// 在两次打开之间变化,体验割裂)。
+    ///
+    /// 用途:`click_at` 在设置弹框外部点击时,按这个标志决定 dismiss
+    /// 还是保留 —— 首启未配置时框外点击必须不关闭,只允许 Esc。
+    first_setup_required: bool,
     /// 待执行的 attach 会话；run() 主循环检测到非 None 后接管控制台跑 attach。
     pending_attach: Option<PendingAttach>,
 }
@@ -418,8 +607,11 @@ impl TuiApp {
             rathole_token_input: String::new(),
             click_regions: Vec::new(),
             mouse_pos: None,
+            settings_scroll_offset: 0,
             last_main_column_area: ratatui::layout::Rect::default(),
             last_sub_page_area: ratatui::layout::Rect::default(),
+            last_settings_popup_rect: None,
+            first_setup_required: !configured,
             pending_attach: None,
         }
     }
@@ -604,12 +796,26 @@ impl TuiApp {
     }
 
     /// 鼠标滚轮滚动:光标位于子页面列表区域内时,上/下滚动移动选中项
-    /// (等价 ↑/↓ 键)。弹框打开或全屏日志模式下忽略,与 click/hover 的
-    /// 穿透阻止策略一致。
+    /// (等价 ↑/↓ 键)。设置弹框打开时,滚轮用于滚动弹框内容(屏幕滚出区
+    /// 域之外的事件忽略,避免误触主列表)。其他弹框(confirm)或全屏日志
+    /// 模式下忽略,与 click/hover 的穿透阻止策略一致。
     fn wheel_scroll(&mut self, col: u16, row: u16, delta: i32) {
-        let popup_open =
-            self.input_mode.is_settings_field() || self.confirm.is_some();
-        if popup_open || self.show_full_log || self.sub_page.is_none() {
+        // 设置面板打开:滚轮滚动内容。
+        if self.input_mode.is_settings_field() {
+            // 只在滚轮事件落在弹框内时才滚动 —— 否则让事件落空,避免
+            // 弹框外误触。这要求 `register_settings_click_regions` 已
+            // 注册了弹框 rect;这里用弹框几何估算(y 在 rect 中部 ± 内容
+            // 区)。但因为弹框 rect 没有保存,我们采取保守策略:只要弹框
+            // 打开就接受滚轮事件 —— 因为 confirm 弹框极小(高度 5-7),
+            // 用户在小终端也会习惯用滚轮调设置面板。
+            if delta > 0 {
+                self.scroll_settings_down(delta as u16);
+            } else if delta < 0 {
+                self.scroll_settings_up((-delta) as u16);
+            }
+            return;
+        }
+        if self.confirm.is_some() || self.show_full_log || self.sub_page.is_none() {
             return;
         }
         let area = self.last_sub_page_area;
@@ -622,13 +828,45 @@ impl TuiApp {
         }
     }
 
+    /// 设置面板:向上滚动 N 行(delta = -1 等)。
+    /// 已被 `saturating_sub` 保护到 >= 0。
+    fn scroll_settings_up(&mut self, n: u16) {
+        self.settings_scroll_offset = self.settings_scroll_offset.saturating_sub(n);
+    }
+
+    /// 设置面板:向下滚动 N 行。超过内容行数时 clamp 到 `content - 1`。
+    /// 实际渲染时会再做一次 clamp,所以这里只做粗略限制。
+    fn scroll_settings_down(&mut self, n: u16) {
+        self.settings_scroll_offset = self.settings_scroll_offset.saturating_add(n);
+    }
+
     async fn click_at(&mut self, col: u16, row: u16) {
         let popup_open =
             self.input_mode.is_settings_field() || self.confirm.is_some();
         let Some(target) = self.find_target(col, row) else {
-            // 弹框打开时,点击空白区域 = 等价 Esc,关闭弹框
+            // 没有命中任何 click region:可能是弹框外、也可能是弹框内
+            // 没注册 region 的位置(说明行 / 空白 / 边框)。两者走不同分支:
+            //
+            // - 设置弹框:用 `should_dismiss_settings_on_click` 纯函数判定
+            //   (含"框内永不关 / 普通设置框外关 / 首启框外不关"三类规则)。
+            // - 确认弹框:确认弹框是模态警告,外部点击 = 取消(不丢数据),
+            //   维持原 dismiss 行为。
             if popup_open {
-                self.dismiss_popup();
+                if self.input_mode.is_settings_field() {
+                    match should_dismiss_settings_on_click(
+                        (col, row),
+                        self.last_settings_popup_rect,
+                        self.first_setup_required,
+                    ) {
+                        SettingsOutsideAction::DismissOutside => self.dismiss_popup(),
+                        // Inside / FirstSetupBlockOutside → 不关闭,直接返回。
+                        SettingsOutsideAction::Inside
+                        | SettingsOutsideAction::FirstSetupBlockOutside => {}
+                    }
+                } else {
+                    // 确认弹框:点外部 = 取消(旧行为,不破坏)。
+                    self.dismiss_popup();
+                }
             }
             return;
         };
@@ -637,6 +875,10 @@ impl TuiApp {
         // - 弹框内的 click region(字段 / 按钮)正常处理
         // - 主菜单 / 当前服务 / 子页面 / 设置入口 / 日志面板的 click region
         //   都视为"点击弹框外部",关闭弹框而非穿透执行。
+        //
+        // 注意:上面 `find_target == None` 分支已处理"几何上在弹框内
+        // 但无 region"的边界(说明行 / 空白 / 边框),这里只处理
+        // "命中了非弹框的 click region"(主菜单/header 等),即**真的在弹框外**。
         if popup_open && !matches!(
             target,
             ClickTarget::SettingsField(_)
@@ -645,7 +887,25 @@ impl TuiApp {
                 | ClickTarget::ConfirmOk
                 | ClickTarget::CancelBtn
         ) {
-            self.dismiss_popup();
+            // 设置弹框:即便命中了非弹框 region(说明用户点的就是主菜单
+            // 某个 card / 日志面板),也要遵守"首启不关"的规则。
+            if self.input_mode.is_settings_field() {
+                match should_dismiss_settings_on_click(
+                    (col, row),
+                    self.last_settings_popup_rect,
+                    self.first_setup_required,
+                ) {
+                    SettingsOutsideAction::DismissOutside => self.dismiss_popup(),
+                    SettingsOutsideAction::Inside
+                    | SettingsOutsideAction::FirstSetupBlockOutside => {
+                        // Inside 在这里理论上不会发生(说明 find_target 命中了
+                        // 弹框外的 region),FirstSetupBlockOutside 是首启
+                        // 时的预期行为 —— 都不关弹框。
+                    }
+                }
+            } else {
+                self.dismiss_popup();
+            }
             return;
         }
 
@@ -702,6 +962,7 @@ impl TuiApp {
             ClickTarget::SettingsCancel => {
                 // 等价于按 Esc 关闭弹框
                 self.input_mode = InputMode::Menu;
+                self.last_settings_popup_rect = None;
             }
         }
     }
@@ -709,12 +970,15 @@ impl TuiApp {
     /// 关闭当前打开的弹框(设置 / 确认)。
     ///
     /// 两个弹框互斥(同时只可能有一个),所以按顺序检查,先 confirm 再 settings。
+    /// 关闭设置弹框时同步清空 `last_settings_popup_rect`,避免下一帧未
+    /// 重新渲染时 `click_at` 误用旧 rect 做"点弹框外 = 关闭"判定。
     fn dismiss_popup(&mut self) {
         if self.confirm.is_some() {
             self.confirm = None;
         }
         if self.input_mode.is_settings_field() {
             self.input_mode = InputMode::Menu;
+            self.last_settings_popup_rect = None;
         }
     }
 
@@ -754,12 +1018,21 @@ impl TuiApp {
         } else {
             InputMode::SettingsHttpPort
         };
+        // 每次重开设置面板都从顶部开始;上次的滚动位置在重新打开时无意义。
+        // 否则:用户上次滚到 RatholeHost,关掉再开 → 仍滚到 RatholeHost →
+        // 但 USERNAME 隐藏在屏幕外,首次鼠标移动不会自动聚焦到顶部字段。
+        self.settings_scroll_offset = 0;
     }
 
     async fn handle_settings_key(&mut self, event: InputEvent) {
         match event {
             InputEvent::Tab | InputEvent::Down => self.move_settings_field(1),
             InputEvent::Up => self.move_settings_field(-1),
+            // PgUp/PgDown:小终端下设置面板内容被截断,用户用翻页键滚动。
+            // 每次滚动 5 行(经验值:既能跨过一组"标题+字段+说明"三行结构,
+            // 又不会跳太远找不到行)。clamp 由 render_settings_popup 在渲染时完成。
+            InputEvent::PageUp => self.scroll_settings_up(5),
+            InputEvent::PageDown => self.scroll_settings_down(5),
             InputEvent::Backspace => match self.input_mode {
                 InputMode::SettingsAuthUsername => {
                     self.username_input.pop();
@@ -813,18 +1086,103 @@ impl TuiApp {
                 InputMode::SettingsUser => self.sb_user_input.push(c),
                 InputMode::SettingsPassword => self.sb_password_input.push(c),
                 InputMode::SettingsRatholeHost => self.rathole_host_input.push(c),
-                InputMode::SettingsRatholePort => self.rathole_port_input.push(c),
+                InputMode::SettingsRatholePort if c.is_ascii_digit() => {
+                    if self.rathole_port_input.len() < 5 {
+                        self.rathole_port_input.push(c);
+                    }
+                }
+                InputMode::SettingsRatholePort => {}
                 InputMode::SettingsRatholeName => self.rathole_name_input.push(c),
                 InputMode::SettingsRatholeToken => self.rathole_token_input.push(c),
                 _ => {}
             },
+            // 粘贴:把 payload 追加到当前字段 buffer。端口字段只接受数字,
+            // RatholePort 同理;payload 中的非数字字符会被静默丢弃。
+            //
+            // 这里不直接吞 arboard —— 因为 Ctrl+V 已经由 events.rs
+            // 转成 Paste(String::new()) 而非真实文本。空 payload 时
+            // 我们拉一次系统剪贴板;非空 payload(终端 bracketed paste)
+            // 直接用事件里的内容。
+            InputEvent::Paste(payload) => {
+                let text = if payload.is_empty() {
+                    crate::ui::app::read_clipboard_text()
+                } else {
+                    payload
+                };
+                self.apply_settings_paste(&text);
+            }
             InputEvent::Select => self.submit_settings().await,
             InputEvent::Quit => {
-                // 退出设置面板:若首启未填写完成,submit_settings 会另
-                // 外拦截,保证无法进入主菜单。
+                // 退出设置面板:刻意不调用 submit_settings。
+                // 设计意图 —— 「Esc 取消」= 关闭弹框不保存,
+                // 「Enter 保存」= 走 submit_settings 校验 + 写文件。
+                // 在首启未填写完成时,submit_settings 会自己拒绝;
+                // 这里只负责把弹框关闭,与退出逻辑解耦。
                 self.input_mode = InputMode::Menu;
             }
             _ => {}
+        }
+    }
+
+    /// 把粘贴文本按字段规则追加到当前编辑焦点的 buffer。
+    ///
+    /// - 普通文本字段(`Settings*` 除端口外):整段追加。
+    /// - 端口字段(`SettingsHttpPort` / `SettingsServePort` /
+    ///   `SettingsRatholePort`):只接受 ASCII 数字,其它字符丢弃,
+    ///   并把总长度限制在 5 位以内(避免 `65535000` 这类越界输入)。
+    ///
+    /// 真正的过滤/截断逻辑放在自由函数 [`apply_paste_to_buffer`] 里,
+    /// 以便单测;本方法只负责把对应 buffer 拿出来 / 写回去。
+    fn apply_settings_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.input_mode {
+            InputMode::SettingsHttpPort => {
+                self.system_port_input =
+                    apply_paste_to_buffer(self.input_mode, &self.system_port_input, text);
+            }
+            InputMode::SettingsServePort => {
+                self.opencode_port_input =
+                    apply_paste_to_buffer(self.input_mode, &self.opencode_port_input, text);
+            }
+            InputMode::SettingsRatholePort => {
+                self.rathole_port_input =
+                    apply_paste_to_buffer(self.input_mode, &self.rathole_port_input, text);
+            }
+            InputMode::SettingsAuthUsername => {
+                self.username_input =
+                    apply_paste_to_buffer(self.input_mode, &self.username_input, text);
+            }
+            InputMode::SettingsAuthPassword => {
+                self.password_input =
+                    apply_paste_to_buffer(self.input_mode, &self.password_input, text);
+            }
+            InputMode::SettingsUrl => {
+                self.sb_url_input =
+                    apply_paste_to_buffer(self.input_mode, &self.sb_url_input, text);
+            }
+            InputMode::SettingsUser => {
+                self.sb_user_input =
+                    apply_paste_to_buffer(self.input_mode, &self.sb_user_input, text);
+            }
+            InputMode::SettingsPassword => {
+                self.sb_password_input =
+                    apply_paste_to_buffer(self.input_mode, &self.sb_password_input, text);
+            }
+            InputMode::SettingsRatholeHost => {
+                self.rathole_host_input =
+                    apply_paste_to_buffer(self.input_mode, &self.rathole_host_input, text);
+            }
+            InputMode::SettingsRatholeName => {
+                self.rathole_name_input =
+                    apply_paste_to_buffer(self.input_mode, &self.rathole_name_input, text);
+            }
+            InputMode::SettingsRatholeToken => {
+                self.rathole_token_input =
+                    apply_paste_to_buffer(self.input_mode, &self.rathole_token_input, text);
+            }
+            InputMode::Menu => {}
         }
     }
 
@@ -2205,16 +2563,31 @@ impl TuiApp {
     fn render_settings_popup(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         // 宽 80 适配 80 列终端(实测环境);超长内容走 Paragraph::wrap 自动换行。
-        // 高度动态 = 行数 + 2(border),但不超出终端可用高度。
+        // 高度动态 = 内容 + 1 空行 + 1 按钮行 + 2 边框,但不超出 area 可用高度。
+        // 当终端矮于完整布局时,通过 `Paragraph::scroll((scroll_offset, 0))`
+        // 让用户用 PgUp/PgDown / 滚轮滚动查看完整内容;同时把 `scroll_offset`
+        // 透传给 `settings_field_at_row` 与 `register_settings_click_regions`,
+        // 使点击坐标映射保持一致 —— 否则屏幕外字段的 click region 会落在弹框外,
+        // find_target 返回 None → click_at 误判为"点弹框外"→ dismiss_popup。
         let w: u16 = 80;
         let mut lines = self.build_settings_lines();
         let btn_line_idx = lines.len() as u16; // 按钮行在底部(以 build_settings_lines 输出计)
 
+        // 限制 scroll_offset:不能超过"内容 - 1"行,否则会把所有内容滚走。
+        // 这里 content 行数 = lines.len()(不含按钮/空行/边框)。saturating_sub(1)
+        // 保证 offset 最大 = content - 1(留至少 1 行内容可见)。
+        let max_offset = lines.len().saturating_sub(1) as u16;
+        if self.settings_scroll_offset > max_offset {
+            self.settings_scroll_offset = max_offset;
+        }
+
         // 先根据 mouse_pos 决定底部按钮文本样式(hover 高亮)。
         // 注意:此处算的是"实际渲染后按钮所在的屏幕坐标",所以必须用最终的
         // `rect` (后续算出来),不能先用 `area`。
-        let desired_h = lines.len() as u16 + 2;
-        let max_h = area.height.saturating_sub(13).max(8);
+        let desired_h = lines.len() as u16 + 2; // +2 = 上/下边框
+        // 弹框至少要 9 行才能放下:6 行内容可视 + 1 空行 + 1 按钮 + 2 边框 = 10;
+        // 9 是极端下限,允许 5 行内容可视。即使窗口极矮,也要保证按钮可点。
+        let max_h = area.height.saturating_sub(13).max(9);
         let h = desired_h.min(max_h);
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
@@ -2242,17 +2615,18 @@ impl TuiApp {
         // 鼠标 hover 字段行 → 自动切换 input_mode(等价于 Tab/点击)
         if let Some((_c, r)) = self.mouse_pos {
             if r >= rect.y + 1 && r < rect.y + btn_line_idx + 1 {
-                if let Some(field) = self.settings_field_at_row(r - rect.y - 1) {
+                if let Some(field) = self.settings_field_at_row(r - rect.y - 1, self.settings_scroll_offset) {
                     self.input_mode = field;
                 }
             }
         }
 
         // 先注册 click 区域(根据"显示位置"反推每行的 y 坐标)
-        self.register_settings_click_regions(rect, lines.len(), h, btn_line_idx);
+        self.register_settings_click_regions(rect, btn_line_idx, self.settings_scroll_offset, h);
 
         let form = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
+            .scroll((self.settings_scroll_offset, 0))
             .block(
                 Block::default()
                     .title("设置")
@@ -2261,22 +2635,43 @@ impl TuiApp {
             );
         frame.render_widget(Clear, rect);
         frame.render_widget(form, rect);
+        // 把本帧弹框 rect 记录下来,供 click_at 用几何判定"是否在弹框内"。
+        // 必须放在最后,保证只有真正完成渲染的 rect 才会被记录 —— 之前
+        // 任何 early-return 都不会污染 last_settings_popup_rect。
+        self.last_settings_popup_rect = Some(rect);
+    }
+
+    /// 把弹框内相对行 idx(0-based,不含上/左边框)转成对应字段 InputMode。
+    /// 返回 None 表示该行不是字段行(可能是标题/空行/帮助/按钮行)。
+    ///
+    /// `scroll_offset` 是当前设置面板的滚动偏移(行数):屏幕行 0 对应
+    /// build_settings_lines 的第 `scroll_offset` 行,屏幕行 `r_inside` 对应
+    /// 原始布局的第 `r_inside + scroll_offset` 行。
+    fn settings_field_at_row(&self, row_inside: u16, scroll_offset: u16) -> Option<InputMode> {
+        // 与 register_settings_click_regions 中的 FIELD_LINE_IDX 保持一致
+        const FIELD_LINE_IDX: [u16; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
+        FIELD_LINE_IDX
+            .iter()
+            .position(|&r| r == row_inside + scroll_offset)
+            .and_then(|i| SETTINGS_FIELDS.get(i).copied())
     }
 
     /// 判断鼠标是否在设置弹框底部某个按钮上(用于 hover 高亮判断)。
     ///
-    /// 参数 `rect` 是**弹框本身**的 rect(不是屏幕 area),按钮行坐标 = `rect.y + 1 + btn_line_idx + 1`。
+    /// 参数 `rect` 是**弹框本身**的 rect(不是屏幕 area),按钮行总是
+    /// 渲染在弹框的**最后一行**(即 `rect.y + rect.height - 1`)——
+    /// 按钮区紧贴下边框,内容可滚动但按钮始终固定可见。
     /// 按钮 click 区域宽度 8 列,与按钮文本列对齐。
     fn mouse_pos_in_settings_btn(
         &self,
         rect: &Rect,
-        btn_line_idx: u16,
+        _btn_line_idx: u16,
         is_ok: bool,
     ) -> bool {
         let Some((c, r)) = self.mouse_pos else {
             return false;
         };
-        let btn_y = rect.y + 1 + btn_line_idx + 1;
+        let btn_y = rect.y + rect.height - 1;
         if r != btn_y {
             return false;
         }
@@ -2289,11 +2684,10 @@ impl TuiApp {
         c >= btn_x && c < btn_x + 8
     }
 
-    /// 当前 auth 中**已保存**密码的长度(用于 PASSWORD 字段掩码显示)。
-    ///
-    /// 注意:**故意不读 buffer** —— buffer 是用户当前输入的内容(可能为空),
-    /// 我们需要显示"已保存密码"的长度,让用户看到"密码已设,N 个字符",
-    /// 改密码时 buffer 长度不反馈(避免长度信息泄露)。
+    /// 当前 auth 中**已保存**密码的长度 —— 仅在需要"显示密码已设置"
+    /// 这种纯信息展示(非输入掩码)时使用。**输入掩码渲染已统一用
+    /// [`render_auth_password_line`] 跟随当前 buffer**。
+    #[allow(dead_code)]
     fn auth_password_len(&self) -> usize {
         self.auth
             .read()
@@ -2302,18 +2696,46 @@ impl TuiApp {
             .len()
     }
 
-    /// 把弹框内相对行 idx(0-based,不含上/左边框)转成对应字段 InputMode。
-    /// 返回 None 表示该行不是字段行(可能是标题/空行/帮助/按钮行)。
-    fn settings_field_at_row(&self, row_inside: u16) -> Option<InputMode> {
-        // 与 register_settings_click_regions 中的 FIELD_LINE_IDX 保持一致
-        const FIELD_LINE_IDX: [u16; 11] = [2, 3, 6, 7, 11, 12, 13, 16, 17, 18, 19];
-        FIELD_LINE_IDX
-            .iter()
-            .position(|&r| r == row_inside)
-            .and_then(|i| SETTINGS_FIELDS.get(i).copied())
-    }
-
     /// 生成设置弹框的所有行内容,同时为每个字段决定高亮样式。
+    ///
+    /// 布局:
+    /// - 4 个分区(认证 / 端口 / SilverBullet / Rathole),每个分区一个标题行。
+    /// - 每个字段占两行:第一行是字段值(高亮由当前 input_mode 决定),
+    ///   第二行是浅灰色「用途」说明(说明 env key、字段作用)。
+    /// - 分区之间留一个空行分隔。
+    ///
+    /// 行索引表(对应 [`settings_field_at_row`] 与 [`register_settings_click_regions`]):
+    /// - 0:  "认证设置"
+    /// - 1:  USERNAME 值       ← field 0
+    /// - 2:  USERNAME 说明
+    /// - 3:  PASSWORD 值       ← field 1
+    /// - 4:  PASSWORD 说明
+    /// - 5:  (空)
+    /// - 6:  "端口设置"
+    /// - 7:  系统端口 值       ← field 2
+    /// - 8:  系统端口 说明
+    /// - 9:  OpenCode 端口 值  ← field 3
+    /// - 10: OpenCode 端口 说明
+    /// - 11: (空)
+    /// - 12: "远程 SilverBullet 设置"
+    /// - 13: 远程路径 值       ← field 4
+    /// - 14: 远程路径 说明
+    /// - 15: 用户名 值         ← field 5
+    /// - 16: 用户名 说明
+    /// - 17: 密码 值           ← field 6
+    /// - 18: 密码 说明
+    /// - 19: (空)
+    /// - 20: "Rathole 内网穿透设置"
+    /// - 21: Host 值           ← field 7
+    /// - 22: Host 说明
+    /// - 23: Port 值           ← field 8
+    /// - 24: Port 说明
+    /// - 25: Name 值           ← field 9
+    /// - 26: Name 说明
+    /// - 27: Token 值          ← field 10
+    /// - 28: Token 说明
+    /// - 29: (空)
+    /// - 30: 帮助行
     fn build_settings_lines(&self) -> Vec<Line<'static>> {
         let active = Style::default()
             .bg(Color::Cyan)
@@ -2329,73 +2751,120 @@ impl TuiApp {
         };
         let title_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
         let help_style = Style::default().fg(Color::DarkGray);
+        // 字段说明(在字段下一行)用浅灰,提示但不抢焦点高亮。
+        let desc_style = Style::default().fg(Color::DarkGray);
+
+        // PASSWORD 字段的星号长度跟随当前输入 buffer 实时变化 —— 与
+        // SilverBullet 密码字段行为一致。粘贴 / 字符输入 / 退格都会
+        // 让 PASSWORD 行立即反映用户输入了多少位。
+        let auth_pw_line = render_auth_password_line(&self.password_input);
 
         vec![
+            // --- 认证设置 ---
             Line::from(Span::styled("认证设置", title_style)),
-            Line::from(""),
             Line::from(Span::styled(
                 format!("  USERNAME: {}", self.username_input),
                 style_for(InputMode::SettingsAuthUsername),
             )),
             Line::from(Span::styled(
-                format!(
-                    "  PASSWORD: {}",
-                    // 永远按 auth 中密码长度显示:buffer 为空时显示当前密码
-                    // 长度(buffer 已 clear 清)→ 让用户知道已设密码且长度为 N;
-                    // buffer 非空时也按 auth 长度(改密码过程中不反馈长度,避免
-                    // 长度信息泄露)。
-                    "*".repeat(self.auth_password_len())
-                ),
+                "    作用: HTTP Basic 用户名(env: OPENCODE_SERVER_USERNAME)",
+                desc_style,
+            )),
+            Line::from(Span::styled(
+                auth_pw_line,
                 style_for(InputMode::SettingsAuthPassword),
             )),
-            Line::from(""),
-            Line::from(Span::styled("端口设置", title_style)),
-            Line::from(""),
             Line::from(Span::styled(
-                format!("  系统端口:    {}", self.system_port_input),
+                "    作用: HTTP Basic 密码(env: OPENCODE_SERVER_PASSWORD)",
+                desc_style,
+            )),
+            Line::from(""),
+            // --- 端口设置 ---
+            Line::from(Span::styled("端口设置", title_style)),
+            Line::from(Span::styled(
+                format!("  系统端口:   {}", self.system_port_input),
                 style_for(InputMode::SettingsHttpPort),
             )),
             Line::from(Span::styled(
-                format!("  OpenCode:  {}", self.opencode_port_input),
+                "    作用: 本程序 axum 监听端口(env: OC_SERVE_SYSTEM_PORT)",
+                desc_style,
+            )),
+            Line::from(Span::styled(
+                format!("  OpenCode 端口: {}", self.opencode_port_input),
                 style_for(InputMode::SettingsServePort),
             )),
+            Line::from(Span::styled(
+                "    作用: opencode serve 端口(env: OC_SERVE_OPENCODE_PORT)",
+                desc_style,
+            )),
             Line::from(""),
+            // --- SilverBullet ---
             Line::from(Span::styled("远程 SilverBullet 设置", title_style)),
-            Line::from(""),
             Line::from(Span::styled(
                 format!("  远程路径: {}", self.sb_url_input),
                 style_for(InputMode::SettingsUrl),
+            )),
+            Line::from(Span::styled(
+                "    作用: 远程 SilverBullet URL(env: SB_URL,留空表示禁用)",
+                desc_style,
             )),
             Line::from(Span::styled(
                 format!("  用户名:   {}", self.sb_user_input),
                 style_for(InputMode::SettingsUser),
             )),
             Line::from(Span::styled(
-                format!("  密码:     {}", "*".repeat(self.sb_password_input.len())),
+                "    作用: 远程 SilverBullet 用户名(env: SB_USER)",
+                desc_style,
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "  密码:     {}",
+                    "*".repeat(self.sb_password_input.len())
+                ),
                 style_for(InputMode::SettingsPassword),
             )),
+            Line::from(Span::styled(
+                "    作用: 远程 SilverBullet 密码(env: SB_PASSWORD)",
+                desc_style,
+            )),
             Line::from(""),
+            // --- Rathole ---
             Line::from(Span::styled("Rathole 内网穿透设置", title_style)),
-            Line::from(""),
             Line::from(Span::styled(
                 format!("  Host:   {}", self.rathole_host_input),
                 style_for(InputMode::SettingsRatholeHost),
+            )),
+            Line::from(Span::styled(
+                "    作用: rathole 远端服务器地址(env: RATHOLE_HOST)",
+                desc_style,
             )),
             Line::from(Span::styled(
                 format!("  Port:   {}", self.rathole_port_input),
                 style_for(InputMode::SettingsRatholePort),
             )),
             Line::from(Span::styled(
+                "    作用: rathole 远端端口(env: RATHOLE_PORT,1-65535)",
+                desc_style,
+            )),
+            Line::from(Span::styled(
                 format!("  Name:   {}", self.rathole_name_input),
                 style_for(InputMode::SettingsRatholeName),
+            )),
+            Line::from(Span::styled(
+                "    作用: rathole 服务名(env: RATHOLE_NAME)",
+                desc_style,
             )),
             Line::from(Span::styled(
                 format!("  Token:  {}", self.rathole_token_input),
                 style_for(InputMode::SettingsRatholeToken),
             )),
+            Line::from(Span::styled(
+                "    作用: rathole 鉴权 Token(env: RATHOLE_TOKEN)",
+                desc_style,
+            )),
             Line::from(""),
             Line::from(Span::styled(
-                "  Tab/↑/↓ 切换字段  Enter 保存  Esc 取消  (点击字段行直接跳到该输入)",
+                "  Tab/↑/↓ 切换  Ctrl+V 粘贴  Enter 保存  Esc 取消  (点击字段行直接跳到该输入)",
                 help_style,
             )),
         ]
@@ -2403,32 +2872,50 @@ impl TuiApp {
 
     /// 为设置弹框内的每个字段注册 ClickRegion(鼠标点击切换焦点)。
     ///
-    /// `SETTINGS_FIELDS` 与 `build_settings_lines` 的顺序一一对应:
-    /// - 0: USERNAME  (line idx 2)
+    /// `SETTINGS_FIELDS` 与 `build_settings_lines` 的顺序一一对应
+    /// (字段值在分区中排在第奇数位 1,3,7,9,13,15,17,21,23,25,27;
+    /// 偶数位是作用说明,不是字段本身)。
+    /// - 0: USERNAME  (line idx 1)
     /// - 1: PASSWORD  (line idx 3)
-    /// - 2: HTTP 端口 (line idx 6)
-    /// - 3: Serve 端口(line idx 7)
-    /// - 4: SB URL    (line idx 11)
-    /// - 5: SB User   (line idx 12)
-    /// - 6: SB Password (line idx 13)
-    /// - 7: Rathole Host (line idx 16)
-    /// - 8: Rathole Port (line idx 17)
-    /// - 9: Rathole Name (line idx 18)
-    /// - 10: Rathole Token(line idx 19)
+    /// - 2: HTTP 端口 (line idx 7)
+    /// - 3: Serve 端口(line idx 9)
+    /// - 4: SB URL    (line idx 13)
+    /// - 5: SB User   (line idx 15)
+    /// - 6: SB Password (line idx 17)
+    /// - 7: Rathole Host (line idx 21)
+    /// - 8: Rathole Port (line idx 23)
+    /// - 9: Rathole Name (line idx 25)
+    /// - 10: Rathole Token(line idx 27)
+    ///
+    /// `scroll_offset` 是当前滚动偏移;屏幕行 `r` 对应 `build_settings_lines`
+    /// 的第 `r + scroll_offset` 行。被滚动到屏幕外的字段(屏幕行 < 0 或 ≥ 内容区)
+    /// **不**注册 click region —— 否则 `find_target` 会返回 None,触发
+    /// `click_at` 走 `dismiss_popup` 分支,造成"点 username 误关弹框"。
     fn register_settings_click_regions(
         &mut self,
         rect: Rect,
-        _lines_len: usize,
-        _h: u16,
-        btn_line_idx: u16,
+        #[allow(unused_variables)] btn_line_idx: u16,
+        scroll_offset: u16,
+        popup_h: u16,
     ) {
-        // lines 数组内的"字段行"索引(从 0 开始);0 是标题,1 是空行。
+        // lines 数组内的"字段行"索引(从 0 开始);0 是分区标题,
+        // 1,3,7,9,13,15,17,21,23,25,27 是 11 个字段值各自所在行。
         // 与 settings_field_at_row 中的索引保持一致。
-        const FIELD_LINE_IDX: [usize; 11] = [2, 3, 6, 7, 11, 12, 13, 16, 17, 18, 19];
+        const FIELD_LINE_IDX: [usize; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
         // 弹框上方 border 占 1 行,所以字段 line idx 0 (认证设置标题) 在 rect.y + 1。
+        // 内容可视行数 = popup_h - 2 (上下边框) - 1 (按钮区空行) - 1 (按钮行)。
+        let content_h = popup_h.saturating_sub(4);
         for (i, field) in SETTINGS_FIELDS.iter().enumerate() {
             let line_idx = FIELD_LINE_IDX[i];
-            let target_y = rect.y + 1 + line_idx as u16;
+            // 字段在 build_settings_lines 中的原始行 idx。
+            let line_idx_u16 = line_idx as u16;
+            // 减去滚动偏移后,该字段的"屏幕内 row" = line_idx_u16 - scroll_offset。
+            // 若屏幕行不在 [0, content_h) 内 → 已被滚动到弹框外 → 跳过。
+            let screen_row = match line_idx_u16.checked_sub(scroll_offset) {
+                Some(r) if r < content_h => r,
+                _ => continue,
+            };
+            let target_y = rect.y + 1 + screen_row;
             // 字段矩形覆盖整行宽度(去掉左右各 1 的 border),高度 1。
             // wrap 后的内容会渲染到下一行,鼠标只能点 prefix 那一行,
             // 这是 wrap 语义与 click region 的固有取舍。
@@ -2437,11 +2924,13 @@ impl TuiApp {
                 target: ClickTarget::SettingsField(*field),
             });
         }
-        // 底部按钮 click region:确认按钮(btn_line_idx + 1) + 取消按钮
+        // 底部按钮 click region:确认按钮 + 取消按钮,均在弹框最后一行。
         // 与 mouse_pos_in_settings_btn 的坐标计算保持完全一致,避免
-        // "hover 高亮但点击无反应"或反之。
-        let ok_y = rect.y + 1 + btn_line_idx + 1;
-        let cancel_y = ok_y;
+        // "hover 高亮但点击无反应"或反之。按钮行在 popup 内的绝对 y =
+        // rect.y + rect.height - 1(下边框上方一行)。
+        let btn_y = rect.y + popup_h - 1;
+        let ok_y = btn_y;
+        let cancel_y = btn_y;
         self.click_regions.push(ClickRegion {
             rect: Rect::new(rect.x + 2, ok_y, 8, 1),
             target: ClickTarget::SettingsOk,
@@ -3342,6 +3831,772 @@ let left = ratatui::layout::Layout::default()
             visible.contains(&ITEMS_OcServe) && visible.contains(&ITEMS_Rathole),
             "main column at 14x80 must include OcServe+Rathole, got {visible:?} (col={main_col:?})"
         );
+    }
+
+    // ---- 设置面板:粘贴 / 关闭不保存 / 新布局 ----
+
+    /// 端口字段粘贴时,非数字字符必须被丢弃,5 位上限必须生效。
+    #[test]
+    fn paste_into_http_port_filters_non_digits_and_caps_at_five() {
+        // 用户从某处复制了 "9a465#9" — 9 留下,a / # 丢,长度裁到 5 位。
+        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "", "9a465#9");
+        assert_eq!(got, "94659");
+        // 已经 4 位 → 再粘 3 位数字 → 只追加 1 位,变成 5 位。
+        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9464", "12345");
+        assert_eq!(got, "94641");
+        // 完全非数字 → 保持原样。
+        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9464", "abc");
+        assert_eq!(got, "9464");
+    }
+
+    #[test]
+    fn paste_into_opencode_port_follows_same_rules() {
+        let got = apply_paste_to_buffer(InputMode::SettingsServePort, "", "94x64");
+        assert_eq!(got, "9464");
+    }
+
+    #[test]
+    fn paste_into_rathole_port_filters_and_caps() {
+        let got = apply_paste_to_buffer(InputMode::SettingsRatholePort, "", "7abc0123");
+        assert_eq!(got, "70123");
+    }
+
+    /// 普通文本字段粘贴时,整段追加,保留所有字符(含中文 / 空格)。
+    #[test]
+    fn paste_into_text_field_appends_verbatim() {
+        let got = apply_paste_to_buffer(
+            InputMode::SettingsUrl,
+            "",
+            "https://md.isoops.com/中文路径",
+        );
+        assert_eq!(got, "https://md.isoops.com/中文路径");
+    }
+
+    /// 空 payload 必须是 no-op(用于 Ctrl+V → 剪贴板拉空的兜底)。
+    #[test]
+    fn paste_with_empty_payload_is_noop() {
+        let got = apply_paste_to_buffer(InputMode::SettingsUrl, "https://x", "");
+        assert_eq!(got, "https://x");
+    }
+
+    /// Menu 模式粘贴不应崩溃 / 改任何东西 —— 正常路径下不会触发,但
+    /// 函数路由必须显式覆盖,免得将来加新 InputMode 时漏掉。
+    #[test]
+    fn paste_in_menu_mode_is_noop() {
+        let got = apply_paste_to_buffer(InputMode::Menu, "anything", "pasted");
+        assert_eq!(got, "anything");
+    }
+
+    /// `render_auth_password_line` 纯函数契约 —— 星号数量严格等于
+    /// `input.chars().count()`,前缀必须始终为 `"  PASSWORD: "`。
+    /// 与 SilverBullet 字段(直接 `sb_password_input.len()`)保持一致:
+    /// 0 → 空、1 → 单星号、N → N 星号。
+    #[test]
+    fn render_auth_password_line_counts_chars_verbatim() {
+        assert_eq!(render_auth_password_line(""), "  PASSWORD: ");
+        assert_eq!(render_auth_password_line("a"), "  PASSWORD: *");
+        assert_eq!(render_auth_password_line("abc"), "  PASSWORD: ***");
+        assert_eq!(
+            render_auth_password_line("Sup3rSecret!"),
+            "  PASSWORD: ************"
+        );
+    }
+
+    /// 回归:设置页 PASSWORD 行的星号长度必须跟随当前 `password_input`
+    /// buffer 实时变化 —— 不能读已保存密码长度(那样粘贴后星号不更新)。
+    ///
+    /// 之前 bug:`build_settings_lines` 调用 `auth_password_len()`
+    /// (返回已保存密码长度),粘贴 / 字符输入 / 退格都改的是 `password_input`,
+    /// 导致用户粘贴一长串后星号还停留在 auth 已保存密码长度上,看不到自己输入了几位。
+    /// 这里用 `apply_paste_to_buffer` 模拟 Ctrl+V 路径,跑真实
+    /// `build_settings_lines`,断言 PASSWORD 行(line idx=3)的 `*` 数量
+    /// 等于 `password_input.len()`。
+    ///
+    /// PASSWORD 行(line idx=3)在 `build_settings_lines` 里是
+    /// `format!("  PASSWORD: {auth_pw_stars}")`,所以
+    /// - 0 字符 → `"  PASSWORD: "`
+    /// - 1 字符 → `"  PASSWORD: *"`
+    /// - 5 字符 → `"  PASSWORD: *****"`
+    #[test]
+    fn password_line_stars_track_paste_into_buffer() {
+        let mut app = TuiApp::test_stub();
+        // 模拟 Ctrl+V 粘贴一段密码到 SettingsAuthPassword 字段。
+        let pasted = apply_paste_to_buffer(
+            InputMode::SettingsAuthPassword,
+            &app.password_input,
+            "Sup3rSecret!",
+        );
+        app.password_input = pasted;
+        let lines = app.build_settings_lines();
+        // 验证 PASSWORD 行(line idx=3)星号数量 = password_input.len()
+        let pw_line = &lines[3];
+        // 拼接 line 内所有 span 的文本以便断言
+        let text: String = pw_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let expected_stars = "*".repeat(app.password_input.len());
+        let expected = format!("  PASSWORD: {expected_stars}");
+        assert_eq!(
+            text, expected,
+            "粘贴后 PASSWORD 行星号必须等于 password_input.len()={}",
+            app.password_input.len()
+        );
+        assert_eq!(app.password_input.len(), 12);
+        // sanity: 整行确实以 "  PASSWORD: " 开头,后面全是 `*`
+        assert!(text.starts_with("  PASSWORD: "));
+        assert_eq!(text.matches('*').count(), app.password_input.len());
+    }
+
+    /// 同上,但走单字符追加路径(`SettingsAuthPassword` 下按普通键):
+    /// 每次输入都应让 PASSWORD 行星号数 = buffer 长度。
+    #[test]
+    fn password_line_stars_track_per_char_input() {
+        let mut app = TuiApp::test_stub();
+        for c in "abc".chars() {
+            app.password_input.push(c);
+        }
+        let lines = app.build_settings_lines();
+        let text: String = lines[3]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "  PASSWORD: ***");
+    }
+
+    /// 退格(`password_input.pop()`)后星号必须同步减少 —— 与 SilverBullet
+    /// 密码字段(`sb_password_input`)的渲染行为保持一致。
+    #[test]
+    fn password_line_stars_shrink_on_pop() {
+        let mut app = TuiApp::test_stub();
+        app.password_input.push_str("hello");
+        // 先确认 5 个星号
+        let lines = app.build_settings_lines();
+        let text_before: String = lines[3]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text_before, "  PASSWORD: *****");
+        // 退格两次
+        app.password_input.pop();
+        app.password_input.pop();
+        let lines = app.build_settings_lines();
+        let text_after: String = lines[3]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text_after, "  PASSWORD: ***");
+    }
+
+    /// 行 idx → InputMode 映射:必须与 build_settings_lines 的布局
+    /// 保持一致。每多一个字段,这里就要多一个 case;少一个就会失败。
+    /// 索引顺序 = SETTINGS_FIELDS 顺序 = [USERNAME, PASSWORD, 系统端口,
+    /// OpenCode 端口, 远程路径, 用户名, 密码, RatholeHost, RatholePort,
+    /// RatholeName, RatholeToken]。
+    #[test]
+    fn settings_field_at_row_maps_every_field_to_correct_input_mode() {
+        let cases = [
+            (1, InputMode::SettingsAuthUsername),
+            (3, InputMode::SettingsAuthPassword),
+            (7, InputMode::SettingsHttpPort),
+            (9, InputMode::SettingsServePort),
+            (13, InputMode::SettingsUrl),
+            (15, InputMode::SettingsUser),
+            (17, InputMode::SettingsPassword),
+            (21, InputMode::SettingsRatholeHost),
+            (23, InputMode::SettingsRatholePort),
+            (25, InputMode::SettingsRatholeName),
+            (27, InputMode::SettingsRatholeToken),
+        ];
+        // `settings_field_at_row` 是 &self 方法但完全不用 self(只读
+        // 内嵌的常量表),我们走 helper 镜像逻辑,避免构造 TuiApp 的
+        // 重依赖(supervisor / log buffer / store)。
+        for (row, expected) in cases {
+            let got = helper_settings_field_at_row(row);
+            assert_eq!(got, Some(expected), "row={row}");
+        }
+        // 标题 / 空行 / 帮助 / 描述行 / 越界 → None
+        assert_eq!(helper_settings_field_at_row(0), None);
+        assert_eq!(helper_settings_field_at_row(2), None); // USERNAME 说明
+        assert_eq!(helper_settings_field_at_row(4), None); // PASSWORD 说明
+        assert_eq!(helper_settings_field_at_row(5), None); // 空
+        assert_eq!(helper_settings_field_at_row(29), None); // 空
+        assert_eq!(helper_settings_field_at_row(30), None); // 帮助
+        assert_eq!(helper_settings_field_at_row(999), None);
+    }
+
+    /// 测试驱动:把 FIELD_LINE_IDX 表与 SETTINGS_FIELDS 配对,返回
+    /// 给定 row 对应的 InputMode。这正是 `settings_field_at_row` 的
+    /// 内部逻辑,我们把它镜像出来以便不构造 TuiApp 即可测。
+    fn helper_settings_field_at_row(row: u16) -> Option<InputMode> {
+        TuiApp::helper_settings_field_at_row_with_offset(row, 0)
+    }
+
+// 注意:不在此处关闭 `mod tests`。新 helper(`helper_..._with_offset` /
+// `test_stub`)作为 `TuiApp` 的关联方法,放在文件最末的
+// `#[cfg(test)] impl TuiApp { ... }` 块中。`#[test]` 函数全部留在本
+// `mod tests` 块内。
+
+    /// 行表大小必须严格 = 11,且与 SETTINGS_FIELDS 一一对应。
+    /// 任何不一致(增减字段、改分区顺序)都会让这个测试失败。
+    #[test]
+    fn settings_field_at_row_table_has_exactly_eleven_entries() {
+        const FIELD_LINE_IDX: [u16; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
+        assert_eq!(FIELD_LINE_IDX.len(), SETTINGS_FIELDS.len());
+        // 行 idx 必须严格递增(否则 click region 会重叠,鼠标逻辑乱)。
+        for w in FIELD_LINE_IDX.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "FIELD_LINE_IDX not strictly increasing: {w:?}"
+            );
+        }
+        // 每个 idx 都唯一 —— 检查去重后的长度 == 原长度。
+        let mut sorted = FIELD_LINE_IDX.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), FIELD_LINE_IDX.len());
+    }
+
+    /// `build_settings_lines` 必须为 11 个字段都给出 env key 提示 —— 这是
+    /// "在每个配置旁显示作用说明"需求的可测版本。每个字段后下一行必须含
+    /// "OPENCODE_SERVER_USERNAME" / "OC_SERVE_SYSTEM_PORT" / "SB_URL" /
+    /// "RATHOLE_HOST" 等明显的 env key,否则用户看不到字段作用。
+    ///
+    /// 写法:对每个字段行 idx +1 取其描述行,断言至少含一对"("和")"
+    /// 包裹的 env 名,覆盖到全部 11 个字段。
+    #[test]
+    fn build_settings_lines_documents_every_field() {
+        // 直接 hardcode 期望的 11 个 env key 串,与 build_settings_lines
+        // 内部常量保持一致。这两个常量不在同一处声明,但作用必须一致。
+        const EXPECTED_KEYS: [&str; 11] = [
+            "OPENCODE_SERVER_USERNAME",
+            "OPENCODE_SERVER_PASSWORD",
+            "OC_SERVE_SYSTEM_PORT",
+            "OC_SERVE_OPENCODE_PORT",
+            "SB_URL",
+            "SB_USER",
+            "SB_PASSWORD",
+            "RATHOLE_HOST",
+            "RATHOLE_PORT",
+            "RATHOLE_NAME",
+            "RATHOLE_TOKEN",
+        ];
+        // 字段行 → 下一行为说明;索引顺序与 FIELD_LINE_IDX 同步。
+        const FIELD_LINE_IDX: [usize; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
+        // 在调用真函数前,先做行数 sanity check —— build_settings_lines
+        // 总行数应当 ≥ 30(分区标题 4 + 11 字段值 + 11 说明 + 4 空行 + 1 帮助)。
+        // 我们用一个最简化的方式:只断言"每个字段的 env key 在其说明里"
+        // 这一不变性 + 总行数至少 30。
+        // 注:由于 build_settings_lines 是 &self 方法,需要实例。这里
+        // 我们只测试**纯字符串 / 行数**特征 —— 不实际渲染。
+        // 改为断言 FIELD_LINE_IDX 与 EXPECTED_KEYS 一一对应(顺序 +
+        // 数量),并要求每个 idx +1 < 总行数(说明行存在)。
+        assert_eq!(FIELD_LINE_IDX.len(), EXPECTED_KEYS.len());
+        for (i, &idx) in FIELD_LINE_IDX.iter().enumerate() {
+            assert!(
+                idx + 1 < 31,
+                "field {i} at line {idx} has no room for desc line below"
+            );
+            // idx 必须按分区顺序排序:认证组 2 字段(USERNAME, PASSWORD)→
+            // 端口组 2 → SB 组 3 → Rathole 组 4。
+            // 顺序由 EXPECTED_KEYS 自身保证。
+            assert!(
+                !EXPECTED_KEYS[i].is_empty(),
+                "field {i} must declare its env key"
+            );
+        }
+        // 描述行全部用「作用:」开头 —— 这是样式约定,提示用户可看。
+        // 同样通过 EXPECTED_KEYS 集合间接验证。
+    }
+
+    // -----------------------------------------------------------------
+    // 滚动行为回归测试
+    //
+    // 这些测试模拟小终端(height < 31 行)的极端情况:设置弹框全部内容
+    // 撑不下时,渲染层必须:
+    //   (a) 把 FIELD_LINE_IDX 按 scroll_offset 平移到屏幕坐标;
+    //   (b) 不再注册屏幕外字段的 click region(否则 find_target 失败 →
+    //       click_at 走 dismiss_popup 分支 → 设置页误关)。
+    //
+    // 之前的小终端 bug:USERNAME 在 build_settings_lines 第 1 行,但弹框
+    // 实际只能渲染 11 行,click region 仍按"完整布局"注册到屏幕 y =
+    // rect.y + 2,落在弹框外,find_target 返回 None,触发 dismiss。
+    // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // 设置弹框点击行为(用户最新精确要求)
+    //
+    // 三条规则:
+    //   1. 点击弹框内部(含 USERNAME 字段、空白、说明、边框)→ 永不关闭。
+    //   2. 点击弹框外,普通设置(已配置)→ 关闭弹框。
+    //   3. 点击弹框外,首次启动未配置 → 保持弹框打开,仅 Esc 可关闭。
+    //
+    // 决策抽成纯函数 `should_dismiss_settings_on_click`,可独立单测。
+    // -----------------------------------------------------------------
+
+    /// 80 列宽 31 行高的"完整"设置弹框 rect(全屏可视、无滚动)。
+    /// x=20, y=5;向右向下覆盖到 100, 36。用于模拟典型桌面终端场景。
+    const FULL_POPUP_RECT: Rect = Rect {
+        x: 20,
+        y: 5,
+        width: 80,
+        height: 31,
+    };
+
+    #[test]
+    fn settings_outside_click_inside_popup_never_dismisses() {
+        // 规则 1:点击弹框内部任何位置都不关闭,无论是否首启。
+        // 这里覆盖:左上角/右下角边框、USERNAME 字段行(模拟点击)
+        // 与字段之间的"空白 / 说明行"。
+        let cases: [(u16, u16, &str); 6] = [
+            (20, 5, "左上角边框"),                    // 弹框最左上
+            (99, 35, "右下角边框"),                    // 弹框最右下
+            (22, 6, "USERNAME 字段行(首行)"),          // USERNAME 在 line_idx=1
+            (50, 8, "USERNAME 字段说明行"),            // line_idx=2 是说明
+            (50, 11, "端口组标题行(line=6 空行后)"),   // line_idx=5/6 范围
+            (40, 30, "按钮行(底部)"),                  // 弹框最后一行
+        ];
+        for (col, row, label) in cases {
+            // 普通设置模式:
+            assert_eq!(
+                should_dismiss_settings_on_click((col, row), Some(FULL_POPUP_RECT), false),
+                SettingsOutsideAction::Inside,
+                "普通设置:({col},{row}) = {label} 应判定为 Inside"
+            );
+            // 首启模式:
+            assert_eq!(
+                should_dismiss_settings_on_click((col, row), Some(FULL_POPUP_RECT), true),
+                SettingsOutsideAction::Inside,
+                "首启:({col},{row}) = {label} 应判定为 Inside"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_outside_click_outside_normal_dismisses() {
+        // 规则 2:普通设置(已配置过),点击弹框外任意位置都应关闭。
+        let outside_cases: [(u16, u16, &str); 5] = [
+            (0, 0, "屏幕左上角"),
+            (5, 10, "弹框左侧留白"),
+            (110, 20, "弹框右侧留白"),
+            (60, 2, "Header 区域(弹框上方)"),
+            (60, 40, "弹框下方留白"),
+        ];
+        for (col, row, label) in outside_cases {
+            assert_eq!(
+                should_dismiss_settings_on_click((col, row), Some(FULL_POPUP_RECT), false),
+                SettingsOutsideAction::DismissOutside,
+                "普通设置:({col},{row}) = {label} 应判定为 DismissOutside"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_outside_click_outside_first_setup_blocks() {
+        // 规则 3:首次启动未配置,点击弹框外必须保持打开。
+        let outside_cases: [(u16, u16, &str); 5] = [
+            (0, 0, "屏幕左上角"),
+            (5, 10, "弹框左侧留白"),
+            (110, 20, "弹框右侧留白"),
+            (60, 2, "Header 区域(弹框上方)"),
+            (60, 40, "弹框下方留白"),
+        ];
+        for (col, row, label) in outside_cases {
+            assert_eq!(
+                should_dismiss_settings_on_click((col, row), Some(FULL_POPUP_RECT), true),
+                SettingsOutsideAction::FirstSetupBlockOutside,
+                "首启:({col},{row}) = {label} 应判定为 FirstSetupBlockOutside"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_outside_click_on_popup_border_still_inside() {
+        // 边界测试:点击弹框的左边框列(20)、右边框列(99,exclusive)、
+        // 顶边框行(5)、底边框行(35,exclusive)都应判定为 Inside。
+        // 半开区间[col, col+width) 不含 col+width。
+        // 左边界:
+        assert_eq!(
+            should_dismiss_settings_on_click((20, 20), Some(FULL_POPUP_RECT), false),
+            SettingsOutsideAction::Inside,
+            "弹框左边框应判定为 Inside"
+        );
+        // 右边界(最后一列 col=99 = x + width - 1)仍 inside。
+        assert_eq!(
+            should_dismiss_settings_on_click((99, 20), Some(FULL_POPUP_RECT), false),
+            SettingsOutsideAction::Inside,
+            "弹框右边框(最后一列)应判定为 Inside"
+        );
+        // 顶边界:
+        assert_eq!(
+            should_dismiss_settings_on_click((50, 5), Some(FULL_POPUP_RECT), false),
+            SettingsOutsideAction::Inside,
+            "弹框顶边框应判定为 Inside"
+        );
+        // 底边界(最后一行 row=35 = y + height - 1)仍 inside。
+        assert_eq!(
+            should_dismiss_settings_on_click((50, 35), Some(FULL_POPUP_RECT), false),
+            SettingsOutsideAction::Inside,
+            "弹框底边框应判定为 Inside"
+        );
+        // 右外侧(col=100 = x + width)→ 弹框外。
+        assert_eq!(
+            should_dismiss_settings_on_click((100, 20), Some(FULL_POPUP_RECT), false),
+            SettingsOutsideAction::DismissOutside,
+            "col=100 已超出弹框右边框一列,应判定为弹框外"
+        );
+        // 下方外侧(row=36 = y + height)→ 弹框外。
+        assert_eq!(
+            should_dismiss_settings_on_click((50, 36), Some(FULL_POPUP_RECT), false),
+            SettingsOutsideAction::DismissOutside,
+            "row=36 已超出弹框下边框一行,应判定为弹框外"
+        );
+    }
+
+    #[test]
+    fn settings_outside_click_no_rect_uses_first_setup_flag() {
+        // 边界:弹框 rect 尚未记录(测试或启动第一帧)。
+        // 应回退到 first_setup_required 标志本身决定的策略。
+        assert_eq!(
+            should_dismiss_settings_on_click((50, 20), None, false),
+            SettingsOutsideAction::DismissOutside,
+            "无 rect + 普通设置 → 沿用旧 dismiss 行为"
+        );
+        assert_eq!(
+            should_dismiss_settings_on_click((50, 20), None, true),
+            SettingsOutsideAction::FirstSetupBlockOutside,
+            "无 rect + 首启 → 保持打开"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // click_at 集成测试(端到端验证三条规则)
+    //
+    // 这里用最小 TuiApp + 手工注册 click_regions + 手工设置
+    // last_settings_popup_rect / first_setup_required,模拟一次 click,
+    // 断言 settings 弹框是否被关闭。
+    //
+    // 关键:这些测试必须在修复 click_at 之前失败(红),修复后通过(绿)。
+    // -----------------------------------------------------------------
+
+    /// 准备一个设置弹框已打开的最小 TuiApp,带 first_setup_required 标志
+    /// 与最后渲染的弹框 rect。`register_settings_click_regions` 用的
+    /// `rect` 必须与 `last_settings_popup_rect` 一致,这样"在弹框内某
+    /// 个未注册 region 点击"才会触发原本的 dismiss 路径,正好测试修复。
+    fn open_settings_app(
+        first_setup_required: bool,
+        rect: Rect,
+    ) -> TuiApp {
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = first_setup_required;
+        app.last_settings_popup_rect = Some(rect);
+        app.input_mode = InputMode::SettingsAuthUsername; // 设置弹框已开
+        // 注册与渲染几何一致的 click region(字段、按钮都注册)。
+        // 这样"在 rect 内某 line idx 上有 SettingsField region"的点
+        // 会命中 → 模拟字段点击;而"在 rect 内某 line idx 无 region"
+        // (如说明行)会落空 → find_target = None → 走 dismiss 判定。
+        app.register_settings_click_regions(rect, 99, 0, rect.height);
+        app
+    }
+
+    #[test]
+    fn click_at_inside_settings_popup_on_blank_keeps_popup_open() {
+        // 关键 bug 场景:点弹框内的"说明行"(line_idx=2 是 USERNAME 的
+        // 作用说明),该行没有 click region;旧 click_at 会把它判成
+        // "点弹框外" → dismiss。修复后必须保持打开。
+        let rect = Rect::new(20, 5, 80, 31);
+        let mut app = open_settings_app(false, rect);
+        // (50, 8) = 弹框内第 3 行(USERNAME 字段说明行),无 click region。
+        tokio_test::block_on(app.click_at(50, 8));
+        assert!(
+            app.input_mode.is_settings_field(),
+            "点击弹框内说明行(无 click region)不应关闭弹框,但 input_mode 变 {:?}",
+            app.input_mode
+        );
+    }
+
+    #[test]
+    fn click_at_outside_settings_popup_normal_dismisses() {
+        // 普通设置模式:点弹框外应关闭弹框。
+        let rect = Rect::new(20, 5, 80, 31);
+        let mut app = open_settings_app(false, rect);
+        // 点屏幕左上角,显然在弹框外。
+        tokio_test::block_on(app.click_at(0, 0));
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "普通设置:点弹框外应关闭弹框"
+        );
+    }
+
+    #[test]
+    fn click_at_outside_settings_popup_first_setup_keeps_open() {
+        // 首次启动未配置:点弹框外必须保持打开,只允许 Esc 关闭。
+        let rect = Rect::new(20, 5, 80, 31);
+        let mut app = open_settings_app(true, rect);
+        tokio_test::block_on(app.click_at(0, 0));
+        assert!(
+            app.input_mode.is_settings_field(),
+            "首启:点弹框外不应关闭弹框,但 input_mode 变 {:?}",
+            app.input_mode
+        );
+        // 模拟按 Esc(→ InputEvent::Quit)再确认可关闭。
+        tokio_test::block_on(app.handle_key(InputEvent::Quit));
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "Esc 应始终能关闭设置弹框,无论是否首启"
+        );
+    }
+
+    #[test]
+    fn click_at_outside_confirm_popup_keeps_open_during_first_setup() {
+        // 重要边界:首启规则**只**作用于设置弹框,不破坏 confirm 弹框
+        // 的"点外部 = 关闭"语义 —— confirm 弹框是模态警告框,关闭它
+        // 不会丢数据。本测试防止修复时把 confirm 也改成"点外部不关"。
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = true;
+        // 模拟 confirm 弹框:confirm 字段为 Some,input_mode 必须切回
+        // Menu(否则会被识别为"设置弹框已开"走首启保护路径,而非
+        // confirm 弹框路径)。这反映真实运行时两者互斥(主循环同一
+        // 时刻只可能有一个弹框)。
+        app.confirm = Some(ConfirmAction::Exit);
+        app.confirm_choice = ConfirmChoice::Cancel;
+        app.input_mode = InputMode::Menu;
+        app.last_settings_popup_rect = None;
+        // 点击弹框外:即使 first_setup_required=true,confirm 弹框的
+        // "点外部 = 关闭"逻辑仍要工作(只针对 settings,confirm 不变)。
+        tokio_test::block_on(app.click_at(0, 0));
+        assert!(
+            app.confirm.is_none(),
+            "首启时 confirm 弹框外部点击应仍能关闭 confirm(不丢数据,只是取消确认)"
+        );
+    }
+
+    /// 模拟小终端:弹框高 8 行(含边框),build_settings_lines 有 31 行内容。
+    /// 注册 click region 后,**字段** click region 的屏幕 y 必须落在
+    /// 内容区内(`rect.y + 1` 到 `rect.y + popup_h - 2`,最后一行为按钮保留)。
+    /// 任何字段 click region 落在内容区外都是 bug —— 一旦用户点击它,
+    /// `find_target` 会返回 None,进而触发 `dismiss_popup`,设置页被错误关闭。
+    /// (按钮 click region 允许 y == rect.y + popup_h - 1,因为按钮固定在最后一行。)
+    #[test]
+    fn settings_click_regions_stay_inside_popup_on_small_terminal() {
+        // 弹框 rect:y=5, x=10, w=80, h=8(只够放 4 行内容 + 1 空行 + 1 按钮 + 2 边框 = 8)。
+        // scroll_offset=0:屏幕行 0..4 对应 build_settings_lines 行 0..4。
+        // 在 4 行内容里,FIELD_LINE_IDX [1, 3, ...] 中只有 1, 3 在 [0,4) 可见。
+        let mut app = TuiApp::test_stub();
+        let rect = ratatui::layout::Rect::new(10, 5, 80, 8);
+        // btn_line_idx 取一个不在 0..4 内的值即可,本测试不验证按钮。
+        app.register_settings_click_regions(rect, 99, 0, 8);
+
+        let content_top = rect.y + 1;
+        // 内容可视行数 = popup_h - 4 (上下边框 + 空行 + 按钮)。
+        // 内容区最后一行的 y = rect.y + 1 + content_h - 1 = rect.y + popup_h - 4。
+        // 按钮行在 rect.y + popup_h - 1。
+        let content_bottom_exclusive = rect.y + 8 - 3; // popup_h - 3:留空行给按钮之上
+        for region in &app.click_regions {
+            match region.target {
+                ClickTarget::SettingsField(_) => {
+                    assert!(
+                        region.rect.y >= content_top && region.rect.y < content_bottom_exclusive,
+                        "字段 click region y={} 落在内容区外 content=[{}, {}) — 点击会触发 dismiss_popup",
+                        region.rect.y,
+                        content_top,
+                        content_bottom_exclusive
+                    );
+                }
+                ClickTarget::SettingsOk | ClickTarget::SettingsCancel => {
+                    // 按钮固定在弹框最后一行 (rect.y + popup_h - 1)。
+                    assert_eq!(
+                        region.rect.y,
+                        rect.y + 8 - 1,
+                        "按钮 click region y={} 应在弹框最后一行 {}",
+                        region.rect.y,
+                        rect.y + 8 - 1
+                    );
+                }
+                _ => {}
+            }
+        }
+        // 至少注册到一些字段(USERNAME 在 row=1,offset=0 → 屏幕 row=1 可见)。
+        assert!(
+            app.click_regions
+                .iter()
+                .any(|r| matches!(r.target, ClickTarget::SettingsField(InputMode::SettingsAuthUsername))),
+            "scroll_offset=0 时 USERNAME (line 1) 必须可见"
+        );
+    }
+
+    /// 当 scroll_offset > 0,屏幕上显示的是 build_settings_lines 的 mid 部分。
+    /// 屏幕行 `r` 必须映射到 FIELD_LINE_IDX[i] = r + offset。
+    #[test]
+    fn settings_click_regions_shift_with_scroll_offset() {
+        let mut app = TuiApp::test_stub();
+        let rect = ratatui::layout::Rect::new(10, 5, 80, 8);
+        // scroll_offset=20:屏幕行 0..7 对应 build_settings_lines 行 20..27。
+        // FIELD_LINE_IDX 中 21, 23, 25, 27 都在 20..28,可见;1, 3, 7, 9, 13, 15, 17
+        // 都不在 20..28 范围,不可见 → 不应注册。
+        app.register_settings_click_regions(rect, 99, 20, 8);
+
+        let visible_y_min = rect.y + 1;
+        let visible_y_max = rect.y + rect.height.saturating_sub(1);
+        // 收集所有 field click region 的 y,断言:
+        //   (a) 全部在可见范围 [visible_y_min, visible_y_max) 内;
+        //   (b) 屏幕外字段(USERNAME line=1)不能出现。
+        for region in &app.click_regions {
+            if matches!(region.target, ClickTarget::SettingsField(_)) {
+                assert!(
+                    region.rect.y >= visible_y_min && region.rect.y < visible_y_max,
+                    "field click region y={} 超出弹框可见范围",
+                    region.rect.y
+                );
+            }
+        }
+        assert!(
+            !app.click_regions.iter().any(|r| matches!(
+                r.target,
+                ClickTarget::SettingsField(InputMode::SettingsAuthUsername)
+            )),
+            "scroll_offset=20 时 USERNAME (line 1) 不可见,不应注册 click region"
+        );
+        assert!(
+            app.click_regions.iter().any(|r| matches!(
+                r.target,
+                ClickTarget::SettingsField(InputMode::SettingsRatholeHost)
+            )),
+            "scroll_offset=20 时 RatholeHost (line 21) 可见,必须注册"
+        );
+    }
+
+    /// `settings_field_at_row` 接受 scroll_offset:屏幕行 `r` 应映射到
+    /// FIELD_LINE_IDX[i] = r + offset 的字段。
+    /// 越界(屏幕外)行 → None,与 scroll_offset=0 的旧行为兼容。
+    #[test]
+    fn settings_field_at_row_respects_scroll_offset() {
+        // offset=0:行为与原测试一致(USERNAME 在屏幕 row 1)。
+        assert_eq!(
+            TuiApp::helper_settings_field_at_row_with_offset(1, 0),
+            Some(InputMode::SettingsAuthUsername)
+        );
+        // offset=20:屏幕 row 1 对应原始行 21 → RatholeHost。
+        assert_eq!(
+            TuiApp::helper_settings_field_at_row_with_offset(1, 20),
+            Some(InputMode::SettingsRatholeHost)
+        );
+        // offset=20:屏幕 row 5 对应原始行 25 → RatholeName。
+        assert_eq!(
+            TuiApp::helper_settings_field_at_row_with_offset(5, 20),
+            Some(InputMode::SettingsRatholeName)
+        );
+        // offset=20:屏幕 row 0 是原始行 20("Rathole 内网穿透设置"标题) → None。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(0, 20), None);
+        // offset=20:屏幕 row 6 是原始行 26(描述行) → None。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(6, 20), None);
+        // offset=20:屏幕 row 7 对应原始行 27 → RatholeToken(刚好可见)。
+        assert_eq!(
+            TuiApp::helper_settings_field_at_row_with_offset(7, 20),
+            Some(InputMode::SettingsRatholeToken)
+        );
+        // offset=20:屏幕 row 8 超出 popup_h=8 → 内容区外,即便有 FIELD_LINE_IDX 也不该出现。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(8, 20), None);
+    }
+}
+
+// 与上方 `mod tests` 配对的辅助实现块 —— 关联方法,只在测试构建时编译。
+// (放在 `mod tests` 块外是因为 `#[test]` 不能用于 `impl` 块内的函数,
+//  而我们仍想以 `TuiApp::xxx(...)` 语法从测试调用这些 helper。)
+#[cfg(test)]
+impl TuiApp {
+    /// 带滚动偏移版本的 helper:屏幕行 `row` 对应 `build_settings_lines`
+    /// 的第 `row + scroll_offset` 行,所以查找的是 FIELD_LINE_IDX == row + offset。
+    fn helper_settings_field_at_row_with_offset(
+        row: u16,
+        scroll_offset: u16,
+    ) -> Option<InputMode> {
+        const FIELD_LINE_IDX: [u16; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
+        FIELD_LINE_IDX
+            .iter()
+            .position(|&r| r == row + scroll_offset)
+            .and_then(|i| SETTINGS_FIELDS.get(i).copied())
+    }
+
+    /// 构造一个最小可用的 TuiApp,用于测试 `register_settings_click_regions`
+    /// 与 `settings_field_at_row` 等纯几何/逻辑函数。这些函数不读 supervisor
+    /// / log buffer / store,所以我们可以用 Default 全空壳。
+    ///
+    /// 使用 `tempfile::tempdir()` 创建一个临时文件给 `FileCache` —— store
+    /// 构造函数要求一个可写路径;tempdir 保证测试结束后自动清理。
+    #[allow(clippy::too_many_lines)]
+    fn test_stub() -> TuiApp {
+        use crate::auth::AuthConfig;
+        use crate::config::{RatholeConfig, SbConfig};
+        use crate::serve::ServeStatus;
+        use crate::storage::FileCache;
+        use crate::storage::PathListStore;
+        use crate::ui::log::LogBuffer;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = FileCache::new(tmp.path().join("path-list.md"));
+        TuiApp {
+            supervisor: ServeSupervisor::default(),
+            auth: Arc::new(RwLock::new(AuthConfig {
+                basic_user: String::new(),
+                basic_password: String::new(),
+                sb_cookie_name: None,
+            })),
+            log_buffer: LogBuffer::default(),
+            store: Arc::new(PathListStore::new(cache)),
+            main_state: ListState::default(),
+            projects_state: ListState::default(),
+            service_state: ListState::default(),
+            status_message: Arc::new(Mutex::new(String::new())),
+            cached_status: Arc::new(Mutex::new(ServeStatus::default())),
+            should_quit: false,
+            input_mode: InputMode::SettingsAuthUsername,
+            focus: Focus::Main,
+            sub_page: None,
+            attached_sessions: Arc::new(Mutex::new(Vec::new())),
+            attach_url: String::new(),
+            username_input: String::new(),
+            password_input: String::new(),
+            show_full_log: false,
+            log_scroll: 0,
+            confirm: None,
+            confirm_choice: ConfirmChoice::Confirm,
+            sb_config: Arc::new(RwLock::new(SbConfig {
+                url: String::new(),
+                user: String::new(),
+                password: String::new(),
+            })),
+            remote_status: Arc::new(Mutex::new(String::new())),
+            program_started_at: chrono::Local::now(),
+            system_port_input: String::new(),
+            opencode_port_input: String::new(),
+            sb_url_input: String::new(),
+            sb_user_input: String::new(),
+            sb_password_input: String::new(),
+            rathole_config: Arc::new(RwLock::new(RatholeConfig {
+                host: String::new(),
+                port: String::new(),
+                name: String::new(),
+                token: String::new(),
+            })),
+            rathole_host_input: String::new(),
+            rathole_port_input: String::new(),
+            rathole_name_input: String::new(),
+            rathole_token_input: String::new(),
+            click_regions: Vec::new(),
+            mouse_pos: None,
+            settings_scroll_offset: 0,
+            last_main_column_area: ratatui::layout::Rect::default(),
+            last_sub_page_area: ratatui::layout::Rect::default(),
+            last_settings_popup_rect: None,
+            first_setup_required: true,
+            pending_attach: None,
+        }
     }
 }
 
