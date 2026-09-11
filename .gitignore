@@ -11,3 +11,6 @@
 
 */path-list.md
 */global.toml
+
+# Worktrees (created by using-git-worktrees skill)
+/.worktrees/
