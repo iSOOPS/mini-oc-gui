@@ -244,6 +244,9 @@ fn render_svg_to_pngs(svg_path: &Path) -> anyhow::Result<BTreeMap<u32, Vec<u8>>>
         let scale = size as f32 / 1024.0;
         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
         resvg::render(&tree, transform, &mut pixmap.as_mut());
+        if pixmap.data().iter().all(|&p| p == 0) {
+            return Err(anyhow::anyhow!("resvg render produced empty pixmap for size {size}"));
+        }
         let mut buf: Vec<u8> = Vec::new();
         {
             let cursor = std::io::Cursor::new(&mut buf);
@@ -325,7 +328,7 @@ fn pack_icns(pngs: &BTreeMap<u32, Vec<u8>>, assets_dir: &Path) -> anyhow::Result
 fn generate_icons(manifest_dir: &Path, profile_dir: &Path) -> anyhow::Result<()> {
     let svg_path = icon_src_path(manifest_dir);
     println!("cargo:rerun-if-changed={}", svg_path.display());
-    println!("cargo:rerun-if-changed={}", profile_dir.join("assets").display());
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("assets").display());
 
     if !svg_path.is_file() {
         eprintln!(
