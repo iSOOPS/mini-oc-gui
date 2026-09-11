@@ -23,7 +23,9 @@
 //! `rathole/settings/` 下的文件变化;只在源端变动时执行复制,避免
 //! 每次增量编译都白白 fs copy 大文件。
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 /// 源端 rathole bundle 根目录(<CARGO_MANIFEST_DIR>/rathole)。
@@ -86,6 +88,11 @@ fn main() {
     let src = src_rathole_root(&manifest_dir);
     let dst = dst_rathole_root(&out_dir);
 
+    // profile_dir = target/<profile>/ (OUT_DIR 的祖父级)
+    let profile_dir = dst
+        .parent()
+        .expect("dst should have a parent (target/<profile>/)");
+
     // 触发条件:监听源端 rathole/ 下所有相关文件
     println!("cargo:rerun-if-changed={}", src.join("bin").display());
     println!("cargo:rerun-if-changed={}", src.join("settings").display());
@@ -95,6 +102,15 @@ fn main() {
 
     // 把"产物目录已就绪"信息告知 cargo cache 系统
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+
+    // MOT icon pipeline (SVG -> PNG/ICO/ICNS)
+    if let Err(e) = generate_icons(&manifest_dir, &profile_dir) {
+        eprintln!("cargo:warning=icon pipeline: {e}");
+    }
+
+    // Windows: embed icon.ico into the final .exe
+    #[cfg(windows)]
+    embed_windows_icon(&profile_dir);
 }
 
 /// 把 `src/rathole/` 整个 bundle(只挑当前平台的 binary + 全部 settings)
@@ -182,5 +198,194 @@ fn copy_dir(src: &Path, dst: &Path) {
         } else if ft.is_file() {
             copy_with_mode(&src_child, &dst_child);
         }
+    }
+}
+
+// ============================================================================
+// Icon generation pipeline (MOT)
+// Reads assets/icon.svg and produces:
+//   <profile_dir>/assets/icon.png  (512x512)
+//   <profile_dir>/assets/icon.ico  (Windows multi-res)
+//   <profile_dir>/assets/icon.icns (macOS multi-res)
+// On Windows, also embeds the .ico into the final .exe via winresource.
+// Failures are non-fatal: emit cargo:warning and return Ok so a missing SVG
+// or transient renderer error never breaks the build.
+// ============================================================================
+
+const ICON_SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256, 512, 1024];
+const PROFILE_ICON_PNG: &str = "icon.png";
+const PROFILE_ICON_ICO: &str = "icon.ico";
+const PROFILE_ICON_ICNS: &str = "icon.icns";
+
+fn icon_src_path(manifest_dir: &Path) -> PathBuf {
+    manifest_dir.join("assets").join("icon.svg")
+}
+
+fn icon_assets_dir(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("assets")
+}
+
+/// Render SVG → BTreeMap<size, png_bytes> for all ICON_SIZES.
+fn render_svg_to_pngs(svg_path: &Path) -> anyhow::Result<BTreeMap<u32, Vec<u8>>> {
+    let svg_data = std::fs::read(svg_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", svg_path.display()))?;
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(&svg_data, &opts)
+        .map_err(|e| anyhow::anyhow!("usvg parse: {e}"))?;
+
+    let mut out = BTreeMap::new();
+    for &size in ICON_SIZES {
+        // resvg expects usvg::Size (logical size), then we apply a scale transform.
+        let pixmap_size = resvg::tiny_skia::IntSize::from_wh(size, size)
+            .ok_or_else(|| anyhow::anyhow!("invalid pixmap size {size}"))?;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(pixmap_size.width(), pixmap_size.height())
+            .ok_or_else(|| anyhow::anyhow!("pixmap alloc for {size} failed"))?;
+        // Scale: SVG is 1024 logical units; we want the rendered output at `size` physical px.
+        let scale = size as f32 / 1024.0;
+        let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        if pixmap.data().iter().all(|&p| p == 0) {
+            return Err(anyhow::anyhow!("resvg render produced empty pixmap for size {size}"));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut encoder = png::Encoder::new(cursor, size, size);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header()
+                .map_err(|e| anyhow::anyhow!("png write_header {size}: {e}"))?;
+            writer.write_image_data(pixmap.data())
+                .map_err(|e| anyhow::anyhow!("png write_image {size}: {e}"))?;
+        }
+        out.insert(size, buf);
+    }
+    Ok(out)
+}
+
+/// Write icon.png (512x512) at <profile_dir>/assets/icon.png.
+fn write_icon_png(pngs: &BTreeMap<u32, Vec<u8>>, assets_dir: &Path) -> anyhow::Result<()> {
+    let bytes = pngs.get(&512)
+        .ok_or_else(|| anyhow::anyhow!("missing 512px png"))?;
+    std::fs::write(assets_dir.join(PROFILE_ICON_PNG), bytes)
+        .map_err(|e| anyhow::anyhow!("write icon.png: {e}"))?;
+    Ok(())
+}
+
+/// Pack icon.ico at <profile_dir>/assets/icon.ico with sizes <=256.
+fn pack_ico(pngs: &BTreeMap<u32, Vec<u8>>, assets_dir: &Path) -> anyhow::Result<()> {
+    let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+    // ICO format only supports up to 256x256; pick standard sizes.
+    let sizes_for_ico: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
+    for &size in sizes_for_ico {
+        let bytes = pngs.get(&size)
+            .ok_or_else(|| anyhow::anyhow!("missing {size}px png"))?;
+        let image = ico::IconImage::read_png(bytes.as_slice())
+            .map_err(|e| anyhow::anyhow!("ico::read_png {size}: {e}"))?;
+        dir.add_entry(ico::IconDirEntry::encode(&image)
+            .map_err(|e| anyhow::anyhow!("ico::encode {size}: {e}"))?);
+    }
+    let file = std::fs::File::create(assets_dir.join(PROFILE_ICON_ICO))
+        .map_err(|e| anyhow::anyhow!("create icon.ico: {e}"))?;
+    dir.write(BufWriter::new(file))
+        .map_err(|e| anyhow::anyhow!("ico::write: {e}"))?;
+    Ok(())
+}
+
+/// Pack icon.icns at <profile_dir>/assets/icon.icns.
+fn pack_icns(pngs: &BTreeMap<u32, Vec<u8>>, assets_dir: &Path) -> anyhow::Result<()> {
+    let mut family = icns::IconFamily::new();
+    // Use from_pixel_size_and_density to find the right icns::IconType for each size.
+    // For 1024px (ic10), density=2 since the base type is 512@2x = 1024.
+    let pairs: &[(u32, u32, u32)] = &[
+        // (width, height, density)
+        (16, 16, 1),
+        (32, 32, 1),
+        (64, 64, 1),
+        (128, 128, 1),
+        (256, 256, 1),
+        (512, 512, 1),
+        (1024, 1024, 2), // ic10 = 512@2x
+    ];
+    for &(w, h, d) in pairs {
+        let bytes = pngs.get(&w)
+            .ok_or_else(|| anyhow::anyhow!("missing {w}px png"))?;
+        let icon_type = icns::IconType::from_pixel_size_and_density(w, h, d)
+            .ok_or_else(|| anyhow::anyhow!("no icns type for {w}x{h}@{d}"))?;
+        let image = icns::Image::read_png(std::io::Cursor::new(bytes.as_slice()))
+            .map_err(|e| anyhow::anyhow!("icns Image::read_png {w}x{h}: {e}"))?;
+        family.add_icon_with_type(&image, icon_type)
+            .map_err(|e| anyhow::anyhow!("icns add {w}x{h}: {e}"))?;
+    }
+    let file = std::fs::File::create(assets_dir.join(PROFILE_ICON_ICNS))
+        .map_err(|e| anyhow::anyhow!("create icon.icns: {e}"))?;
+    family.write(BufWriter::new(file))
+        .map_err(|e| anyhow::anyhow!("icns::write: {e}"))?;
+    Ok(())
+}
+
+/// Top-level orchestrator. Errors degrade to cargo:warning, never panic.
+fn generate_icons(manifest_dir: &Path, profile_dir: &Path) -> anyhow::Result<()> {
+    let svg_path = icon_src_path(manifest_dir);
+    println!("cargo:rerun-if-changed={}", svg_path.display());
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("assets").display());
+
+    if !svg_path.is_file() {
+        eprintln!(
+            "cargo:warning=icon svg not found at {}; skipping icon generation",
+            svg_path.display()
+        );
+        return Ok(());
+    }
+
+    let pngs = match render_svg_to_pngs(&svg_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("cargo:warning=icon svg render failed: {e}");
+            return Ok(());
+        }
+    };
+
+    let assets_dir = icon_assets_dir(profile_dir);
+    std::fs::create_dir_all(&assets_dir)
+        .map_err(|e| anyhow::anyhow!("mkdir {}: {e}", assets_dir.display()))?;
+
+    if let Err(e) = write_icon_png(&pngs, &assets_dir) {
+        eprintln!("cargo:warning=write icon.png failed: {e}");
+    }
+    if let Err(e) = pack_ico(&pngs, &assets_dir) {
+        eprintln!("cargo:warning=pack icon.ico failed: {e}");
+    }
+    if let Err(e) = pack_icns(&pngs, &assets_dir) {
+        eprintln!("cargo:warning=pack icon.icns failed: {e}");
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn embed_windows_icon(profile_dir: &Path) {
+    let ico = profile_dir.join("assets").join(PROFILE_ICON_ICO);
+    if !ico.is_file() {
+        eprintln!(
+            "cargo:warning=icon.ico missing at {}; skipping winresource embed",
+            ico.display()
+        );
+        return;
+    }
+    let ico_str = match ico.to_str() {
+        Some(s) => s,
+        None => {
+            eprintln!("cargo:warning=icon.ico path is not valid UTF-8");
+            return;
+        }
+    };
+    let mut res = winresource::WindowsResource::new();
+    if let Err(e) = res.set_icon_path(ico_str) {
+        eprintln!("cargo:warning=winresource set_icon_path failed: {e}");
+        return;
+    }
+    if let Err(e) = res.compile() {
+        eprintln!("cargo:warning=winresource compile failed: {e}");
     }
 }

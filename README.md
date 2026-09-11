@@ -11,6 +11,7 @@ for the HTTP layer and **ratatui** for the terminal UI.
   - ⬆️ Upgrade opencode + oh-my-openagent (bun/npm)
   - 🔐 HTTP Basic auth + Cookie session support
   - 📡 Syncs `path-list.md` with a remote SilverBullet (or any HTTP file store)
+- 🎨 App icon: 3-letter "MOT" mark, deep-navy background with indigo accent ring; auto-baked into Windows PE resources and shipped as macOS `.icns` / Linux `.png`. SVG source in `assets/icon.svg`.
 - **`path-list-actor` (binary)** — CLI for managing the path-list index (`add` / `list` / `remove`)
 
 ## Architecture
@@ -122,6 +123,40 @@ If nothing is found, the program prints a clear error pointing to the expected f
 - **Legacy-path migration**: on first startup after upgrading, the client reads the pre-namespaced `/serv/opencode/path-list.md` once, merges those entries into the new layout (dedup by `path`, union sections, min/max timestamps), and seeds the new path if it is empty. Idempotent within a process lifetime — subsequent calls are no-ops. The legacy file on the server is left in place; operators may remove it manually.
 - **Local cache lives next to the binary**: `path-list.md` is written under `<exe_dir>/data/`, alongside the bundled rathole. Release and debug builds use separate directories; no CWD assumption.
 - **Process cleanup**: spawned children get tracked PIDs; SIGINT/SIGTERM trigger a graceful kill chain.
+
+## Application icon
+
+The MOT mark is generated at build time from [`assets/icon.svg`](assets/icon.svg) into:
+- `target/<profile>/assets/icon.png` — generic 512×512 PNG (Linux desktop, docs)
+- `target/<profile>/assets/icon.ico` — Windows multi-resolution, embedded into `.exe` via `winresource`
+- `target/<profile>/assets/icon.icns` — macOS multi-resolution
+
+### macOS `.app` bundle integration
+
+`cargo build --release` produces a bare Mach-O binary; to make Finder / Dock
+honor the icon, wrap it in a minimal `.app`:
+
+```sh
+cargo build --release
+mkdir -p MiniOC.app/Contents/{MacOS,Resources}
+cp target/release/mini-oc-gui-serve MiniOC.app/Contents/MacOS/
+cp target/release/assets/icon.icns MiniOC.app/Contents/Resources/
+
+cat > MiniOC.app/Contents/Info.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>mini-oc-gui-serve</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+  <key>CFBundleIdentifier</key><string>local.mini-oc-gui-serve</string>
+  <key>CFBundleName</key><string>mini-oc-gui-serve</string>
+</dict>
+</plist>
+EOF
+```
+
+To change the icon, edit `assets/icon.svg` and rebuild — all platform artifacts regenerate from this single source.
 
 ## License
 

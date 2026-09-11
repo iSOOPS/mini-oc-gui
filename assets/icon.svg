@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1024 1024"
+     width="1024" height="1024"
+     shape-rendering="geometricPrecision">
+  <!-- Background: deep navy rounded square -->
+  <rect x="0" y="0" width="1024" height="1024" rx="180" ry="180" fill="#1A1A2E"/>
+
+  <!-- M letter (left) -->
+  <path d="M 140 720
+           L 140 304
+           L 260 304
+           L 360 540
+           L 460 304
+           L 580 304
+           L 580 720
+           L 480 720
+           L 480 460
+           L 400 660
+           L 320 660
+           L 240 460
+           L 240 720 Z"
+        fill="#FFFFFF"/>
+
+  <!-- O letter (center accent ring) -->
+  <circle cx="512" cy="512" r="188"
+          fill="none"
+          stroke="#4F46E5"
+          stroke-width="88"
+          stroke-linecap="round"/>
+
+  <!-- T letter (right) -->
+  <path d="M 624 304
+           L 904 304
+           L 904 404
+           L 814 404
+           L 814 720
+           L 714 720
+           L 714 404
+           L 624 404 Z"
+        fill="#FFFFFF"/>
+</svg>
