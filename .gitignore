@@ -11,3 +11,8 @@
 
 */path-list.md
 */global.toml
+
+# MOT icon build artifacts (regenerated from assets/icon.svg by build.rs)
+assets/icon.png
+assets/icon.ico
+assets/icon.icns
