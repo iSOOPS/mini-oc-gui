@@ -112,6 +112,7 @@ schannel = "=0.1.27"
 [build-dependencies]
 # Build-time icon generation (SVG -> PNG -> ICO/ICNS).
 # These crates are only used in build.rs and do not enter the release binary.
+anyhow = "1"
 usvg = "0.48.1"
 resvg = "0.48.1"
 png = "0.18.1"
