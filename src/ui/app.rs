@@ -1877,7 +1877,13 @@ impl TuiApp {
         let _ = std::fs::remove_file(&removed.pid_file);
         // 新窗口模式：顺带清理 launcher 脚本（与 pid_file 同 basename，
         // 内容只有 $env: 引用，无敏感信息；留着无害但及时清理更干净）。
-        let launcher = std::path::Path::new(&removed.pid_file).with_extension("launcher.ps1");
+        // 扩展名按平台分支：Windows 是 .launcher.ps1，macOS 是 .launcher.sh。
+        let launcher_ext: &str = if cfg!(target_os = "macos") {
+            "launcher.sh"
+        } else {
+            "launcher.ps1"
+        };
+        let launcher = std::path::Path::new(&removed.pid_file).with_extension(launcher_ext);
         let _ = std::fs::remove_file(launcher);
         *self.status_message.lock().unwrap() = msg;
     }
@@ -2351,7 +2357,10 @@ impl TuiApp {
             user: auth.basic_user,
             password: auth.basic_password,
             pid_file: base.with_extension("pid").to_string_lossy().into_owned(),
-            launcher_script: base.with_extension("launcher.ps1").to_string_lossy().into_owned(),
+            launcher_script: base
+                .with_extension(if cfg!(target_os = "macos") { "launcher.sh" } else { "launcher.ps1" })
+                .to_string_lossy()
+                .into_owned(),
         };
         // spawn_blocking：内部含同步文件写入 + CreateProcess；即便未来
         // 再出现同步慢调用（杀软扫描等），也只挂住 blocking 线程池，
@@ -2652,7 +2661,7 @@ impl TuiApp {
     fn item_card(item: MenuItem, status: &ServeStatus) -> Vec<Line<'static>> {
         let title_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
         let desc_style = Style::default().fg(Color::DarkGray);
-        let status_style = Style::default().fg(Color::Yellow);
+        let status_style = Style::default().fg(Color::White);
         let title = Self::item_title(item, status);
         match item {
             MenuItem::OcServe => vec![
@@ -2782,7 +2791,7 @@ impl TuiApp {
         };
 
         // Header
-        let header_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
+        let header_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green));
         let header_inner = header_block.inner(chunks[0]);
         frame.render_widget(header_block, chunks[0]);
         let header_cols = Layout::default()
@@ -2792,7 +2801,7 @@ impl TuiApp {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 " opencode TUI 启动器 (Rust + Axum + ratatui) ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )])),
             header_cols[0],
         );
@@ -2804,10 +2813,10 @@ impl TuiApp {
         let settings_style = if settings_hovered {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled("设置 [s]", settings_style)])),
@@ -2874,8 +2883,8 @@ impl TuiApp {
         let top_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Min(5),       // 服务与系统 — 至少 5 行
-                Constraint::Percentage(45),
+                Constraint::Percentage(30), // 服务与系统
+                Constraint::Percentage(60), // OC 项目
             ])
             .split(left[0]);
 
@@ -2958,7 +2967,7 @@ impl TuiApp {
             )),
             Line::from(Span::styled(
                 rathole_state,
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::White),
             )),
             Line::from(Span::styled(
                 if remote.is_empty() {
@@ -2966,7 +2975,7 @@ impl TuiApp {
                 } else {
                     remote
                 },
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::White),
             )),
         ];
         let status_para = Paragraph::new(status_text)
@@ -3020,7 +3029,7 @@ impl TuiApp {
         let cancel_hovered = self.mouse_pos_in_settings_btn(&rect, 0, SettingsBtnKind::Cancel);
         let open_hovered = self.mouse_pos_in_settings_btn(&rect, 0, SettingsBtnKind::OpenConfigDir);
         let selected_style = Style::default()
-            .bg(Color::Cyan)
+            .bg(Color::Green)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
         let idle_style = Style::default().fg(Color::DarkGray);
@@ -3032,7 +3041,7 @@ impl TuiApp {
         let block = Block::default()
             .title("设置")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(Color::Green));
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
 
@@ -3207,7 +3216,7 @@ impl TuiApp {
     /// - 30: 帮助行
     fn build_settings_lines(&self) -> Vec<Line<'static>> {
         let active = Style::default()
-            .bg(Color::Cyan)
+            .bg(Color::Green)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
         let inactive = Style::default();
@@ -3218,7 +3227,7 @@ impl TuiApp {
                 inactive
             }
         };
-        let title_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let title_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
         let help_style = Style::default().fg(Color::DarkGray);
         // 字段说明(在字段下一行)用浅灰,提示但不抢焦点高亮。
         let desc_style = Style::default().fg(Color::DarkGray);
@@ -3426,7 +3435,7 @@ impl TuiApp {
             Some(ConfirmAction::ExitService(_)) => (
                 vec!["确认杀死/关闭该服务？".to_string()],
                 44,
-                5,
+                6,
             ),
             Some(ConfirmAction::EnterProjectsWithoutServe) => (
                 vec![
@@ -3434,17 +3443,17 @@ impl TuiApp {
                     "直接启动项目将无法支持远程服务，仍要继续吗？".to_string(),
                 ],
                 68,
-                7,
+                8,
             ),
             Some(ConfirmAction::Exit) => (
                 vec!["确认退出程序?".to_string()],
                 36,
-                5,
+                6,
             ),
             Some(ConfirmAction::Upgrade) => (
                 vec!["确认升级 OpenCode + omo?".to_string()],
                 44,
-                5,
+                6,
             ),
             // 展示 session id 前 12 位避免太长导致弹框过宽；其余信息用
             // 「...」后缀 + 项目路径已能让用户分辨是要删哪个。
@@ -3459,7 +3468,7 @@ impl TuiApp {
                         "（项目记录保留）".to_string(),
                     ],
                     72,
-                    9,
+                    10,
                 )
             }
             Some(ConfirmAction::KillPortAndLaunch(port)) => (
@@ -3469,7 +3478,7 @@ impl TuiApp {
                     "（高风险：会强制终止占用该端口的进程）".to_string(),
                 ],
                 72,
-                7,
+                8,
             ),
             None => return,
         };
@@ -3483,7 +3492,7 @@ impl TuiApp {
         let block = Block::default()
             .borders(Borders::ALL)
             .title("确认")
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(Style::default().fg(Color::Green));
 
         let btn_y = rect.y + 2 + msg_lines.len() as u16;
         let confirm_rect = Rect::new(rect.x + 1, btn_y, 11, 1);
@@ -3502,7 +3511,7 @@ impl TuiApp {
         let confirm_selected = self.confirm_choice == ConfirmChoice::Confirm;
         let cancel_selected = self.confirm_choice == ConfirmChoice::Cancel;
         let selected_style = Style::default()
-            .bg(Color::Cyan)
+            .bg(Color::Green)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
         let confirm_btn = Span::styled(
@@ -3516,7 +3525,17 @@ impl TuiApp {
 
         let mut lines: Vec<Line<'_>> = msg_lines_ref.into_iter().map(Line::from).collect();
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![confirm_btn, Span::raw("   "), cancel_btn]));
+        lines.push(Line::from(vec![
+            confirm_btn,
+            Span::raw("  "),
+            Span::styled("←/→", Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            cancel_btn,
+        ]));
+        lines.push(Line::from(Span::styled(
+            "Enter 确认 · Esc/q 取消",
+            Style::default().fg(Color::DarkGray),
+        )));
         let para = Paragraph::new(lines).block(block);
         frame.render_widget(Clear, rect);
         frame.render_widget(para, rect);
@@ -3644,7 +3663,7 @@ impl TuiApp {
             let title_para = Paragraph::new(Line::from(Span::styled(
                 title_full,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )));
             frame.render_widget(title_para, Rect::new(area.x, y, area.width, 1));
@@ -3663,7 +3682,7 @@ impl TuiApp {
                 let style = if selected {
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .bg(Color::Green)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
@@ -3700,7 +3719,7 @@ impl TuiApp {
             regions.push(ClickRegion { rect: card_area, target });
             let selected = focused && state.selected() == Some(item_idx);
             let border_style = if selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -3780,7 +3799,7 @@ impl TuiApp {
             regions.push(ClickRegion { rect: card_area, target: ClickTarget::ServicePanel(i) });
             let selected = focused && state.selected() == Some(i);
             let border_style = if selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -3888,14 +3907,14 @@ impl TuiApp {
                 let mut lines: Vec<Line<'_>> = vec![
                     Line::from(vec![Span::styled(
                         "请输入项目路径（留空使用默认目录）",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                     )]),
                     Line::from(""),
                     Line::from(vec![
                         Span::raw("  路径: "),
                         Span::styled(
                             input.clone(),
-                            Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD),
+                            Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD),
                         ),
                     ]),
                     Line::from(""),
@@ -3915,7 +3934,7 @@ impl TuiApp {
                     Block::default()
                         .title(crumb)
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(Color::Green)),
                 );
                 frame.render_widget(form, area);
             }
@@ -3935,7 +3954,7 @@ impl TuiApp {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 title,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )),
             title_area,
         );
@@ -3959,14 +3978,14 @@ impl TuiApp {
             regions.push(ClickRegion { rect: card_area, target: ClickTarget::SubPage(idx) });
             let is_selected = state.selected() == Some(idx);
             let border_style = if is_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .padding(Padding::horizontal(1));
+                .padding(Padding::uniform(5));
             let para = Paragraph::new(cards[idx].clone()).block(block);
             frame.render_widget(para, card_area);
             y += card_h;
@@ -4000,7 +4019,7 @@ impl TuiApp {
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(desc, Style::default().fg(Color::DarkGray))),
-            Line::from(Span::styled(status, Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled(status, Style::default().fg(Color::White))),
         ]
     }
 
@@ -4016,7 +4035,7 @@ impl TuiApp {
             )),
             Line::from(Span::styled(
                 "Enter 新窗口 · T 本窗口",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::White),
             )),
         ]
     }
@@ -4031,7 +4050,7 @@ impl TuiApp {
             Line::from(Span::styled(title, Style::default().fg(Color::DarkGray))),
             Line::from(Span::styled(
                 "Enter 新窗口 attach · T 本窗口接管 · D 删除",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::White),
             )),
         ]
     }
@@ -4071,7 +4090,7 @@ impl TuiApp {
                     && r >= area.y && r < area.y + area.height
             );
         let border_style = if hovered {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -4097,7 +4116,7 @@ impl TuiApp {
             .split(area);
         let hint = Paragraph::new(Span::styled(
             "日志（全屏）  Esc / q / l 退出    ↑/↓ 滚动",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(hint, chunks[0]);
 

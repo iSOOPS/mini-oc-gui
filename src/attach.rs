@@ -116,6 +116,7 @@ pub async fn choose_folder() -> Result<String, String> {
 /// # 返回
 /// `(binary_name, version_label)`：如 `("pwsh.exe", "PowerShell 7+")` 或
 /// `("powershell.exe", "Windows PowerShell 5.1")`。
+#[cfg(target_os = "windows")]
 fn resolve_powershell_bin() -> (&'static str, &'static str) {
     // 1) 显式环境变量优先 —— 用户说了算。
     if let Ok(custom) = std::env::var("OC_POWERSHELL_BIN") {
@@ -146,13 +147,13 @@ fn resolve_powershell_bin() -> (&'static str, &'static str) {
 /// 通过 `where` (Windows) / `which` (Unix) 检查可执行文件是否在 PATH 中。
 /// 注意：仅用于探测存在性，不会修改全局 PATH。出错时返回 Err，让调用方
 /// 走默认分支（pwsh 优先）。
+#[cfg(target_os = "windows")]
 fn which_powershell(name: &str) -> Result<std::path::PathBuf, ()> {
-    #[cfg(target_os = "windows")]
-    let mut probe = std::process::Command::new("where");
-    #[cfg(not(target_os = "windows"))]
-    let mut probe = std::process::Command::new("which");
-
-    let output = probe.arg(name).output().ok().filter(|o| o.status.success());
+    let output = std::process::Command::new("where")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
     match output {
         Some(o) => {
             let path = String::from_utf8_lossy(&o.stdout)
@@ -648,8 +649,121 @@ pub fn spawn_attach_new_window(spec: &AttachWindowSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// 非 Windows 平台：新窗口模式暂未实现，提示回退同窗口模式。
-#[cfg(not(target_os = "windows"))]
+/// 非 Windows 平台：见各 `#[cfg]` 分支的真正实现（macOS 弹 iTerm2/Terminal.app）。
+#[cfg(target_os = "macos")]
+pub fn spawn_attach_new_window(spec: &AttachWindowSpec) -> Result<(), String> {
+    // 路径预解析：把错误在 Rust 侧先暴露，比依赖 osascript 的 stderr 清晰。
+    let bin = crate::upgrade::resolve_command("opencode")
+        .or_else(|_| {
+            std::env::var("OPENCODE_BIN")
+                .map(std::path::PathBuf::from)
+                .map_err(|_| "未找到 opencode（PATH 查找 + OPENCODE_BIN 都失败）。可设置 OPENCODE_BIN 指向可执行文件".to_string())
+        })?;
+
+    std::fs::write(&spec.launcher_script, launcher_sh_body())
+        .map_err(|e| format!("写入 launcher 脚本失败（{}）：{e}", spec.launcher_script))?;
+
+    // 环境变量透传：do script / create window 的命令是 Terminal/iTerm2 App
+    // 的子进程，**不继承** osascript 的环境，必须用 `env K=V ...` 前缀。
+    // AppleScript 命令串里子串用 `'$value'` 包裹，所以只需要转义单引号。
+    let cmd = format!(
+        "env OC_ATTACH_BIN='{bin}' OC_ATTACH_URL='{url}' OC_ATTACH_DIR='{dir}' \
+OC_ATTACH_SESSION='{session}' OC_ATTACH_USER='{user}' OC_ATTACH_PASS='{pass}' \
+OC_ATTACH_PIDFILE='{pid_file}' \
+/bin/bash '{launcher}'",
+        bin = shell_escape_for_osascript(&bin.to_string_lossy()),
+        url = shell_escape_for_osascript(&spec.url),
+        dir = shell_escape_for_osascript(&spec.directory),
+        session = shell_escape_for_osascript(&spec.session),
+        user = shell_escape_for_osascript(&spec.user),
+        pass = shell_escape_for_osascript(&spec.password),
+        pid_file = shell_escape_for_osascript(&spec.pid_file),
+        launcher = shell_escape_for_osascript(&spec.launcher_script),
+    );
+
+    let script = format!(
+        r#"-- System Events 探测 iTerm2 是否在运行（不会意外拉起未运行/未安装的 app）
+tell application "System Events" to set useIterm to exists process "iTerm2"
+set cmd to "{cmd}"
+if useIterm then
+	-- iTerm2 路径：复用当前窗口开新 tab，把命令当文本写到 session（相当于用户手敲回车）。
+	-- 用 create window with default profile command 会触发 iTerm2 的
+	-- "A session ended very soon after starting. Check that the command in
+	-- profile \"Default\" is correct." 告警 —— 那是 iTerm2 把窗口绑给那条
+	-- 命令跑、命令退出就报；write text 走 shell 的子进程路径，无告警。
+	tell application "iTerm2"
+		activate
+		set newTab to (create tab with default profile in current window)
+		tell current session of newTab
+			write text cmd
+		end tell
+	end tell
+else
+	-- Terminal.app 路径：开新窗口跑命令（Terminal 没有稳定的"新 tab in
+	-- 当前窗口" AppleScript API；iTerm2 未运行时只能开新窗口）。
+	tell application "Terminal"
+		activate
+		do script cmd
+	end tell
+end if"#
+    );
+
+    // AppleScript 立即返回，osascript 进程几毫秒内退出 —— 不阻塞 TUI 事件循环。
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("启动 osascript 失败：{e}"))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("osascript 退出码 {:?}", out.status.code())
+        };
+        // 首次运行会触发 macOS TCC 授权弹窗；用户拒绝时这里会拿到 not authorized。
+        return Err(format!("新窗口启动失败（osascript）：{detail}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launcher_sh_body() -> &'static str {
+    r#"#!/bin/bash
+set -u
+
+echo $$ > "$OC_ATTACH_PIDFILE"
+echo "== oc attach ${OC_ATTACH_SESSION} =="
+echo "dir: ${OC_ATTACH_DIR}"
+echo "url: ${OC_ATTACH_URL}"
+echo
+
+# exec 替换进程：bash PID 不变 → pidfile 即 opencode PID，kill -9 等效"杀整树"。
+exec "$OC_ATTACH_BIN" \
+    attach "$OC_ATTACH_URL" \
+    --dir "$OC_ATTACH_DIR" \
+    --session "$OC_ATTACH_SESSION" \
+    -u "$OC_ATTACH_USER" \
+    -p "$OC_ATTACH_PASS"
+"#
+}
+
+/// Shell 单引号字符串里转义单引号：`'` → `'\''`。
+#[cfg(target_os = "macos")]
+fn shell_escape_for_osascript(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
+/// 非 Windows / 非 macOS：暂不实现，回退同窗口模式。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn spawn_attach_new_window(_spec: &AttachWindowSpec) -> Result<(), String> {
-    Err("新窗口模式当前仅支持 Windows，请用 Enter（同窗口 attach）".to_string())
+    Err("新窗口模式当前仅支持 Windows / macOS，请用 Enter（同窗口 attach）".to_string())
 }
