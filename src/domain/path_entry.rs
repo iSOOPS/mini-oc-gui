@@ -8,6 +8,7 @@ use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use super::session::Session;
 use crate::error::AppError;
 
 /// A single indexed path entry.
@@ -19,9 +20,10 @@ pub struct PathEntry {
     /// The normalized absolute path.
     pub path: String,
 
-    /// Session ids (or `seq_<hex>` placeholders) attached to this path.
+    /// Session metadata attached to this path. Each element is a full
+    /// [`Session`] descriptor (id, title, directory, createdAt, updatedAt).
     #[serde(default)]
-    pub sections: Vec<String>,
+    pub sections: Vec<Session>,
 
     /// ISO-8601 creation timestamp with timezone offset (immutable).
     #[serde(
@@ -317,5 +319,35 @@ mod tests {
             let expected = home.join("projects").join("demo").clean();
             assert_eq!(PathBuf::from(&got), expected);
         }
+    }
+
+    #[test]
+    fn path_entry_with_sessions_roundtrip() {
+        use chrono::TimeZone;
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let dt = off.with_ymd_and_hms(2026, 9, 13, 10, 0, 0).unwrap();
+        let entry = PathEntry {
+            path: "/proj".into(),
+            sections: vec![
+                Session::new("ses_a", "first", "/proj", dt),
+                Session::new("ses_b", "second", "/proj", dt),
+            ],
+            created_at: Some(dt),
+            last_opened_at: Some(dt),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: PathEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.sections.len(), 2);
+        assert_eq!(back.sections[0].id, "ses_a");
+        assert_eq!(back.sections[1].title, "second");
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn path_entry_with_empty_sections_omits_field_on_serialize() {
+        let entry = PathEntry::new("/proj");
+        let json = serde_json::to_string(&entry).expect("serialize");
+        // 空 sections 应被 serde(default) 省略或渲染为 []
+        assert!(json.contains("\"sections\":[]") || !json.contains("sections"));
     }
 }

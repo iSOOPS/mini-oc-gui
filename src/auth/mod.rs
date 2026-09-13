@@ -1,4 +1,12 @@
 //! Authentication: HTTP Basic + Cookie session.
+//!
+//! 认证流（v2）：
+//! 1. 用户在首次配置表单登录，服务端调用远端 `/api/user/info`；
+//! 2. 从返回的用户信息（`id`, `name`）映射出 `basic_user` / `basic_password`
+//!    ——`opencode serve` 的 HTTP Basic 认证依赖它们；
+//! 3. 同时拿到 sb config（`sb.base_url` 等），Cookie session 的 cookie name
+//!    由 [`crate::storage::remote::RemoteClient`] 根据 URL 动态派生，
+//!    不再依赖静态的 `SB_COOKIE_NAME` 环境变量。
 
 pub mod basic;
 pub mod session;
@@ -12,15 +20,17 @@ use crate::error::AppError;
 /// Loaded from environment variables via [`AuthConfig::from_env`]. Inserted
 /// into request extensions by an auth layer so that extractors in
 /// [`basic::BasicAuth`] and [`session::SessionAuth`] can read it.
+///
+/// `basic_user` / `basic_password` 在首次登录成功后从 `/api/user/info`
+/// 返回的用户信息（`id`, `name`）映射而来。Cookie session 的 cookie name
+/// 不在此持有——由 [`crate::storage::remote::RemoteClient`] 根据 sb
+/// `base_url` 动态派生。
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// HTTP Basic auth username.
     pub basic_user: String,
     /// HTTP Basic auth password.
     pub basic_password: String,
-    /// Cookie name to look for when validating session auth
-    /// (e.g. `auth_md_isoops_com`). `None` disables cookie session auth.
-    pub sb_cookie_name: Option<String>,
 }
 
 impl AuthConfig {
@@ -33,12 +43,11 @@ impl AuthConfig {
     /// 2. `${auth_env}` file (defaults to `OC_SERVE_AUTH_ENV` env var or
     ///    `./.oc-serve-auth.env` next to the binary).
     ///
-    /// `OPENCODE_SERVER_USERNAME` defaults to `opencode`.
-    /// `SB_COOKIE_NAME` is optional.
+    /// `OPENCODE_SERVER_USERNAME` 缺省时留空，由首次配置表单引导填写。
     ///
     /// # Errors
-    /// Returns [`AppError::Internal`] if no password can be resolved from
-    /// either source.
+    /// Returns [`AppError::Internal`] if the auth-env file exists but
+    /// cannot be read.
     pub fn from_env() -> Result<Self, AppError> {
         let auth_env_path = std::env::var("OC_SERVE_AUTH_ENV")
             .ok()
@@ -49,16 +58,18 @@ impl AuthConfig {
     }
 
     /// Like [`Self::from_env`] but with an explicit auth-env file path.
+    ///
+    /// 只读取 `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`。
+    /// `SB_COOKIE_NAME` 已不再读取——cookie name 由
+    /// [`crate::storage::remote::RemoteClient`] 根据 sb.base_url 动态派生，
+    /// env 文件中遗留的 `SB_COOKIE_NAME=...` 行会被安全忽略。
     pub fn from_env_with_file(auth_env: &Path) -> Result<Self, AppError> {
         // Layer 1: process environment wins.
         let mut user = std::env::var("OPENCODE_SERVER_USERNAME").ok();
         let mut password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
-        let mut cookie_name = std::env::var("SB_COOKIE_NAME").ok();
 
         // Layer 2: fall back to `.oc-serve-auth.env` for any missing value.
-        if (user.is_none() || password.is_none() || cookie_name.is_none())
-            && auth_env.is_file()
-        {
+        if (user.is_none() || password.is_none()) && auth_env.is_file() {
             let contents = std::fs::read_to_string(auth_env).map_err(|e| {
                 AppError::Internal(format!(
                     "OPENCODE_SERVER_PASSWORD not set; could not read {}: {e}",
@@ -74,16 +85,13 @@ impl AuthConfig {
                     let k = k.trim();
                     let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
                     match k {
-                        "OPENCODE_SERVER_USERNAME" if user.is_none() => user = Some(v.to_string()),
+                        "OPENCODE_SERVER_USERNAME" if user.is_none() => {
+                            user = Some(v.to_string())
+                        }
                         "OPENCODE_SERVER_PASSWORD" if password.is_none() => {
                             password = Some(v.to_string())
                         }
-                        "SB_COOKIE_NAME" if cookie_name.is_none() => {
-                            cookie_name = Some(v.to_string())
-                        }
-                        "OPENCODE_SERVER_USERNAME"
-                        | "OPENCODE_SERVER_PASSWORD"
-                        | "SB_COOKIE_NAME" => {}
+                        "OPENCODE_SERVER_USERNAME" | "OPENCODE_SERVER_PASSWORD" => {}
                         _ => {}
                     }
                 }
@@ -97,7 +105,6 @@ impl AuthConfig {
         Ok(Self {
             basic_user,
             basic_password,
-            sb_cookie_name: cookie_name,
         })
     }
 
@@ -109,15 +116,15 @@ impl AuthConfig {
 
     /// 将凭据写入 auth-env 文件（Unix 下 chmod 600）。
     ///
-    /// **已废弃**:设置面板现在通过 [`crate::config::write_persisted_env`]
-    /// 一次性写入所有 key。保留此函数仅为向后兼容,**新代码不要使用**
-    /// ——它只写 USERNAME/PASSWORD 两行,会把文件里已有的 SB / rathole /
-    /// port 等配置抹掉。
+    /// **已废弃**:设置面板现在通过 [`crate::account`] 的 env kv 工具
+    /// （`upsert_env_keys`）增量写入对应 key,文件里已有的账户 / rathole /
+    /// port 等配置原样保留。保留此函数仅为向后兼容,**新代码不要使用**
+    /// ——它只写 USERNAME/PASSWORD 两行,整文件覆盖会抹掉其他 section。
     ///
     /// # Errors
     /// 返回 [`AppError::Io`] 当文件写入失败。
     #[deprecated(
-        note = "改用 crate::config::write_persisted_env 统一写入,保留其他 section"
+        note = "改用 crate::account::upsert_env_keys 增量写入,保留其他 section"
     )]
     pub fn write_env_file(
         &self,

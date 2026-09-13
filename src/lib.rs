@@ -2,6 +2,7 @@
 //! workflow using **Axum 0.7** (HTTP) and **ratatui** (TUI).
 //!
 //! Module map:
+//! - [`account`]  — Account login config + remote user info types.
 //! - [`auth`]      — HTTP Basic + Cookie session auth.
 //! - [`domain`]    — `Project`, `Session`, `PathEntry`, path validation.
 //! - [`error`]     — Unified [`AppError`] with `IntoResponse` mapping.
@@ -13,6 +14,7 @@
 
 #![warn(rust_2018_idioms)]
 
+pub mod account;
 pub mod auth;
 pub mod attach;
 pub mod config;

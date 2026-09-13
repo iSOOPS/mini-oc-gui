@@ -75,7 +75,7 @@ fn print_table(entries: &[PathEntry]) {
                 .sections
                 .iter()
                 .take(3)
-                .cloned()
+                .map(|s| s.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             let first3 = if first3.is_empty() {

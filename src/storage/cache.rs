@@ -67,11 +67,18 @@ impl FileCache {
             .await
             .map_err(|e| {
                 AppError::Internal(format!(
-                    "path-list.md corrupt ({parse_err}) and .bak unreadable: {e}"
+                    "path-list.md has unsupported format ({parse_err}); \
+                     this may be a legacy version where sections were string ids. \
+                     Delete path-list.md and path-list.md.bak to start fresh, \
+                     or restore from a backup. .bak read error: {e}"
                 ))
             })?;
         serde_json::from_str::<Vec<PathEntry>>(&bak_text).map_err(|e| {
-            AppError::Internal(format!("path-list.md and .bak both corrupt: {e}"))
+            AppError::Internal(format!(
+                "path-list.md has unsupported format (parse error: {e}); \
+                 this may be a legacy version where sections were string ids. \
+                 Delete path-list.md and path-list.md.bak to start fresh."
+            ))
         })
     }
 
@@ -243,5 +250,30 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe available in test");
         let expected = exe.parent().unwrap().join("data").join("path-list.md");
         assert_eq!(p, expected);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_legacy_sections_format() {
+        use std::io::Write;
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("path-list.md");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            // 旧格式：sections 是字符串数组
+            writeln!(
+                f,
+                r#"[{{"path":"/a","sections":["ses_old1","ses_old2"],"createdAt":"2026-09-13T10:00:00+0800","lastOpenedAt":"2026-09-13T10:00:00+0800"}}]"#
+            )
+            .expect("write");
+        }
+        let cache = FileCache::new(&path);
+        let result = cache.read().await;
+        assert!(result.is_err(), "旧格式 sections 应当被拒绝");
+        let err = result.err().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy") || msg.contains("sections"),
+            "错误消息应提示 legacy sections 格式: {msg}"
+        );
     }
 }

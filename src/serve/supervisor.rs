@@ -159,6 +159,13 @@ impl ServeSupervisor {
     /// Returns [`AppError::Conflict`] if the port is busy or
     /// [`AppError::Io`] if the binary cannot be spawned.
     pub async fn launch_opencode(&self, port: u16) -> Result<u32, AppError> {
+        // mutex guard: rathole 在跑时拒绝启动单体（云服务依赖单体,
+        // 反向启单体无意义,且会破坏既有 rathole 监听）
+        if self.status.lock().await.rathole_pid.is_some() {
+            return Err(AppError::Conflict(
+                "云服务正在运行,请先停止云服务后再启动单体".to_string(),
+            ));
+        }
         Self::check_port(port).await?;
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
@@ -189,6 +196,12 @@ impl ServeSupervisor {
     /// Returns [`AppError::BadRequest`] if either path is missing,
     /// or [`AppError::Io`] on spawn failure.
     pub async fn launch_rathole(&self, bin: &str, config: &str) -> Result<u32, AppError> {
+        // mutex guard: 已在跑时直接 Conflict,避免重复启
+        if self.status.lock().await.rathole_pid.is_some() {
+            return Err(AppError::Conflict(
+                "rathole 隧道已在运行".to_string(),
+            ));
+        }
         if !std::path::Path::new(bin).exists() {
             return Err(AppError::BadRequest(format!("rathole binary not found: {bin}")));
         }
@@ -210,6 +223,44 @@ impl ServeSupervisor {
         let mut status = self.status.lock().await;
         status.rathole_pid = Some(pid);
         Ok(pid)
+    }
+
+    /// Launch the "cloud service" combo: ensure single opencode is up, then stack rathole.
+    ///
+    /// - rathole already running -> Conflict (combo already live)
+    /// - single not running -> launch single first; if that fails, the whole combo fails
+    /// - single already running -> skip single launch, just add rathole
+    ///
+    /// Returns `(opencode_pid, rathole_pid)`.
+    pub async fn launch_cloud_service(
+        &self,
+        port: u16,
+        bin: &str,
+        config: &str,
+    ) -> Result<(u32, u32), AppError> {
+        // 先决条件:云服务已启则拒绝（与 mutex 表保持一致）
+        if self.status.lock().await.rathole_pid.is_some() {
+            return Err(AppError::Conflict(
+                "云服务正在运行,请先停止".to_string(),
+            ));
+        }
+        // 单体若未启,先启单体;失败则整体失败
+        let oc_pid = if self.status.lock().await.opencode_pid.is_some() {
+            self.status.lock().await.opencode_pid.unwrap()
+        } else {
+            self.launch_opencode(port).await.map_err(|e| {
+                AppError::Conflict(format!(
+                    "云服务启动失败:单体 OpenCode 未启动:{e}"
+                ))
+            })?
+        };
+        // 叠加 rathole;失败不回滚单体(单体已可用)
+        let rt_pid = self.launch_rathole(bin, config).await.map_err(|e| {
+            AppError::Conflict(format!(
+                "云服务启动失败:单体已启(PID={oc_pid}),但 rathole 启动失败:{e}"
+            ))
+        })?;
+        Ok((oc_pid, rt_pid))
     }
 
     /// Get a snapshot of the current supervisor status.
@@ -547,6 +598,89 @@ async fn kill_pid_force(port: u16, pid: u32) -> Result<(), AppError> {
             Err(AppError::Internal(format!(
                 "kill -9 PID {pid} 失败：{detail}"
             )))
+        }
+    }
+}
+
+#[cfg(test)]
+impl ServeSupervisor {
+    /// Test helper: read the current status snapshot without spawning.
+    pub async fn status_for_test(&self) -> ServeStatus {
+        self.status.lock().await.clone()
+    }
+
+    /// Test helper: overwrite the status snapshot (e.g. simulate running children).
+    pub async fn set_status_for_test(&self, s: ServeStatus) {
+        *self.status.lock().await = s;
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn launch_opencode_rejects_when_rathole_already_running() {
+        let sup = ServeSupervisor::new();
+        let mut s = sup.status_for_test().await;
+        s.rathole_pid = Some(9999);
+        sup.set_status_for_test(s).await;
+
+        let result = sup.launch_opencode(9464).await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn launch_rathole_rejects_when_already_running() {
+        let sup = ServeSupervisor::new();
+        let mut s = sup.status_for_test().await;
+        s.rathole_pid = Some(8888);
+        sup.set_status_for_test(s).await;
+
+        let result = sup.launch_rathole("nonexistent-bin", "nonexistent.toml").await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn launch_cloud_service_rejects_when_rathole_already_running() {
+        let sup = ServeSupervisor::new();
+        let mut s = sup.status_for_test().await;
+        s.rathole_pid = Some(7777);
+        sup.set_status_for_test(s).await;
+
+        let result = sup.launch_cloud_service(9464, "nonexistent-bin", "nonexistent.toml").await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn launch_cloud_service_skips_opencode_when_already_running() {
+        // single already running -> skip opencode launch, go to rathole branch.
+        // rathole binary nonexistent -> rathole launch fails with BadRequest
+        // (mapped to Conflict by the combo wrapper). The point of this test:
+        // confirm we did NOT bail with the "rathole already running" guard.
+        let sup = ServeSupervisor::new();
+        let mut s = sup.status_for_test().await;
+        s.opencode_pid = Some(5555);
+        sup.set_status_for_test(s).await;
+
+        let result = sup.launch_cloud_service(9464, "nonexistent-bin", "nonexistent.toml").await;
+        // combo wrapper maps rathole sub-failure to Conflict with
+        // "云服务启动失败:单体已启" prefix. So we DO get Conflict —
+        // but the message must indicate the rathole sub-failure, not the
+        // "rathole already running" guard.
+        match result {
+            Err(AppError::Conflict(msg)) => {
+                assert!(
+                    msg.contains("rathole") || msg.contains("单体已启"),
+                    "expected rathole sub-failure Conflict, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("已在运行"),
+                    "got wrong Conflict reason (rathole-already-running): {msg}"
+                );
+            }
+            other => panic!("expected Conflict with rathole sub-failure msg, got: {other:?}"),
         }
     }
 }

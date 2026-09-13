@@ -381,10 +381,7 @@ fn embed_windows_icon(profile_dir: &Path) {
         }
     };
     let mut res = winresource::WindowsResource::new();
-    if let Err(e) = res.set_icon_path(ico_str) {
-        eprintln!("cargo:warning=winresource set_icon_path failed: {e}");
-        return;
-    }
+    res.set_icon(ico_str);
     if let Err(e) = res.compile() {
         eprintln!("cargo:warning=winresource compile failed: {e}");
     }

@@ -15,17 +15,21 @@ use ratatui::{
     widgets::{Block, Borders, Clear, ListState, Padding, Paragraph, Wrap},
 };
 
+use crate::account::{
+    AccountConfig, DevicePickerTrigger, DevicePickerTriggerSlot, RemoteUserInfo,
+    DEFAULT_REMOTE_PATH, bind_device, fetch_user_info, upsert_env_keys,
+};
+#[cfg(test)]
+use crate::account::RemoteDevice;
 use crate::attach::{AttachedSession, OcSession, OpencodeClient, choose_folder, kill_process};
 use crate::auth::AuthConfig;
-use crate::config::{
-    PortsConfig, RatholeConfig, SbConfig, read_persisted_env, write_persisted_env,
-};
+use crate::config::PortsConfig;
 use crate::domain::{PathEntry, PathValidator};
 use crate::error::AppError;
 use crate::serve::{
     ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
 };
-use crate::storage::{PathListStore, RemotePaths};
+use crate::storage::PathListStore;
 use crate::storage::remote::RemoteClient;
 use crate::ui::events::InputEvent;
 use crate::ui::log::LogBuffer;
@@ -53,6 +57,99 @@ fn read_clipboard_text() -> String {
         Ok(mut cb) => cb.get_text().unwrap_or_default(),
         Err(_) => String::new(),
     }
+}
+
+/// 把文本写入系统剪贴板。失败（无 GUI 剪贴板服务 / 平台不支持）返回
+/// `false`，由调用方在提示行告知用户，绝不 panic（与
+/// [`read_clipboard_text`] 同一套兜底策略）。
+fn write_clipboard_text(s: &str) -> bool {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => cb.set_text(s.to_string()).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// 按终端**显示宽度**把一行日志切成若干屏行（自动换行）。
+///
+/// 宽度启发式：ASCII 字符按 1 列、其余（CJK / 全角标点等）按 2 列 ——
+/// 与等宽终端字体下的常规表现一致。emoji 等复杂字形可能略偏，但日志
+/// 场景下足够精确，且不引入 `unicode-width` 依赖。
+///
+/// - `width == 0` 时退化为单行返回（防御，调用方保证 width ≥ 1）；
+/// - 空字符串返回一个空屏行（保证行数 ≥ 1，渲染不塌陷）。
+fn wrap_line_display_width(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let w = if ch.is_ascii() { 1 } else { 2 };
+        if cur_w + w > width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    out.push(cur);
+    out
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_splits_ascii_by_width() {
+        assert_eq!(wrap_line_display_width("abcdef", 3), vec!["abc", "def"]);
+        // 恰好整除不加空尾行
+        assert_eq!(wrap_line_display_width("abc", 3), vec!["abc"]);
+        assert_eq!(wrap_line_display_width("abcd", 3), vec!["abc", "d"]);
+    }
+
+    #[test]
+    fn wrap_counts_cjk_as_two_columns() {
+        // 3 列宽只装得下一个中文(2 列),第二个换行
+        assert_eq!(wrap_line_display_width("中文", 3), vec!["中", "文"]);
+        assert_eq!(wrap_line_display_width("a中b", 3), vec!["a中", "b"]);
+    }
+
+    #[test]
+    fn wrap_empty_line_yields_single_empty_row() {
+        assert_eq!(wrap_line_display_width("", 5), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrap_zero_width_falls_back_to_single_line() {
+        assert_eq!(wrap_line_display_width("abc", 0), vec!["abc"]);
+    }
+}
+
+/// 解析远端 path-list JSON(数组)为 `PathEntry` 列表。
+///
+/// 与 `storage::sync::json_arr_to_entries` 同语义:逐项反序列化,
+/// 跳过格式错误的条目而不是整体失败。空 body 视为空列表(远端
+/// 文件刚创建、内容为空时会出现)。
+fn parse_path_entries_from_json(body: &str) -> Result<Vec<PathEntry>, AppError> {
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        AppError::Internal(format!("解析远端 path-list JSON 失败: {e}"))
+    })?;
+    let arr = value.as_array().cloned().unwrap_or_default();
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        match serde_json::from_value::<PathEntry>(item) {
+            Ok(e) => out.push(e),
+            Err(err) => {
+                tracing::warn!("跳过远端格式错误的 entry: {err}");
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// 设置弹框外点击的处置策略(纯函数,便于单测覆盖三类规则)。
@@ -124,44 +221,36 @@ fn should_dismiss_settings_on_click(
     }
 }
 
-/// 渲染设置页 PASSWORD 字段掩码行 —— 纯函数,只依赖当前输入 buffer 与
-/// 「已保存密码长度」占位。
+/// 渲染设置页「密钥」(account_key)字段掩码行 —— 纯函数,只依赖当前输入
+/// buffer。
 ///
-/// 行为:把 `input` 的字符数 与 `mask_len` 取较大值,渲染对应数量的 `*`,
-/// 拼成 `"  PASSWORD: ****"`(与 build_settings_lines 的固定前缀 +
-/// SilverBullet 密码字段保持视觉一致)。
+/// 行为:把 `input` 的字符数渲染成对应数量的 `*`,拼成 `"  密钥: ****"`
+/// (与 build_settings_lines 的固定前缀保持视觉一致)。
 ///
 /// 设计意图 —— 抽成纯函数,便于单测覆盖:
-/// - buffer 空 + mask_len=0  → `"  PASSWORD: "`         (首启未配置)
-/// - buffer 空 + mask_len=N  → `"  PASSWORD: " + "*" * N` (回显已保存密码)
-/// - buffer 长度 M + mask_len=N → `"  PASSWORD: " + "*" * max(M, N)`
+/// - buffer 空     → `"  密钥: "`         (首启未配置)
+/// - buffer N 字符 → `"  密钥: " + "*" * N`
 ///
-/// 两套参数同时存在的原因:
-/// - `input` 实时跟随用户在 buffer 里的输入(粘贴 / 输入 / 退格),反映
-///   "我刚才输入了几位";
-/// - `mask_len` 在 `open_settings` 时一次性记录"已保存密码长度",用户没动
-///   buffer 也能看到对应位数的 \* 占位 —— 不需要把真实密码回填到
-///   `password_input` buffer(否则用户没改就保存时,`submit_settings` 会
-///   把 `password_input` 当成新密码提交,把真实密码覆盖掉)。
-///
-/// 渲染时取 max 是为了:用户已开始输入时,buffer 长度可能超过 mask_len
-/// (不会发生但理论上),以及 mask_len 不会"夹"在 buffer 中段,只决定
-/// 底限显示。
-fn render_auth_password_line(input: &str, mask_len: usize) -> String {
-    let n = input.chars().count().max(mask_len);
-    format!("  PASSWORD: {}", "*".repeat(n))
+/// buffer 由 `open_settings` 回填已保存密钥(真实值只以掩码呈现),
+/// 用户可直接在掩码行上追加 / 退格;不动直接保存 = 沿用原密钥。
+fn render_account_key_line(input: &str) -> String {
+    format!("  密钥: {}", "*".repeat(input.chars().count()))
 }
 
 /// 把粘贴文本按字段规则追加到对应 buffer,返回追加后的新 buffer。
 ///
-/// 设计意图:**抽成纯函数**以便单测覆盖所有 11 个字段 + 端口过滤 +
-/// 5 位上限。TuiApp 的 11 个 buffer 都是 String,字段路由通过
+/// 设计意图:**抽成纯函数**以便单测覆盖所有可编辑字段 + 端口过滤 +
+/// 5 位上限。TuiApp 的可编辑 buffer 都是 String,字段路由通过
 /// `InputMode` 决定,函数不持有任何 self 之外的引用,易测易推。
 ///
+/// 注:系统端口(`SettingsHttpPort`)不在可编辑字段中,该分支 no-op。
+///
 /// 行为细节:
-/// - 普通文本字段:整段追加,保留所有字符(含中文 / 空格 / 标点)。
-/// - 三个端口字段(`SettingsHttpPort` / `SettingsServePort` /
-///   `SettingsRatholePort`):只保留 ASCII 数字,且总长度 ≤ 5。
+/// - 普通文本字段(账户ID / 密钥 / 远程路径):整段追加,保留所有字符
+///   (含中文 / 空格 / 标点)。
+/// - OpenCode 端口(`SettingsServePort`):只保留 ASCII 数字,且总长度
+///   ≤ 5。`SettingsHttpPort` 系统端口已锁定为 9465,该分支 no-op
+///   (见上方 match arm 注释)。
 /// - `Menu` 模式:粘贴不生效(防御性,正常路径不会传进来)。
 fn apply_paste_to_buffer(field: InputMode, current: &str, text: &str) -> String {
     let mut buf = current.to_string();
@@ -170,12 +259,8 @@ fn apply_paste_to_buffer(field: InputMode, current: &str, text: &str) -> String 
     }
     match field {
         InputMode::SettingsHttpPort => {
-            for c in text.chars().filter(|c| c.is_ascii_digit()) {
-                if buf.len() >= 5 {
-                    break;
-                }
-                buf.push(c);
-            }
+            // 硬锁定:系统端口固定为 9465。即便上游未做 early return,
+            // 此分支也不修改 buf,保持防御纵深。
         }
         InputMode::SettingsServePort => {
             for c in text.chars().filter(|c| c.is_ascii_digit()) {
@@ -185,22 +270,9 @@ fn apply_paste_to_buffer(field: InputMode, current: &str, text: &str) -> String 
                 buf.push(c);
             }
         }
-        InputMode::SettingsRatholePort => {
-            for c in text.chars().filter(|c| c.is_ascii_digit()) {
-                if buf.len() >= 5 {
-                    break;
-                }
-                buf.push(c);
-            }
-        }
-        InputMode::SettingsAuthUsername
-        | InputMode::SettingsAuthPassword
-        | InputMode::SettingsUrl
-        | InputMode::SettingsUser
-        | InputMode::SettingsPassword
-        | InputMode::SettingsRatholeHost
-        | InputMode::SettingsRatholeName
-        | InputMode::SettingsRatholeToken => buf.push_str(text),
+        InputMode::SettingsAccountId
+        | InputMode::SettingsAccountKey
+        | InputMode::SettingsRemotePath => buf.push_str(text),
         InputMode::Menu => {}
     }
     buf
@@ -231,46 +303,28 @@ const SYS_PICKER_DESC: &str = "打开系统文件管理器选择项目目录";
 enum InputMode {
     /// 主菜单导航。
     Menu,
-    /// 设置：HTTP Basic 用户名（`OPENCODE_SERVER_USERNAME`）。
-    SettingsAuthUsername,
-    /// 设置：HTTP Basic 密码（`OPENCODE_SERVER_PASSWORD`）。
-    SettingsAuthPassword,
-    /// 设置：系统端口。
+    /// 设置：系统端口（锁定为 9465，不可编辑，仅用于"弹框已打开"判定）。
     SettingsHttpPort,
     /// 设置：OpenCode 服务端口。
     SettingsServePort,
-    /// 设置：远程 SilverBullet 路径。
-    SettingsUrl,
-    /// 设置：SilverBullet 用户名。
-    SettingsUser,
-    /// 设置：SilverBullet 密码。
-    SettingsPassword,
-    /// 设置：rathole 远端 Host。
-    SettingsRatholeHost,
-    /// 设置：rathole 远端 Port。
-    SettingsRatholePort,
-    /// 设置：rathole 服务名 Name。
-    SettingsRatholeName,
-    /// 设置：rathole 鉴权 Token。
-    SettingsRatholeToken,
+    /// 设置：账户ID（`ACCOUNT_ID`）。
+    SettingsAccountId,
+    /// 设置：账户密钥（`ACCOUNT_KEY`）。
+    SettingsAccountKey,
+    /// 设置：账户中心远程路径（`REMOTE_PATH`）。
+    SettingsRemotePath,
 }
 
 impl InputMode {
-    /// 是否为设置面板的某个字段（port / SB / Rathole）。
+    /// 是否为设置面板的某个字段（账户 / 端口）。
     fn is_settings_field(self) -> bool {
         matches!(
             self,
-            InputMode::SettingsAuthUsername
-                | InputMode::SettingsAuthPassword
-                | InputMode::SettingsHttpPort
+            InputMode::SettingsHttpPort
                 | InputMode::SettingsServePort
-                | InputMode::SettingsUrl
-                | InputMode::SettingsUser
-                | InputMode::SettingsPassword
-                | InputMode::SettingsRatholeHost
-                | InputMode::SettingsRatholePort
-                | InputMode::SettingsRatholeName
-                | InputMode::SettingsRatholeToken
+                | InputMode::SettingsAccountId
+                | InputMode::SettingsAccountKey
+                | InputMode::SettingsRemotePath
         )
     }
 }
@@ -377,7 +431,10 @@ enum SettingsBtnKind {
 }
 
 /// 鼠标点击目标。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 不派生 `Copy` —— `SettingsBindDevice(Option<RemoteUserInfo>)` 携带
+/// 缓存的用户信息(可能较大)。匹配代码用 `match` + 单字段比较即可。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ClickTarget {
     /// 主菜单栏（服务与系统）第 i 项。
     MainColumn(usize),
@@ -404,25 +461,57 @@ enum ClickTarget {
     /// 设置弹框底部的「打开配置文件目录」按钮（点击 = 调系统文件管理器
     /// 打开 `unified_env_path()` 的父目录 —— 配置文件所在目录）。
     SettingsOpenConfigDir,
+    /// 设置弹框中「绑定设备」只读信息行（点击 = 关闭设置弹框并触发
+    /// 设备选择弹框，每次都重新拉取最新设备清单）。
+    SettingsBindDevice,
+    /// 设备选择弹框中的第 i 个设备（鼠标点击行选中）。
+    DevicePickerRow(usize),
+    /// 设备选择弹框底部的「确认」按钮（点击 = 调 bind_device 绑定当前选中）。
+    DevicePickerConfirm,
+    /// 设备选择弹框底部的「取消」按钮（点击 = 关闭弹框、跳过绑定）。
+    DevicePickerCancel,
 }
 
 /// 设置弹框内可编辑字段的有序列表（决定 ↑/↓ / Tab / 点击的循环顺序）。
-const SETTINGS_FIELDS: [InputMode; 11] = [
-    InputMode::SettingsAuthUsername,
-    InputMode::SettingsAuthPassword,
-    InputMode::SettingsHttpPort,
+const SETTINGS_FIELDS: [InputMode; 4] = [
+    InputMode::SettingsAccountId,
+    InputMode::SettingsAccountKey,
+    InputMode::SettingsRemotePath,
     InputMode::SettingsServePort,
-    InputMode::SettingsUrl,
-    InputMode::SettingsUser,
-    InputMode::SettingsPassword,
-    InputMode::SettingsRatholeHost,
-    InputMode::SettingsRatholePort,
-    InputMode::SettingsRatholeName,
-    InputMode::SettingsRatholeToken,
 ];
 
+/// 字段值所在行 idx（`build_settings_lines` 布局内，0-based，不含上边框）。
+///
+/// 布局（17 行）：
+/// - 0:  "账户登录" 标题
+/// - 1:  账户ID 值         ← field 0
+/// - 2:  账户ID 说明
+/// - 3:  密钥 值(掩码)     ← field 1
+/// - 4:  密钥 说明
+/// - 5:  绑定设备 值(只读)
+/// - 6:  绑定设备 说明
+/// - 7:  远程路径 值       ← field 2
+/// - 8:  远程路径 说明
+/// - 9:  (空)
+/// - 10: "端口设置" 标题
+/// - 11: 系统端口 值（锁定 9465，只渲染不进本表）
+/// - 12: 系统端口 说明
+/// - 13: OpenCode 端口 值  ← field 3
+/// - 14: OpenCode 端口 说明
+/// - 15: (空)
+/// - 16: 帮助行
+///
+/// `settings_field_at_row` 与 `register_settings_click_regions` 共用本表，
+/// 避免多处 hardcode 漂移。
+const FIELD_LINE_IDX: [u16; 4] = [1, 3, 7, 13];
+
 /// 可点击区域（每帧渲染时记录）。
-#[derive(Debug, Clone, Copy)]
+///
+/// 不是 `Copy`：`ClickTarget::DevicePickerRow(usize)` 携带设备下标，
+/// 但 `derive(Clone)` 仍是必要的（`click_regions` 按值 push，且
+/// `click_at` 按引用匹配时不移动字段）。`SettingsBindDevice` /
+/// `DevicePickerConfirm` / `DevicePickerCancel` 是 unit-like 变体。
+#[derive(Debug, Clone)]
 struct ClickRegion {
     rect: Rect,
     target: ClickTarget,
@@ -449,6 +538,21 @@ struct PendingAttach {
     session: String,
     user: String,
     password: String,
+}
+
+/// 设备选择弹框状态（本地未配置 `DEVICE_NAME` 时由后台 fetch 任务经
+/// [`DevicePickerTriggerSlot`] 触发弹出）。
+struct DevicePickerState {
+    /// /api/user/info 返回的完整用户信息（`devices` 即待选清单）。
+    user_info: RemoteUserInfo,
+    /// 账户密钥 + 远程 API 地址 —— confirm 后调 `/api/device-bind` 用。
+    account_key: String,
+    remote_path: String,
+    /// 当前选中的设备下标（↑/↓ 移动 / 鼠标点击行 / 左右键切换底部按钮）。
+    selected: usize,
+    /// 底部确认 / 取消按钮的当前选中态（左右键切换 / 鼠标 hover 切换）。
+    /// 默认 Confirm（与确认按钮 Enter / 点击行为对齐）。
+    button_focus: ConfirmChoice,
 }
 
 /// Main TUI application state.
@@ -490,56 +594,55 @@ pub struct TuiApp {
     attached_sessions: Arc<Mutex<Vec<AttachedSession>>>,
     /// 当前 attach 目标 URL（进入 OC 项目时根据 serve 状态确定）。
     attach_url: String,
-    /// 首次配置：用户名输入缓冲。
+    /// HTTP Basic 用户名缓冲 —— 不再由用户手填，`submit_settings` 从
+    /// 账户信息（user.id / user.name）自动填充后写入 auth 与 env。
     username_input: String,
-    /// 首次配置：密码输入缓冲。
+    /// HTTP Basic 密码缓冲 —— 同上，从账户信息（user.sb.password 等）
+    /// 自动填充；用户在设置面板中不直接编辑。
     password_input: String,
-    /// 设置面板 PASSWORD 行回显用的「已保存密码长度」占位（仅展示用，不影响
-    /// `password_input` buffer 内容）。`open_settings` 时一次性记录当前
-    /// auth.basic_password 长度；用户不动 buffer 也能看到对应位数的 `*`,
-    /// 真实密码内容不会被回填（否则保存时会被覆盖）。
+    /// 「已保存密码长度」占位：`submit_settings` 从账户信息填充 auth 时
+    /// 一次性记录 `basic_password` 长度（原为设置面板 PASSWORD 行回显
+    /// 用；账户化后仅作状态展示 / 诊断用途，不再回填明文）。
     auth_password_mask_len: usize,
     /// 日志全屏模式。
     show_full_log: bool,
-    /// 全屏日志滚动偏移（向上滚动的行数）。
+    /// 全屏日志滚动偏移（向上滚动的行数，以 wrap 后的**屏行**计）。
     log_scroll: usize,
+    /// 全屏日志拖选起点（屏幕坐标，鼠标左键按下时记录；仅日志内容区有效）。
+    log_select_anchor: Option<(u16, u16)>,
+    /// 全屏日志拖选当前终点（拖动中实时更新；与 anchor 共同决定高亮范围）。
+    log_select_current: Option<(u16, u16)>,
+    /// 上一帧全屏日志**内容区**（含滚动窗口与 wrap 布局，mouse up 时
+    /// 重建同样的 wrapped 行做屏幕行 → 逻辑行映射）。
+    last_full_log_inner: Option<Rect>,
+    /// 全屏日志顶部提示行的临时通知（如"已复制 N 行"），下次进入/退出
+    /// 全屏时清空。
+    full_log_notice: Option<String>,
     /// 待二次确认的动作（杀死/关闭服务）。
     confirm: Option<ConfirmAction>,
     /// 确认弹框的按钮选中态。
     confirm_choice: ConfirmChoice,
-    /// 远程 SilverBullet 配置（设置弹框热更新）.
-    sb_config: Arc<RwLock<SbConfig>>,
-    /// 远端服务验证状态（状态框第二行展示）.
-    remote_status: Arc<Mutex<String>>,
+    /// 账户登录配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH，设置面板热更新）.
+    account_config: Arc<RwLock<AccountConfig>>,
     /// 程序启动时刻（状态框展示运行时长）.
     program_started_at: chrono::DateTime<chrono::Local>,
     /// 设置：系统端口输入缓冲。
     system_port_input: String,
     /// 设置：OpenCode 服务端口输入缓冲。
     opencode_port_input: String,
-    /// 设置：SB URL 输入缓冲。
-    sb_url_input: String,
-    /// 设置：SB 用户名输入缓冲。
-    sb_user_input: String,
-    /// 设置：SB 密码输入缓冲。
-    sb_password_input: String,
-    /// rathole 全局配置（设置弹框热更新 + 生成 global.toml）.
-    rathole_config: Arc<RwLock<RatholeConfig>>,
-    /// 设置：rathole Host 输入缓冲。
-    rathole_host_input: String,
-    /// 设置：rathole Port 输入缓冲。
-    rathole_port_input: String,
-    /// 设置：rathole Name 输入缓冲。
-    rathole_name_input: String,
-    /// 设置：rathole Token 输入缓冲。
-    rathole_token_input: String,
+    /// 设置：账户ID 输入缓冲。
+    account_id_input: String,
+    /// 设置：账户密钥输入缓冲（打开面板时留空，掩码回显已保存位数）。
+    account_key_input: String,
+    /// 设置：账户中心远程路径输入缓冲（默认 `https://oc.isoops.com`）。
+    remote_path_input: String,
     /// 当前帧的可点击区域（渲染时填充，鼠标事件查询）。
     click_regions: Vec<ClickRegion>,
     /// 最近一次鼠标移动的位置（用于日志面板边框 hover 高亮）。
     mouse_pos: Option<(u16, u16)>,
     /// 设置弹框内部内容的垂直滚动偏移（行数）。
     ///
-    /// 当终端高度不足以一次渲染完整布局(约 31 行)时,`render_settings_popup`
+    /// 当终端高度不足以一次渲染完整布局(约 15 行)时,`render_settings_popup`
     /// 通过 `Paragraph::scroll((scroll_offset, 0))` 把被截掉的部分向下移动。
     /// `settings_field_at_row` 与 `register_settings_click_regions` 必须用
     /// 同样的偏移来计算屏幕坐标,否则屏幕外的字段 click region 会落在弹框外,
@@ -571,18 +674,34 @@ pub struct TuiApp {
     first_setup_required: bool,
     /// 待执行的 attach 会话；run() 主循环检测到非 None 后接管控制台跑 attach。
     pending_attach: Option<PendingAttach>,
+    /// 设备选择弹框（Some = 弹框打开，独占键盘输入）。
+    ///
+    /// 由 main.rs 的后台 fetch_user_info 任务在"本地未绑定设备（DEVICE_NAME
+    /// 为空）且远端设备清单非空"时通过共享触发槽唤起，见
+    /// [`TuiApp::consume_device_picker_trigger`]。也可由用户在设置面板
+    /// 点击「绑定设备」行主动触发（点击后设置弹框关闭、直接打开选择）。
+    device_picker: Option<DevicePickerState>,
+    /// 后台任务 → TUI 的设备选择触发槽（每帧 render 入口轮询消费）。
+    device_picker_trigger: DevicePickerTriggerSlot,
+    /// 最近一次 fetch_user_info 返回的用户信息缓存。
+    ///
+    /// 用途：设置面板点击「绑定设备」行时,如缓存命中可直接拼装
+    /// `DevicePickerState`（避免再次网络请求）。后台 fetch 完成后会更新。
+    /// `None` 表示从未成功拉取过 / 缓存已过期 —— 点击会触发重新拉取。
+    cached_user_info: Option<RemoteUserInfo>,
 }
 
 impl TuiApp {
-    /// Construct a new TUI app bound to a supervisor + shared auth + log buffer + store + sb config.
+    /// Construct a new TUI app bound to a supervisor + shared auth + log
+    /// buffer + store + account config + device-picker trigger slot.
     #[must_use]
     pub fn new(
         supervisor: ServeSupervisor,
         auth: Arc<RwLock<AuthConfig>>,
         log_buffer: LogBuffer,
         store: Arc<PathListStore>,
-        sb_config: Arc<RwLock<SbConfig>>,
-        rathole_config: Arc<RwLock<RatholeConfig>>,
+        account_config: Arc<RwLock<AccountConfig>>,
+        device_picker_trigger: DevicePickerTriggerSlot,
     ) -> Self {
         let mut main_state = ListState::default();
         main_state.select(Some(0));
@@ -591,23 +710,19 @@ impl TuiApp {
         let mut service_state = ListState::default();
         service_state.select(Some(0));
 
-        let configured = auth.read().map(|a| a.is_configured()).unwrap_or(false);
-        let existing_user = auth
+        // 首启判定只看 AccountConfig：未配置账户（ACCOUNT_ID / 密钥 /
+        // REMOTE_PATH）时强制打开设置面板;HTTP Basic 凭据在 submit 时由
+        // 账户信息自动填充,不再是首启门槛。
+        let configured = account_config
             .read()
-            .map(|a| a.basic_user.clone())
-            .unwrap_or_default();
-        // 已保存密码长度作为首次进入设置面板时的回显占位 —— 不暴露明文,
-        // 仅供 `render_auth_password_line` 用作底限星号数。
-        let saved_password_len = auth
-            .read()
-            .map(|a| a.basic_password.len())
-            .unwrap_or_default();
+            .map(|a| a.is_configured())
+            .unwrap_or(false);
         let (input_mode, status) = if configured {
             (InputMode::Menu, "就绪".to_string())
         } else {
             (
-                InputMode::SettingsAuthUsername,
-                "首次启动：请填写 OPENCODE_SERVER_USERNAME / PASSWORD".to_string(),
+                InputMode::SettingsAccountId,
+                "首次启动：请填写 账户ID / 密钥 完成登录".to_string(),
             )
         };
 
@@ -628,29 +743,29 @@ impl TuiApp {
             attached_sessions: Arc::new(Mutex::new(Vec::new())),
             attach_url: std::env::var("ATTACH_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:9464".to_string()),
-            username_input: existing_user,
+            // username / password 不再由用户手填:submit_settings 从账户
+            // 信息自动填充并写入 auth,这里从空开始。
+            username_input: String::new(),
             password_input: String::new(),
-            // 启动时若 auth 已配置,把已保存密码长度作为回显占位记录下来,
-            // 用户首次打开设置面板即可看到对应位数的 *（不暴露明文）。
-            // 首启时 auth 未配置,保持 0。
-            auth_password_mask_len: saved_password_len,
+            auth_password_mask_len: 0,
             show_full_log: false,
             log_scroll: 0,
+            log_select_anchor: None,
+            log_select_current: None,
+            last_full_log_inner: None,
+            full_log_notice: None,
             confirm: None,
             confirm_choice: ConfirmChoice::Confirm,
-            sb_config,
-            remote_status: Arc::new(Mutex::new(String::new())),
+            account_config,
             program_started_at: chrono::Local::now(),
             system_port_input: PortsConfig::load().system_port.to_string(),
             opencode_port_input: PortsConfig::load().opencode_port.to_string(),
-            sb_url_input: String::new(),
-            sb_user_input: String::new(),
-            sb_password_input: String::new(),
-            rathole_config,
-            rathole_host_input: String::new(),
-            rathole_port_input: String::new(),
-            rathole_name_input: String::new(),
-            rathole_token_input: String::new(),
+            account_id_input: String::new(),
+            // 启动时若账户已配置,把已保存密钥长度作为「密钥」行回显占位
+            // 记录下来,用户首次打开设置面板即可看到对应位数的 *
+            // (不暴露明文)。首启时账户未配置,保持 0。
+            account_key_input: String::new(),
+            remote_path_input: DEFAULT_REMOTE_PATH.to_string(),
             click_regions: Vec::new(),
             mouse_pos: None,
             settings_scroll_offset: 0,
@@ -659,6 +774,9 @@ impl TuiApp {
             last_settings_popup_rect: None,
             first_setup_required: !configured,
             pending_attach: None,
+            device_picker: None,
+            device_picker_trigger,
+            cached_user_info: None,
         }
     }
 
@@ -683,8 +801,9 @@ impl TuiApp {
             }
         });
 
-        // 启动后异步验证远端服务可用性。
-        self.verify_remote();
+        // 启动后异步验证远端可用性：由 main.rs 的 store.refresh /
+        // submit_settings 的后台刷新任务承担（结果写日志面板），
+        // 不再单独维护 remote_status 状态行。
 
         // 启用鼠标捕获。
         let _ = crossterm::execute!(
@@ -748,36 +867,50 @@ impl TuiApp {
         Ok(())
     }
 
-    fn verify_remote(&self) {
-        let cfg = self.sb_config.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let remote_status = self.remote_status.clone();
-        tokio::spawn(async move {
-            if !cfg.is_configured() {
-                *remote_status.lock().unwrap() =
-                    "未配置远程存储地址，请在[设置]中配置".to_string();
-                return;
-            }
-            let mut remote =
-                RemoteClient::with_credentials(cfg.url.clone(), cfg.user.clone(), cfg.password.clone());
-            let path = RemotePaths::new(cfg.user.as_str()).path_list_with_slash();
-            match remote.get(&path).await {
-                Ok((0, _)) => {
-                    *remote_status.lock().unwrap() = format!("远程存储不可用：{}", cfg.url);
-                }
-                Ok((status, _)) if status >= 400 => {
-                    *remote_status.lock().unwrap() = format!("远程存储不可用：HTTP {status}");
-                }
-                Ok(_) => {
-                    *remote_status.lock().unwrap() = format!("远程存储已连接：{}", cfg.url);
-                }
-                Err(e) => {
-                    *remote_status.lock().unwrap() = format!("远程存储不可用：{e}");
-                }
-            }
-        });
-    }
-
     async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        // 全屏日志模式独占鼠标：左键按下记拖选起点、拖动更新终点（实时
+        // 高亮，见 render_full_log）、松开自动复制选中行到剪贴板；滚轮
+        // 直接滚动日志。不透传到主界面的 hover/click。
+        if self.show_full_log {
+            let inner_ok = |col: u16, row: u16, rect: Option<Rect>| {
+                rect.is_some_and(|r| {
+                    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+                })
+            };
+            match mouse.kind {
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    // 仅日志内容区内起选；点到边框 / 提示行则清空选择。
+                    if inner_ok(mouse.column, mouse.row, self.last_full_log_inner) {
+                        self.log_select_anchor = Some((mouse.column, mouse.row));
+                        self.log_select_current = Some((mouse.column, mouse.row));
+                    } else {
+                        self.log_select_anchor = None;
+                        self.log_select_current = None;
+                    }
+                }
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    if self.log_select_anchor.is_some() {
+                        self.log_select_current = Some((mouse.column, mouse.row));
+                    }
+                }
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                    if self.log_select_anchor.is_some() {
+                        self.copy_log_selection_to_clipboard();
+                    }
+                    // 复制完清空选择（单击也会走这里：选中 0/1 行 → 复制）。
+                    self.log_select_anchor = None;
+                    self.log_select_current = None;
+                }
+                crossterm::event::MouseEventKind::ScrollUp => {
+                    self.log_scroll = self.log_scroll.saturating_add(3);
+                }
+                crossterm::event::MouseEventKind::ScrollDown => {
+                    self.log_scroll = self.log_scroll.saturating_sub(3);
+                }
+                _ => {}
+            }
+            return;
+        }
         match mouse.kind {
             crossterm::event::MouseEventKind::Moved | crossterm::event::MouseEventKind::Drag(_) => {
                 self.hover_at(mouse.column, mouse.row);
@@ -798,20 +931,18 @@ impl TuiApp {
     fn find_target(&self, col: u16, row: u16) -> Option<ClickTarget> {
         self.click_regions
             .iter()
-            .find(|r| {
+.find(|r| {
                 r.rect.x <= col
                     && col < r.rect.x + r.rect.width
                     && r.rect.y <= row
                     && row < r.rect.y + r.rect.height
             })
-            .map(|r| r.target)
+            .map(|r| r.target.clone())
     }
 
     /// 设置弹框专属 region 查找:只匹配 [`ClickTarget::SettingsField`] /
     /// [`ClickTarget::SettingsOk`] / [`ClickTarget::SettingsCancel`] /
     /// [`ClickTarget::SettingsOpenConfigDir`],忽略其他 region(Logs /
-    /// MainColumn / ServicePanel 等),这是 modal dialog 的"前景优先"
-    /// 语义 ——
     ///
     /// - `click_at` 在弹框打开时,先用本函数查;找不到才退回 [`find_target`]。
     /// - 设计动机:Logs region 在底部 row 占据一整块矩形,几何上可能与
@@ -833,9 +964,10 @@ impl TuiApp {
                             | ClickTarget::SettingsOk
                             | ClickTarget::SettingsCancel
                             | ClickTarget::SettingsOpenConfigDir
+                            | ClickTarget::SettingsBindDevice
                     )
             })
-            .map(|r| r.target)
+            .map(|r| r.target.clone())
     }
 
     fn hover_at(&mut self, col: u16, row: u16) {
@@ -918,6 +1050,37 @@ impl TuiApp {
     }
 
     async fn click_at(&mut self, col: u16, row: u16) {
+        // 设备选择弹框是模态的 —— 打开期间优先处理弹框自身的 click
+        // （设备行 / 确认 / 取消），其他背景 region 忽略（与 handle_key
+        // 的独占路由对称），避免误触设置 / 主菜单。
+        if self.device_picker.is_some() {
+            // 弹框期间允许 hover 切换 button_focus 在 render 时已处理,
+            // 这里只需按 find_target 全局查找 —— render_device_picker 注册的
+            // DevicePickerRow/Confirm/Cancel 会优先匹配。
+            if let Some(target) = self.find_target(col, row) {
+                match target {
+                    ClickTarget::DevicePickerRow(i) => {
+                        if let Some(p) = self.device_picker.as_mut() {
+                            if i < p.user_info.devices.len() {
+                                p.selected = i;
+                            }
+                        }
+                    }
+                    ClickTarget::DevicePickerConfirm => {
+                        self.confirm_device_bind().await;
+                    }
+                    ClickTarget::DevicePickerCancel => {
+                        self.device_picker = None;
+                        *self.status_message.lock().unwrap() =
+                            "已跳过设备绑定".to_string();
+                    }
+                    _ => {
+                        // 弹框外区域命中其他 region —— 忽略,不触发背景。
+                    }
+                }
+            }
+            return;
+        }
         // 与 handle_key 一致：先消费后台"端口占用"信号，再走主 click 流。
         self.maybe_show_port_busy_confirm();
         let popup_open =
@@ -983,8 +1146,12 @@ impl TuiApp {
                 | ClickTarget::SettingsOk
                 | ClickTarget::SettingsCancel
                 | ClickTarget::SettingsOpenConfigDir
+                | ClickTarget::SettingsBindDevice
                 | ClickTarget::ConfirmOk
                 | ClickTarget::CancelBtn
+                | ClickTarget::DevicePickerRow(_)
+                | ClickTarget::DevicePickerConfirm
+                | ClickTarget::DevicePickerCancel
         ) {
             // 设置弹框:即便命中了非弹框 region(说明用户点的就是主菜单
             // 某个 card / 日志面板),也要遵守"首启不关"的规则。
@@ -1033,6 +1200,9 @@ impl TuiApp {
             ClickTarget::Logs => {
                 self.show_full_log = true;
                 self.log_scroll = 0;
+                self.log_select_anchor = None;
+                self.log_select_current = None;
+                self.full_log_notice = None;
             }
             ClickTarget::ConfirmOk => {
                 // 等价于按 Select:从 confirm 取 action,根据类型分发
@@ -1060,6 +1230,11 @@ impl TuiApp {
             ClickTarget::CancelBtn => {
                 self.confirm = None;
             }
+            // DevicePicker* 已被 device_picker.is_some() 提前路由处理,
+            // 理论上走不到这里 —— match 仍需穷尽以满足编译器。
+            ClickTarget::DevicePickerRow(_)
+            | ClickTarget::DevicePickerConfirm
+            | ClickTarget::DevicePickerCancel => {}
             ClickTarget::SettingsOk => {
                 // 等价于按 Enter 保存
                 self.submit_settings().await;
@@ -1073,6 +1248,84 @@ impl TuiApp {
                 // 调系统文件管理器打开配置文件所在目录。失败仅状态栏提示,
                 // 不关闭弹框（用户可以继续设置）。
                 self.open_config_dir_in_file_manager();
+            }
+            ClickTarget::SettingsBindDevice => {
+                // 「绑定设备」只读行被点击 —— 关闭设置弹框,触发设备选择。
+                // 关闭时与 Esc 路径对称(input_mode=Menu + 清 last rect)。
+                self.input_mode = InputMode::Menu;
+                self.last_settings_popup_rect = None;
+
+                // **Bug 2 + Bug 4 修复**:每次点击"绑定设备"行都**强制重新
+                // 拉取最新用户信息**(确保设备清单含服务端最新的 bound 状态),
+                // 不使用 ClickRegion 携带的缓存(可能为过期数据)。同时清除
+                // 设备选择弹框、清除缓存 —— 避免状态残留干扰下一次触发。
+                self.device_picker = None;
+                self.cached_user_info = None;
+
+                let cfg_snapshot = self
+                    .account_config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if !cfg_snapshot.is_configured() {
+                    *self.status_message.lock().unwrap() =
+                        "⚠️ 账户未配置,无法触发设备选择".to_string();
+                    return;
+                }
+                // **不在此处写入 trigger 槽**(原 Bug 根因):
+                // 旧实现先写一个"空壳 RemoteUserInfo"(devices=vec![]),下一帧
+                // `consume_device_picker_trigger` 立即 take 它、弹出空设备清单;
+                // 后续 fetch 完成后写回的完整 info 来不及被消费。改为 fetch
+                // 完成后再写入,确保弹窗拿到的是完整最新数据。
+                let cfg_for_fetch = cfg_snapshot.clone();
+                let trigger_slot = self.device_picker_trigger.clone();
+                // 状态栏引用带进后台任务 —— fetch 失败时用户必须看到
+                // 明确错误,而不是永远停在"正在拉取…"。
+                let status_for_fetch = self.status_message.clone();
+                tokio::spawn(async move {
+                    match crate::account::fetch_user_info(
+                        &cfg_for_fetch.remote_path,
+                        &cfg_for_fetch.account_key,
+                    )
+                    .await
+                    {
+                        Ok(info) => {
+                            // 验证设备清单完整性(bug 4 关联:进入弹窗前确认
+                            // 服务端返回有效数据,若有完整性问题记录但不阻塞)。
+                            if let Err(problems) =
+                                crate::account::validate_user_info_integrity(&info)
+                            {
+                                tracing::warn!(
+                                    "用户信息完整性问题: {problems}"
+                                );
+                            }
+                            tracing::info!(
+                                "重新绑定：用户信息拉取成功（{} 个设备），已请求弹出设备选择弹窗",
+                                info.devices.len()
+                            );
+                            if let Ok(mut guard) = trigger_slot.lock() {
+                                *guard = Some(DevicePickerTrigger {
+                                    user_info: info,
+                                    account_key: cfg_for_fetch.account_key.clone(),
+                                    remote_path: cfg_for_fetch.remote_path.clone(),
+                                    // 用户主动触发 —— consume 时跳过已绑定检查,
+                                    // 否则"已绑定状态下点重新绑定"会被静默丢弃。
+                                    force: true,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "设置面板点击绑定设备后重新拉取用户信息失败: {e}"
+                            );
+                            *status_for_fetch.lock().unwrap() = format!(
+                                "⚠️ 拉取设备清单失败：{e}"
+                            );
+                        }
+                    }
+                });
+                *self.status_message.lock().unwrap() =
+                    "📱 正在拉取最新设备清单…".to_string();
             }
         }
     }
@@ -1152,6 +1405,276 @@ impl TuiApp {
         }
     }
 
+    /// 消费后台任务塞进共享槽的设备选择触发信号（每帧 render 入口调用）。
+    ///
+    /// 触发条件由 main.rs 后台 fetch 任务判定：本地未绑定设备（DEVICE_NAME
+    /// 为空）且远端设备清单非空。这里消费时再次检查 `has_bound_device` ——
+    /// 从信号产生到消费之间用户可能已通过其他途径完成绑定，过期信号直接
+    /// 丢弃。`try_lock` 而非 `lock`：后台任务持锁窗口极短（写入一个
+    /// Option），偶发冲突只是这一帧不消费、下一帧再取，不值得阻塞渲染。
+    ///
+    /// 无论最终是否弹出设备选择弹框,都会把 `user_info` 缓存到
+    /// `cached_user_info` —— 设置面板点击「绑定设备」行时无需重新拉取。
+    ///
+    /// **force 语义**：`trigger.force=true`（用户点击「重新绑定」）时跳过
+    /// 已绑定检查 —— 用户主动要求重新选择设备,即使本地 DEVICE_NAME 已有
+    /// 值也必须弹窗。`force=false`（启动时后台自动触发）保持旧行为:仅在
+    /// 本地未绑定时弹窗。
+    fn consume_device_picker_trigger(&mut self) {
+        let Some(trigger) = self
+            .device_picker_trigger
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        else {
+            return;
+        };
+        // 缓存最新一次 fetch 结果(无论是否触发弹框)。
+        self.cached_user_info = Some(trigger.user_info.clone());
+        // 弹框已打开 → 丢弃弹框触发（缓存仍生效）。
+        if self.device_picker.is_some() {
+            tracing::debug!("device-picker trigger discarded: popup already open");
+            return;
+        }
+        let already_bound = self
+            .account_config
+            .read()
+            .map(|a| a.has_bound_device())
+            .unwrap_or(false);
+        if already_bound && !trigger.force {
+            // 仅自动触发(force=false)被已绑定检查拦截;用户主动触发
+            // (force=true,点击「重新绑定」)必须弹窗,否则出现
+            // "点击后无反应"的静默失败。
+            tracing::debug!(
+                "device-picker trigger discarded: already bound (auto trigger)"
+            );
+            return;
+        }
+        let device_count = trigger.user_info.devices.len();
+        tracing::info!(
+            "弹出设备选择弹窗（{} 个设备，force={}）",
+            device_count,
+            trigger.force
+        );
+        self.device_picker = Some(DevicePickerState {
+            user_info: trigger.user_info,
+            account_key: trigger.account_key,
+            remote_path: trigger.remote_path,
+            selected: 0,
+            button_focus: ConfirmChoice::Confirm,
+        });
+        *self.status_message.lock().unwrap() = if already_bound {
+            "📱 请选择要绑定的设备（重新绑定）".to_string()
+        } else {
+            "📱 请选择要绑定的设备（本地未配置 DEVICE_NAME）".to_string()
+        };
+    }
+
+    /// 设备选择弹框的键盘处理（弹框打开期间独占输入，见 `handle_key`
+    /// 入口的优先路由）。
+    async fn handle_device_picker_key(&mut self, event: InputEvent) {
+        match event {
+            InputEvent::Up | InputEvent::Char('k') => {
+                if let Some(p) = self.device_picker.as_mut() {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+            }
+            InputEvent::Down | InputEvent::Char('j') => {
+                if let Some(p) = self.device_picker.as_mut() {
+                    let max = p.user_info.devices.len().saturating_sub(1);
+                    if p.selected < max {
+                        p.selected += 1;
+                    }
+                }
+            }
+            // 左右箭头 —— 在底部确认/取消按钮之间切换。
+            InputEvent::Left | InputEvent::Right => {
+                if let Some(p) = self.device_picker.as_mut() {
+                    p.button_focus = p.button_focus.toggle();
+                }
+            }
+            // 空格/Enter —— 触发当前按钮。
+            InputEvent::Select => match self.device_picker.as_ref() {
+                Some(p) if p.button_focus == ConfirmChoice::Cancel => {
+                    self.device_picker = None;
+                    *self.status_message.lock().unwrap() =
+                        "已跳过设备绑定".to_string();
+                }
+                _ => {
+                    self.confirm_device_bind().await;
+                }
+            },
+            InputEvent::Quit => {
+                self.device_picker = None;
+                *self.status_message.lock().unwrap() =
+                    "已跳过设备绑定（重启程序后可重新触发）".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    /// 绑定当前选中的设备：调 `/api/device-bind`（bound=true），成功后把
+    /// `DEVICE_NAME` 写回内存 AccountConfig 并持久化到统一 env 文件
+    /// （增量 upsert，不动其他 section）。
+    ///
+    /// **切换绑定（bug 1 修复）**：如果本地 `DEVICE_NAME` 已指向另一台
+    /// 设备（`previous_device_name` ≠ 目标），**先**对原设备调
+    /// `bound=false`（解绑）再对新设备调 `bound=true`。两次调用必须
+    /// 都成功 —— 任一失败都保留弹框让用户重试，避免半完成状态。
+    ///
+    /// 失败（网络 / 服务端拒绝 / ok=false）时恢复弹框并保留选择位置，
+    /// 用户可重试或 Esc 跳过。
+    async fn confirm_device_bind(&mut self) {
+        let Some(picker) = self.device_picker.take() else {
+            return;
+        };
+        let Some(dev) = picker.user_info.devices.get(picker.selected) else {
+            // 下标越界（清单为空 / 数据异常）—— 防御性丢弃弹框。
+            return;
+        };
+        let target_device = dev.name.clone();
+        let user_id = picker.user_info.id.clone();
+        // 客户端上报的设备真实名称（即 tui 项目的 pc-name）。
+        // mini-oc-web `device_bind` 要求该字段必传（缺失返回 422），
+        // 服务端会写入设备条目的 `device-name` 字段 —— 该值与服务端
+        // 远端路径 `serv/opencode/{uid}/{pctype}/{device-name}/path-list`
+        // 的第三段一致。本机直接用 whoami 获取的 OS 用户名/主机名
+        // (`pcname()`)，与服务端注册清单的设备名对齐。
+        let client_device_name = crate::storage::paths::pcname();
+
+        // 读取本地当前绑定的设备名 —— 若与目标不同，需先解绑原设备
+        let previous_device_name = self
+            .account_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .device_name
+            .clone();
+        let need_unbind_first =
+            !previous_device_name.is_empty() && previous_device_name != target_device;
+
+        if need_unbind_first {
+            // 先解绑原设备
+            *self.status_message.lock().unwrap() = format!(
+                "⏳ 正在解绑原设备 {previous_device_name}…"
+            );
+            match bind_device(
+                &picker.remote_path,
+                &picker.account_key,
+                &user_id,
+                &previous_device_name,
+                &client_device_name,
+                crate::account::pctype(),
+                false,
+            )
+            .await
+            {
+                Ok(resp) if resp.ok => {
+                    // 继续走新设备绑定
+                }
+                Ok(_) => {
+                    *self.status_message.lock().unwrap() = format!(
+                        "⚠️ 解绑原设备 {previous_device_name} 失败：服务端返回 ok=false"
+                    );
+                    self.device_picker = Some(picker);
+                    return;
+                }
+                Err(AppError::NotFound) => {
+                    // **404 跳过**：原设备已不在服务端设备清单中（服务端
+                    // 数据已变更 / 设备被移除）。解绑一个不存在的设备没有
+                    // 意义 —— 跳过此步，直接继续绑定新设备，避免切换绑定
+                    // 被一个早已失效的本地 DEVICE_NAME 卡死。
+                    tracing::info!(
+                        "原设备 {previous_device_name} 已不在服务端清单（404），跳过解绑，直接绑定 {target_device}"
+                    );
+                    *self.status_message.lock().unwrap() = format!(
+                        "ℹ️ 原设备 {previous_device_name} 已不在服务端清单，跳过解绑"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("device-bind unbind-old failed: {e}");
+                    *self.status_message.lock().unwrap() = format!(
+                        "⚠️ 解绑原设备 {previous_device_name} 失败：{e}"
+                    );
+                    self.device_picker = Some(picker);
+                    return;
+                }
+            }
+        }
+
+        // 绑定目标设备（bound=true）。若目标设备已绑（dev.bound=true 且），
+        // 等价于保持绑定 —— 仍是 true。
+        *self.status_message.lock().unwrap() = format!(
+            "⏳ 正在绑定设备 {target_device}…"
+        );
+        match bind_device(
+            &picker.remote_path,
+            &picker.account_key,
+            &user_id,
+            &target_device,
+            &client_device_name,
+            crate::account::pctype(),
+            true,
+        )
+        .await
+        {
+            Ok(resp) if resp.ok => {
+                let mut cfg = self
+                    .account_config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                cfg.device_name = target_device.clone();
+                let write_result = cfg.write_env_file(&crate::config::unified_env_path());
+                *self.account_config.write().unwrap_or_else(|e| e.into_inner()) = cfg;
+                // 用绑定后的设备名重建远端客户端，让后续 path-list
+                // 推送立即切换到新格式路径
+                // serv/opencode/{user_id}/{pctype}/{device_name}/path-list。
+                if picker.user_info.sb.is_configured() {
+                    let remote = RemoteClient::from_user_info_v2(
+                        &picker.user_info,
+                        target_device.clone(),
+                        picker.user_info.sb.password.clone(),
+                    );
+                    self.store.with_remote(remote).await;
+                }
+                // 同步刷新 cached_user_info —— 让下次点击重新绑定时
+                // 显示的设备列表包含最新的 bound 状态（bug 4 修复）。
+                let mut updated_info = picker.user_info.clone();
+                for d in updated_info.devices.iter_mut() {
+                    if d.name == previous_device_name && need_unbind_first {
+                        d.bound = false;
+                    }
+                    if d.name == target_device {
+                        d.bound = true;
+                    }
+                }
+                self.cached_user_info = Some(updated_info);
+
+                *self.status_message.lock().unwrap() = match write_result {
+                    Ok(()) => format!(
+                        "✅ 设备绑定已切换到 {target_device}（DEVICE_NAME 已保存）"
+                    ),
+                    Err(e) => format!(
+                        "⚠️ 已绑定设备 {target_device}，但写入配置失败：{e}"
+                    ),
+                };
+            }
+            Ok(_) => {
+                // 服务端 2xx 但 ok=false —— 视为失败，恢复弹框供重试。
+                *self.status_message.lock().unwrap() = format!(
+                    "⚠️ 绑定设备 {target_device} 失败：服务端返回 ok=false"
+                );
+                self.device_picker = Some(picker);
+            }
+            Err(e) => {
+                tracing::warn!("device-bind failed: {e}");
+                *self.status_message.lock().unwrap() =
+                    format!("⚠️ 绑定设备 {target_device} 失败：{e}");
+                self.device_picker = Some(picker);
+            }
+        }
+    }
+
     fn set_sub_page_selected(&mut self, i: usize) {
         if let Some(sub) = &mut self.sub_page {
             match sub {
@@ -1164,38 +1687,35 @@ impl TuiApp {
     }
 
     fn open_settings(&mut self) {
-        let cfg = self.sb_config.read().unwrap_or_else(|e| e.into_inner()).clone();
-        self.sb_url_input = cfg.url;
-        self.sb_user_input = cfg.user;
-        self.sb_password_input = cfg.password;
-        let rc = self.rathole_config.read().unwrap_or_else(|e| e.into_inner()).clone();
-        self.rathole_host_input = rc.host;
-        self.rathole_port_input = rc.port;
-        self.rathole_name_input = rc.name;
-        self.rathole_token_input = rc.token;
+        // 从 AccountConfig 回填账户字段到 buffer。
+        // - account_id / remote_path 直接回填显示;
+        // - account_key 回填真实值但渲染层只显示掩码(`render_account_key_line`),
+        //   用户可直接在掩码上追加 / 退格编辑,不动直接保存 = 沿用原密钥。
+        let ac = self
+            .account_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let needs_first_setup = !ac.is_configured();
+        self.account_id_input = ac.account_id;
+        self.account_key_input = ac.account_key;
+        self.remote_path_input = if ac.remote_path.trim().is_empty() {
+            DEFAULT_REMOTE_PATH.to_string()
+        } else {
+            ac.remote_path.trim().trim_end_matches('/').to_string()
+        };
         let ports = PortsConfig::load();
         self.system_port_input = ports.system_port.to_string();
         self.opencode_port_input = ports.opencode_port.to_string();
-        // 把 auth 也回填到 buffer(密码 buffer 始终为空,要求用户重新输入才能改)。
-        // 用户名 buffer 直接显示当前值,首次启动时是空字符串。
-        let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let needs_first_setup = auth.basic_user.is_empty() || auth.basic_password.is_empty();
-        self.username_input = auth.basic_user;
-        self.password_input.clear();
-        // 回显 PASSWORD 行:把"已保存密码长度"作为底限星号数记录到
-        // `auth_password_mask_len`,真实密码内容不回填到 buffer —— 用户
-        // 看到对应位数 *,但不动 buffer 直接保存时 `submit_settings` 会
-        // 因为 buffer 空而保留原密码,不会把 * 当成新密码提交。
-        self.auth_password_mask_len = auth.basic_password.chars().count();
-        // 首启自动聚焦用户名,后续打开聚焦系统端口。
+        // 首启自动聚焦账户ID,后续打开聚焦系统端口(锁定行,等价"无焦点")。
         self.input_mode = if needs_first_setup {
-            InputMode::SettingsAuthUsername
+            InputMode::SettingsAccountId
         } else {
             InputMode::SettingsHttpPort
         };
         // 每次重开设置面板都从顶部开始;上次的滚动位置在重新打开时无意义。
-        // 否则:用户上次滚到 RatholeHost,关掉再开 → 仍滚到 RatholeHost →
-        // 但 USERNAME 隐藏在屏幕外,首次鼠标移动不会自动聚焦到顶部字段。
+        // 否则:用户上次滚到 OpenCode 端口,关掉再开 → 仍滚到底部 →
+        // 但账户ID 隐藏在屏幕外,首次鼠标移动不会自动聚焦到顶部字段。
         self.settings_scroll_offset = 0;
     }
 
@@ -1209,70 +1729,39 @@ impl TuiApp {
             InputEvent::PageUp => self.scroll_settings_up(5),
             InputEvent::PageDown => self.scroll_settings_down(5),
             InputEvent::Backspace => match self.input_mode {
-                InputMode::SettingsAuthUsername => {
-                    self.username_input.pop();
+                InputMode::SettingsAccountId => {
+                    self.account_id_input.pop();
                 }
-                InputMode::SettingsAuthPassword => {
-                    self.password_input.pop();
+                InputMode::SettingsAccountKey => {
+                    self.account_key_input.pop();
+                }
+                InputMode::SettingsRemotePath => {
+                    self.remote_path_input.pop();
                 }
                 InputMode::SettingsHttpPort => {
-                    self.system_port_input.pop();
+                    // 硬锁定:系统端口固定为 9465,即便 input_mode 被
+                    // 外部设到这里,Backspace 也不能修改 buffer。
                 }
                 InputMode::SettingsServePort => {
                     self.opencode_port_input.pop();
                 }
-                InputMode::SettingsUrl => {
-                    self.sb_url_input.pop();
-                }
-                InputMode::SettingsUser => {
-                    self.sb_user_input.pop();
-                }
-                InputMode::SettingsPassword => {
-                    self.sb_password_input.pop();
-                }
-                InputMode::SettingsRatholeHost => {
-                    self.rathole_host_input.pop();
-                }
-                InputMode::SettingsRatholePort => {
-                    self.rathole_port_input.pop();
-                }
-                InputMode::SettingsRatholeName => {
-                    self.rathole_name_input.pop();
-                }
-                InputMode::SettingsRatholeToken => {
-                    self.rathole_token_input.pop();
-                }
                 _ => {}
             },
             InputEvent::Char(c) => match self.input_mode {
-                InputMode::SettingsHttpPort if c.is_ascii_digit() => {
-                    if self.system_port_input.len() < 5 {
-                        self.system_port_input.push(c);
-                    }
-                }
+                // 硬锁定:系统端口固定为 9465,即便是 digit 也丢弃。
+                InputMode::SettingsHttpPort if c.is_ascii_digit() => {}
                 InputMode::SettingsServePort if c.is_ascii_digit() => {
                     if self.opencode_port_input.len() < 5 {
                         self.opencode_port_input.push(c);
                     }
                 }
-                InputMode::SettingsAuthUsername => self.username_input.push(c),
-                InputMode::SettingsAuthPassword => self.password_input.push(c),
-                InputMode::SettingsUrl => self.sb_url_input.push(c),
-                InputMode::SettingsUser => self.sb_user_input.push(c),
-                InputMode::SettingsPassword => self.sb_password_input.push(c),
-                InputMode::SettingsRatholeHost => self.rathole_host_input.push(c),
-                InputMode::SettingsRatholePort if c.is_ascii_digit() => {
-                    if self.rathole_port_input.len() < 5 {
-                        self.rathole_port_input.push(c);
-                    }
-                }
-                InputMode::SettingsRatholePort => {}
-                InputMode::SettingsRatholeName => self.rathole_name_input.push(c),
-                InputMode::SettingsRatholeToken => self.rathole_token_input.push(c),
+                InputMode::SettingsAccountId => self.account_id_input.push(c),
+                InputMode::SettingsAccountKey => self.account_key_input.push(c),
+                InputMode::SettingsRemotePath => self.remote_path_input.push(c),
                 _ => {}
             },
             // 粘贴:把 payload 追加到当前字段 buffer。端口字段只接受数字,
-            // RatholePort 同理;payload 中的非数字字符会被静默丢弃。
+            // payload 中的非数字字符会被静默丢弃。
             //
             // 这里不直接吞 arboard —— 因为 Ctrl+V 已经由 events.rs
             // 转成 Paste(String::new()) 而非真实文本。空 payload 时
@@ -1301,10 +1790,11 @@ impl TuiApp {
 
     /// 把粘贴文本按字段规则追加到当前编辑焦点的 buffer。
     ///
-    /// - 普通文本字段(`Settings*` 除端口外):整段追加。
-    /// - 端口字段(`SettingsHttpPort` / `SettingsServePort` /
-    ///   `SettingsRatholePort`):只接受 ASCII 数字,其它字符丢弃,
-    ///   并把总长度限制在 5 位以内(避免 `65535000` 这类越界输入)。
+    /// - 普通文本字段(账户ID / 密钥 / 远程路径):整段追加。
+    /// - OpenCode 端口字段(`SettingsServePort`):只接受 ASCII 数字,
+    ///   其它字符丢弃,并把总长度限制在 5 位以内(避免 `65535000` 这类
+    ///   越界输入)。系统端口(`SettingsHttpPort`)已强制锁定为 9465,
+    ///   本函数对其 early return,不接受任何粘贴。
     ///
     /// 真正的过滤/截断逻辑放在自由函数 [`apply_paste_to_buffer`] 里,
     /// 以便单测;本方法只负责把对应 buffer 拿出来 / 写回去。
@@ -1312,59 +1802,42 @@ impl TuiApp {
         if text.is_empty() {
             return;
         }
+        // 系统端口(`SettingsHttpPort`)强制锁定为 9465 —— 即使
+        // `input_mode` 被外部设到该值,粘贴也不能修改 `system_port_input`。
+        // 这是"硬锁定"的输入路径防御:UI 已经不让用户进入该字段,
+        // 但万一有遗留状态/未来代码走到这里,粘贴也无效。
+        if self.input_mode == InputMode::SettingsHttpPort {
+            return;
+        }
         match self.input_mode {
-            InputMode::SettingsHttpPort => {
-                self.system_port_input =
-                    apply_paste_to_buffer(self.input_mode, &self.system_port_input, text);
+            InputMode::SettingsAccountId => {
+                self.account_id_input =
+                    apply_paste_to_buffer(self.input_mode, &self.account_id_input, text);
+            }
+            InputMode::SettingsAccountKey => {
+                self.account_key_input =
+                    apply_paste_to_buffer(self.input_mode, &self.account_key_input, text);
+            }
+            InputMode::SettingsRemotePath => {
+                self.remote_path_input =
+                    apply_paste_to_buffer(self.input_mode, &self.remote_path_input, text);
             }
             InputMode::SettingsServePort => {
                 self.opencode_port_input =
                     apply_paste_to_buffer(self.input_mode, &self.opencode_port_input, text);
             }
-            InputMode::SettingsRatholePort => {
-                self.rathole_port_input =
-                    apply_paste_to_buffer(self.input_mode, &self.rathole_port_input, text);
+            InputMode::SettingsHttpPort | InputMode::Menu => {
+                // 不可达:上面 early return 已处理 HttpPort;Menu 为
+                // 防御性分支。保留以让 match 覆盖全部 InputMode。
             }
-            InputMode::SettingsAuthUsername => {
-                self.username_input =
-                    apply_paste_to_buffer(self.input_mode, &self.username_input, text);
-            }
-            InputMode::SettingsAuthPassword => {
-                self.password_input =
-                    apply_paste_to_buffer(self.input_mode, &self.password_input, text);
-            }
-            InputMode::SettingsUrl => {
-                self.sb_url_input =
-                    apply_paste_to_buffer(self.input_mode, &self.sb_url_input, text);
-            }
-            InputMode::SettingsUser => {
-                self.sb_user_input =
-                    apply_paste_to_buffer(self.input_mode, &self.sb_user_input, text);
-            }
-            InputMode::SettingsPassword => {
-                self.sb_password_input =
-                    apply_paste_to_buffer(self.input_mode, &self.sb_password_input, text);
-            }
-            InputMode::SettingsRatholeHost => {
-                self.rathole_host_input =
-                    apply_paste_to_buffer(self.input_mode, &self.rathole_host_input, text);
-            }
-            InputMode::SettingsRatholeName => {
-                self.rathole_name_input =
-                    apply_paste_to_buffer(self.input_mode, &self.rathole_name_input, text);
-            }
-            InputMode::SettingsRatholeToken => {
-                self.rathole_token_input =
-                    apply_paste_to_buffer(self.input_mode, &self.rathole_token_input, text);
-            }
-            InputMode::Menu => {}
         }
     }
 
-    /// 在 9 个设置字段之间循环切换（delta = +1 下移 / -1 上移）。
+    /// 在设置字段之间循环切换（delta = +1 下移 / -1 上移）。
     ///
     /// 找不到当前位置时（理论上不会发生，因为 `open_settings` 总是从
-    /// `SETTINGS_FIELDS[0]` 开始），兜底回到第一个字段。
+    /// `SETTINGS_FIELDS[0]` 或锁定的 `SettingsHttpPort` 开始），兜底回到
+    /// 第一个字段。
     fn move_settings_field(&mut self, delta: i32) {
         let len = SETTINGS_FIELDS.len() as i32;
         let cur = SETTINGS_FIELDS
@@ -1375,72 +1848,57 @@ impl TuiApp {
         self.input_mode = SETTINGS_FIELDS[next as usize];
     }
 
+    /// 提交设置：账户字段校验 → 端口校验 → `/api/user/info` 拉取账户信息 →
+    /// 热更新 auth / storage remote → 写 AccountConfig + 端口到 env 文件。
+    ///
+    /// 任一步失败都保持弹框打开并把焦点切回对应字段，与旧版语义一致。
     async fn submit_settings(&mut self) {
-        // ---- 0. 认证字段校验（首启必须填写）----
-        // 用户名从 auth 内存读到的 buffer;密码 buffer 永远从空开始,需
-        // 要用户重新输入才能修改。`is_first_setup` 强制要求密码 buffer
-        // 非空（即用户在本次会话内实际输入过密码）。
-        let auth_user_now = self
-            .auth
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .basic_user
-            .clone();
-        let auth_pass_now = self
-            .auth
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .basic_password
-            .clone();
-        let username_from_buffer = self.username_input.trim().to_string();
-        let password_from_buffer = self.password_input.clone();
-        // 最终生效的 username:buffer 优先(buffer 可能用户改了);password
-        // 必须 buffer 非空才采用,否则保持 auth 内存里原值。
-        let final_username = if username_from_buffer.is_empty() {
-            auth_user_now.clone()
-        } else {
-            username_from_buffer.clone()
-        };
-        if final_username.is_empty() {
+        // ---- 0. 账户字段校验 ----
+        let account_id = self.account_id_input.trim().to_string();
+        if account_id.is_empty() {
             *self.status_message.lock().unwrap() =
-                "❌ 必须填写 OPENCODE_SERVER_USERNAME".to_string();
-            self.input_mode = InputMode::SettingsAuthUsername;
+                "❌ 必须填写 账户ID".to_string();
+            self.input_mode = InputMode::SettingsAccountId;
             return;
         }
-        let final_password = if password_from_buffer.is_empty() {
-            auth_pass_now.clone()
-        } else {
-            password_from_buffer.clone()
-        };
-        if final_password.is_empty() {
+        // 密钥 buffer 在 open_settings 时回填了已保存值;为空说明既没有
+        // 已保存密钥、用户也没输入 —— 必须填写。
+        let account_key = self.account_key_input.clone();
+        if account_key.trim().is_empty() {
             *self.status_message.lock().unwrap() =
-                "❌ 必须填写 OPENCODE_SERVER_PASSWORD（密码 buffer 必须输入才能改）".to_string();
-            self.input_mode = InputMode::SettingsAuthPassword;
+                "❌ 必须填写 密钥".to_string();
+            self.input_mode = InputMode::SettingsAccountKey;
             return;
         }
-        // 立即把认证写回内存(供当前进程的 axum / OpenCodeClient 立即使用)
-        {
-            let mut guard = self.auth.write().unwrap_or_else(|e| e.into_inner());
-            guard.basic_user = final_username.clone();
-            guard.basic_password = final_password.clone();
+        // 远程路径：空 → 默认 https://oc.isoops.com；必须 http(s):// 开头。
+        let remote_path = {
+            let raw = self.remote_path_input.trim().trim_end_matches('/');
+            if raw.is_empty() {
+                DEFAULT_REMOTE_PATH.trim_end_matches('/').to_string()
+            } else {
+                raw.to_string()
+            }
+        };
+        if AccountConfig::validate_remote_path(&remote_path).is_err() {
+            *self.status_message.lock().unwrap() =
+                "❌ 远程路径必须以 http:// 或 https:// 开头".to_string();
+            self.input_mode = InputMode::SettingsRemotePath;
+            return;
         }
 
         // ---- 1. 端口校验 ----
-        let system_port_str = self.system_port_input.trim().to_string();
+        // 系统端口(`OC_SERVE_SYSTEM_PORT`)由产品需求强制锁定为 9465:
+        // 不接受用户 buffer(`system_port_input`),即便调用方绕过 UI 写入
+        // 任何值,最终落盘的也必须是 9465。这是"硬锁定"的最终防线。
+        let system_port_str = crate::config::DEFAULT_SYSTEM_PORT.to_string();
+        let system_port: u16 = crate::config::DEFAULT_SYSTEM_PORT;
         let opencode_port_str = self.opencode_port_input.trim().to_string();
-        let system_port = match system_port_str.parse::<u16>() {
-            Ok(p) if p > 0 => p,
-            _ => {
-                *self.status_message.lock().unwrap() =
-                    "❌ 系统端口无效（1-65535）".to_string();
-                return;
-            }
-        };
         let opencode_port = match opencode_port_str.parse::<u16>() {
             Ok(p) if p > 0 => p,
             _ => {
                 *self.status_message.lock().unwrap() =
                     "❌ OpenCode 服务端口无效（1-65535）".to_string();
+                self.input_mode = InputMode::SettingsServePort;
                 return;
             }
         };
@@ -1451,136 +1909,119 @@ impl TuiApp {
             return;
         }
 
-        // ---- 2. Rathole 配置：校验 + 生成 global.toml ----
-        let rc = RatholeConfig {
-            host: self.rathole_host_input.trim().to_string(),
-            port: self.rathole_port_input.trim().to_string(),
-            name: self.rathole_name_input.trim().to_string(),
-            token: self.rathole_token_input.clone(),
+        // ---- 2. 调 /api/user/info 获取用户信息 ----
+        // account_key 即身份凭证：接口成功 = 密钥有效；失败（网络 / 401 /
+        // 4xx）都不落盘，弹框保留。
+        let user_info = match fetch_user_info(&remote_path, &account_key).await {
+            Ok(u) => u,
+            Err(e) => {
+                *self.status_message.lock().unwrap() =
+                    format!("❌ 获取账户信息失败：{e}");
+                return;
+            }
         };
-        let rc_filled = [&rc.host, &rc.port, &rc.name, &rc.token]
-            .iter()
-            .all(|s| !s.is_empty());
-        let rc_empty = [&rc.host, &rc.port, &rc.name, &rc.token]
-            .iter()
-            .all(|s| s.is_empty());
-        if !rc_filled && !rc_empty {
-            *self.status_message.lock().unwrap() =
-                "❌ Rathole 配置需全部填写或全部留空".to_string();
-            return;
-        }
-        let mut rathole_msg = String::new();
-        if rc_filled {
-            let ok_port = rc.port.parse::<u16>().map(|p| p > 0).unwrap_or(false);
-            if !ok_port {
-                *self.status_message.lock().unwrap() =
-                    "❌ Rathole Port 无效（1-65535）".to_string();
-                return;
-            }
-            // local_addr 端口优先用本次保存的 opencode_port,其次用当前 supervisor
-            // 状态,再次 fallback 硬编码 9464。
-            let local_port = opencode_port.to_string();
-            let rathole_cfg_path = crate::config::rathole_config_path();
-            if let Err(e) = rc.write_config_file(&rathole_cfg_path, &local_port) {
-                *self.status_message.lock().unwrap() =
-                    format!("❌ 生成 global.toml 失败：{e}");
-                return;
-            }
-            *self.rathole_config.write().unwrap_or_else(|e| e.into_inner()) = rc.clone();
-            rathole_msg = format!("Rathole → {}:{}", self.rathole_host_input, self.rathole_port_input);
-        }
 
-        // ---- 3. SB 配置：连接测试 ----
-        let cfg = SbConfig {
-            url: self.sb_url_input.trim().to_string(),
-            user: self.sb_user_input.trim().to_string(),
-            password: self.sb_password_input.clone(),
-        };
-        let sb_filled = !cfg.url.is_empty() && !cfg.user.is_empty() && !cfg.password.is_empty();
-        let sb_empty = cfg.url.is_empty() && cfg.user.is_empty() && cfg.password.is_empty();
-        if !sb_filled && !sb_empty {
-            *self.status_message.lock().unwrap() =
-                "❌ SilverBullet 配置需全部填写或全部留空".to_string();
-            return;
-        }
+        // ---- 3. 从用户信息提取 sb config → 更新 storage 的 RemoteClient ----
+        // sb 凭据(base_url / username / password)后台热更新 store 并刷新
+        // path-list;结果写日志面板,不阻塞提交流程。sb 凭据不再本地
+        // 持久化 —— 每次启动由 main.rs 调 /api/user/info 重新下发。
+        let sb_filled = !user_info.sb.base_url.trim().is_empty()
+            && !user_info.sb.username.trim().is_empty()
+            && !user_info.sb.password.is_empty();
         let mut sb_msg = String::new();
         if sb_filled {
-            let mut remote = RemoteClient::with_credentials(
-                cfg.url.clone(),
-                cfg.user.clone(),
-                cfg.password.clone(),
-            );
-            let path = RemotePaths::new(cfg.user.as_str()).path_list_with_slash();
-            let test_result = remote.get(&path).await;
-            let connected = matches!(&test_result, Ok((status, _)) if (200..400).contains(status));
-            if !connected {
-                let base = match &test_result {
-                    Ok((0, _)) => "❌ 连接测试失败：无法访问远端（网络/超时），未保存".to_string(),
-                    Ok((status, _)) => format!("❌ 连接测试失败：HTTP {status}，未保存"),
-                    Err(e) => format!("❌ 连接测试失败：{e}，未保存"),
-                };
-                let msg = if rathole_msg.is_empty() {
-                    base
-                } else {
-                    format!("{base}（但 {rathole_msg} 已保存）")
-                };
-                *self.status_message.lock().unwrap() = msg;
-                return;
-            }
-            sb_msg = format!("SB → {}", cfg.url);
-            {
-                let mut guard = self.sb_config.write().unwrap_or_else(|e| e.into_inner());
-                guard.url = cfg.url.clone();
-                guard.user = cfg.user.clone();
-                guard.password = cfg.password.clone();
-            }
             let store = self.store.clone();
-            let store_cfg = cfg.clone();
+            let info_for_sb = user_info.clone();
+            // 设备名取当前 AccountConfig（未绑定时为空 —— RemotePaths
+            // 构造阶段回退 OS 用户名，路径仍然良构）。
+            let device_name = self
+                .account_config
+                .read()
+                .map(|c| c.device_name.clone())
+                .unwrap_or_default();
             tokio::spawn(async move {
-                let remote = RemoteClient::with_credentials(
-                    store_cfg.url,
-                    store_cfg.user,
-                    store_cfg.password,
+                let remote = RemoteClient::from_user_info_v2(
+                    &info_for_sb,
+                    device_name,
+                    info_for_sb.sb.password.clone(),
                 );
                 store.with_remote(remote).await;
                 if let Err(e) = store.refresh().await {
                     tracing::warn!("settings refresh failed: {e}");
                 }
             });
+            sb_msg = format!("SB → {}", user_info.sb.base_url);
         }
 
-        // ---- 4. 读现有 env -> 改 port -> 整文件回写 ----
+        // ---- 4. 更新 auth（basic_user = user.name，缺失回退 user.id，
+        //      再回退账户ID；密码取 sb.password，sb 未下发时回退账户密钥）
+        //      → 同步填充 username/password buffer ----
+        let basic_user = {
+            let display = user_info.display_name();
+            if !display.is_empty() {
+                display
+            } else if !user_info.id.trim().is_empty() {
+                user_info.id.trim().to_string()
+            } else {
+                account_id.clone()
+            }
+        };
+        let basic_password = if user_info.sb.password.is_empty() {
+            account_key.clone()
+        } else {
+            user_info.sb.password.clone()
+        };
+        self.username_input = basic_user.clone();
+        self.password_input = basic_password.clone();
+        // 从账户信息填充时记录"已保存密码长度"（状态栏展示用，不回显明文）。
+        self.auth_password_mask_len = basic_password.chars().count();
+        // 立即把认证写回内存(供当前进程的 axum / OpenCodeClient 立即使用)
+        {
+            let mut guard = self.auth.write().unwrap_or_else(|e| e.into_inner());
+            guard.basic_user = basic_user.clone();
+            guard.basic_password = basic_password.clone();
+        }
+
+        // ---- 5. 持久化（增量 upsert，不再整文件覆盖）----
+        // - 账户：ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH / DEVICE_NAME（write_env_file）；
+        // - auth：OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD（账户信息自动填充）；
+        // - 端口：OC_SERVE_SYSTEM_PORT（硬锁定 9465）/ OC_SERVE_OPENCODE_PORT。
+        // rathole 配置由账户信息中的 sb config 替代,面板不再收集;
+        // env 中已有的其他 section 原样保留(增量写入互不覆盖)。
         let env_path = crate::config::unified_env_path();
-        let mut persisted = read_persisted_env(&env_path);
-        // 保留当前进程里已经配置好的 username/password（首次配置表单写过）
-        // 与 SB / Rathole / cookie_name（已校验通过）
-        if persisted.username.is_empty() {
-            let guard = self.auth.read().unwrap_or_else(|e| e.into_inner());
-            persisted.username = guard.basic_user.clone();
+        let device_name = self
+            .account_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .device_name
+            .clone();
+        let account_cfg = AccountConfig {
+            account_id: account_id.clone(),
+            account_key: account_key.clone(),
+            remote_path: remote_path.clone(),
+            device_name,
+        };
+        let mut write_result = account_cfg.write_env_file(&env_path);
+        if write_result.is_ok() {
+            write_result = upsert_env_keys(
+                &env_path,
+                &[
+                    ("OPENCODE_SERVER_USERNAME".to_string(), Some(basic_user.clone())),
+                    ("OPENCODE_SERVER_PASSWORD".to_string(), Some(basic_password.clone())),
+                    (
+                        crate::config::keys::SYSTEM_PORT.to_string(),
+                        Some(system_port_str.clone()),
+                    ),
+                    (
+                        crate::config::keys::OPENCODE_PORT.to_string(),
+                        Some(opencode_port_str.clone()),
+                    ),
+                ],
+            );
         }
-        if persisted.password.is_empty() {
-            let guard = self.auth.read().unwrap_or_else(|e| e.into_inner());
-            persisted.password = guard.basic_password.clone();
-        }
-        if persisted.sb_cookie_name.is_none() {
-            persisted.sb_cookie_name = self
-                .auth
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .sb_cookie_name
-                .clone();
-        }
-        if sb_filled {
-            persisted.sb = cfg.clone();
-        }
-        if rc_filled {
-            persisted.rathole = rc.clone();
-        }
-        persisted.system_port = system_port_str;
-        persisted.opencode_port = opencode_port_str;
 
-        let write_result = write_persisted_env(&env_path, &persisted);
-
+        // ---- 6. 更新内存 AccountConfig + 关闭弹框 + 状态消息 ----
+        *self.account_config.write().unwrap_or_else(|e| e.into_inner()) = account_cfg;
         self.input_mode = InputMode::Menu;
         // 同步清掉 settings 弹框 rect,与 SettingsCancel / Esc 关闭路径对称。
         // 之前 submit_settings 只切 input_mode,忘记清 rect,导致下一帧
@@ -1589,22 +2030,25 @@ impl TuiApp {
         let port_msg = format!(
             "系统={system_port} OpenCode={opencode_port}（重启生效）"
         );
-        let final_msg = match (sb_msg.is_empty(), rathole_msg.is_empty()) {
-            (true, true) => port_msg,
-            (false, true) => format!("{port_msg}；{sb_msg}"),
-            (true, false) => format!("{port_msg}；{rathole_msg}"),
-            (false, false) => format!("{port_msg}；{sb_msg}；{rathole_msg}"),
+        let account_msg = format!("账户 → {account_id}@{remote_path}");
+        let final_msg = if sb_msg.is_empty() {
+            format!("{port_msg}；{account_msg}")
+        } else {
+            format!("{port_msg}；{account_msg}；{sb_msg}")
         };
         *self.status_message.lock().unwrap() = match write_result {
             Ok(()) => format!("✅ {final_msg}"),
             Err(e) => format!("⚠️ {final_msg}（写文件失败：{e}）"),
         };
-        if sb_filled {
-            self.verify_remote();
-        }
     }
 
     async fn handle_key(&mut self, event: InputEvent) {
+        // 设备选择弹框打开期间独占键盘输入（优先级最高，避免与 confirm /
+        // settings / 主菜单抢键）。
+        if self.device_picker.is_some() {
+            self.handle_device_picker_key(event).await;
+            return;
+        }
         // 在 dispatch 前先把后台异步任务的"端口占用"信号转成 confirm 弹框。
         // 见 `maybe_show_port_busy_confirm` 的注释。
         self.maybe_show_port_busy_confirm();
@@ -1660,6 +2104,9 @@ impl TuiApp {
             match event {
                 InputEvent::Quit | InputEvent::Char('q') | InputEvent::Char('l') => {
                     self.show_full_log = false;
+                    self.log_select_anchor = None;
+                    self.log_select_current = None;
+                    self.full_log_notice = None;
                 }
                 InputEvent::Up | InputEvent::Char('k') => {
                     self.log_scroll = self.log_scroll.saturating_add(1);
@@ -1702,6 +2149,9 @@ impl TuiApp {
             InputEvent::Char('l') | InputEvent::Char('L') => {
                 self.show_full_log = true;
                 self.log_scroll = 0;
+                self.log_select_anchor = None;
+                self.log_select_current = None;
+                self.full_log_notice = None;
             }
             InputEvent::Char('s') | InputEvent::Char('S') => self.open_settings(),
             InputEvent::Quit | InputEvent::Char('q') => {
@@ -1901,7 +2351,7 @@ impl TuiApp {
                 if self.status_snapshot().rathole_pid.is_some() {
                     self.stop_rathole();
                 } else {
-                    self.launch_rathole();
+                    self.launch_cloud_service();
                 }
             }
             MenuAction::EnterProjects => self.enter_projects_flow().await,
@@ -1955,16 +2405,21 @@ impl TuiApp {
         });
     }
 
-    fn launch_rathole(&mut self) {
+    /// 启动 OpenCode 云服务：自动先启单体，再叠 rathole。
+    /// 三段状态消息：单体失败 / rathole 失败（单体已启不回滚）/ 成功。
+    fn launch_cloud_service(&mut self) {
         let status = self.status_message.clone();
-        *status.lock().unwrap() = "🚀 正在启动 rathole…".to_string();
+        *status.lock().unwrap() = "🚀 正在启动 OpenCode 云服务…".to_string();
+        let port = crate::config::PortsConfig::load().opencode_port;
         let bin = rathole_default_bin();
         let config = rathole_default_config();
         let supervisor = self.supervisor.clone();
         tokio::spawn(async move {
-            let msg = match supervisor.launch_rathole(&bin, &config).await {
-                Ok(pid) => format!("✅ rathole 已启动，PID={pid}"),
-                Err(e) => format!("❌ rathole 启动失败：{e}"),
+            let msg = match supervisor.launch_cloud_service(port, &bin, &config).await {
+                Ok((oc_pid, rt_pid)) => format!(
+                    "✅ 云服务已启动：单体 PID={oc_pid}, rathole PID={rt_pid}"
+                ),
+                Err(e) => format!("❌ 云服务启动失败：{e}"),
             };
             *status.lock().unwrap() = msg;
         });
@@ -2162,22 +2617,107 @@ impl TuiApp {
     // --- 「OC 项目」子页面处理 ---
 
     async fn enter_projects(&mut self) {
-        let _ = self.store.refresh().await;
-        let projects = self.store.list().await.unwrap_or_default();
+        *self.status_message.lock().unwrap() = "📡 正在从远端加载项目清单...".to_string();
+
+        let projects = match self.fetch_remote_projects_only().await {
+            Ok(projects) => projects,
+            Err(e) => {
+                *self.status_message.lock().unwrap() =
+                    format!("⚠️ 加载远程项目清单失败: {e}");
+                return; // 远端失败时不进入项目列表视图(用户可重试)
+            }
+        };
+
+        let count = projects.len();
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         self.sub_page = Some(SubPage::Projects { list_state, projects });
+        *self.status_message.lock().unwrap() = format!("📡 已从远端加载 {count} 个项目");
+    }
+
+    /// 强制从远端拉取项目清单(不读本地、不合并、不缓存)。
+    ///
+    /// 必须 PathListStore 已通过 `with_remote` 配置了 RemoteClient。
+    /// 每次进入 OC 项目入口都直接调 `remote.get()`,确保数据为最新;
+    /// 不走 `store.refresh()`(refresh 会先读本地 cache 并回写)。
+    /// 失败返回 Err(AppError::Internal)。
+    async fn fetch_remote_projects_only(&self) -> Result<Vec<PathEntry>, AppError> {
+        let Some(mut remote) = self.store.remote_client().await else {
+            return Err(AppError::Internal(
+                "远程存储未配置（需要先完成账户登录 + fetch_user_info）".to_string(),
+            ));
+        };
+
+        // 路径与推送侧保持一致：RemoteClient 携带 user_id 时走新格式
+        // serv/opencode/{user_id}/{pctype}/{device_name}/path-list，
+        // 否则回退 sb 用户名的 legacy 布局。未配置用户标识则拒绝。
+        let has_identity = remote
+            .user_id
+            .as_deref()
+            .is_some_and(|u| !u.is_empty())
+            || remote.user.as_deref().is_some_and(|u| !u.is_empty());
+        if !has_identity {
+            return Err(AppError::Internal("远程用户标识为空".to_string()));
+        }
+
+        let path = remote.remote_paths()?.path_list_with_slash();
+        let (status, body) = match remote.get(&path).await {
+            Ok(pair) => pair,
+            Err(e) => return Err(AppError::Internal(format!("远端请求失败: {e}"))),
+        };
+
+        if status == 0 {
+            return Err(AppError::Internal("网络错误：无法访问远端".to_string()));
+        }
+        if status >= 400 && status != 404 {
+            return Err(AppError::Internal(format!("远端返回 HTTP {status}")));
+        }
+        // 404 = 远端 path-list 尚未创建 → 空列表(与 refresh 的空远端语义一致)。
+        if status == 404 {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = parse_path_entries_from_json(&body)?;
+        // 与 refresh 的展示排序保持一致:最近打开的在前。
+        entries.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+
+        // 注:完全不读、不写本地 cache
+        Ok(entries)
     }
 
     async fn enter_sessions(&mut self, project: String) {
         let client = self.build_oc_client();
-        let sessions = match client.list_sessions(&project).await {
-            Ok(s) => s,
+        let fetched = client.list_sessions(&project).await;
+        let (sessions, sync_ok) = match fetched {
+            Ok(s) => {
+                // 选已有项目：把 opencode serve 读出的 sessions 整理后
+                // 汇总上传到远端 path-list（一次合并、一次推送）。
+                let now = chrono::Local::now().with_timezone(chrono::Local::now().offset());
+                let domain_sessions: Vec<crate::domain::Session> = s
+                    .iter()
+                    .map(|oc| {
+                        let title = oc.title.clone().unwrap_or_else(|| {
+                            format!("session-{}", &oc.id[..oc.id.len().min(8)])
+                        });
+                        crate::domain::Session::new(&oc.id, title, &project, now)
+                    })
+                    .collect();
+                let sync_ok = s.is_empty()
+                    || self
+                        .store
+                        .sync_project_sessions(&project, &domain_sessions)
+                        .await
+                        .is_ok();
+                (s, sync_ok)
+            }
             Err(e) => {
                 *self.status_message.lock().unwrap() = format!("⚠️ 拉取会话失败：{e}");
-                Vec::new()
+                (Vec::new(), false)
             }
         };
+        if !sync_ok {
+            tracing::warn!(target: "tui", "汇总上传 sessions 到远端 path-list 失败：{project}");
+        }
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         self.sub_page = Some(SubPage::Sessions { project, list_state, sessions });
@@ -2188,7 +2728,15 @@ impl TuiApp {
         *self.status_message.lock().unwrap() = "🚀 正在创建会话…".to_string();
         match client.create_session(&project).await {
             Ok(sid) => {
-                let _ = self.store.append_session(&project, &sid).await;
+                let now = chrono::Local::now().with_timezone(chrono::Local::now().offset());
+                let short_id = &sid[..sid.len().min(8)];
+                let session = crate::domain::Session::new(
+                    &sid,
+                    format!("session-{short_id}"),
+                    &project,
+                    now,
+                );
+                let _ = self.store.append_session(&project, &session).await;
                 let _ = self.store.touch_path(&project).await;
                 self.trigger_attach(project, sid);
             }
@@ -2204,7 +2752,15 @@ impl TuiApp {
         *self.status_message.lock().unwrap() = "🚀 正在创建会话（新窗口模式）…".to_string();
         match client.create_session(&project).await {
             Ok(sid) => {
-                let _ = self.store.append_session(&project, &sid).await;
+                let now = chrono::Local::now().with_timezone(chrono::Local::now().offset());
+                let short_id = &sid[..sid.len().min(8)];
+                let session = crate::domain::Session::new(
+                    &sid,
+                    format!("session-{short_id}"),
+                    &project,
+                    now,
+                );
+                let _ = self.store.append_session(&project, &session).await;
                 let _ = self.store.touch_path(&project).await;
                 self.trigger_attach_window(project, sid).await;
             }
@@ -2305,6 +2861,12 @@ impl TuiApp {
         match PathValidator::validate(trimmed) {
             Ok(path) => {
                 let _ = self.store.upsert_path(&path).await;
+                // 选新项目：在远端创建空结构（sections=[]），同步执行
+                // 让用户立刻知道是否成功。
+                if let Err(e) = self.store.create_remote_path(&path).await {
+                    *self.status_message.lock().unwrap() =
+                        format!("⚠️ 远端创建空结构失败：{e}");
+                }
                 self.enter_sessions(path).await;
             }
             Err(e) => {
@@ -2648,6 +3210,11 @@ impl TuiApp {
         match choose_folder().await {
             Ok(path) => {
                 let _ = self.store.upsert_path(&path).await;
+                // 选新项目：在远端创建空结构（sections=[]）。
+                if let Err(e) = self.store.create_remote_path(&path).await {
+                    *self.status_message.lock().unwrap() =
+                        format!("⚠️ 远端创建空结构失败：{e}");
+                }
                 self.enter_sessions(path).await;
             }
             Err(e) => {
@@ -2666,12 +3233,18 @@ impl TuiApp {
         match item {
             MenuItem::OcServe => vec![
                 Line::from(Span::styled(title, title_style)),
-                Line::from(Span::styled("启动 opencode serve 服务", desc_style)),
+                Line::from(Span::styled(
+                    "启动单体 OpenCode 服务(直接监听本机端口)",
+                    desc_style,
+                )),
                 Line::from(Span::styled(Self::item_status_line(item, status), status_style)),
             ],
             MenuItem::Rathole => vec![
                 Line::from(Span::styled(title, title_style)),
-                Line::from(Span::styled("启动 rathole 内网穿透", desc_style)),
+                Line::from(Span::styled(
+                    "启动 OpenCode 云服务(自动先启单体,再叠 rathole)",
+                    desc_style,
+                )),
                 Line::from(Span::styled(Self::item_status_line(item, status), status_style)),
             ],
             MenuItem::OcProjects => vec![
@@ -2692,16 +3265,16 @@ impl TuiApp {
         match item {
             MenuItem::OcServe => {
                 if status.opencode_pid.is_some() {
-                    "⏹ 停止 OpenCode Serve".to_string()
+                    "⏹ 停止单体 OpenCode 服务".to_string()
                 } else {
-                    "🚀 启动 OpenCode Serve".to_string()
+                    "🚀 启动单体 OpenCode 服务".to_string()
                 }
             }
             MenuItem::Rathole => {
                 if status.rathole_pid.is_some() {
-                    "⏹ 停止 Rathole 隧道".to_string()
+                    "⏹ 停止 OpenCode 云服务".to_string()
                 } else {
-                    "🚀 启动 Rathole 隧道".to_string()
+                    "🚀 启动 OpenCode 云服务".to_string()
                 }
             }
             MenuItem::OcProjects => "📂 OC 项目".to_string(),
@@ -2709,20 +3282,39 @@ impl TuiApp {
         }
     }
 
-    /// 状态行("当前:运行中 端口 9464" / "当前:未运行")。
+    /// 状态行:运行中显示 PID/端口,互斥状态显示锁定 + 原因。
     fn item_status_line(item: MenuItem, status: &ServeStatus) -> String {
         match item {
-            MenuItem::OcServe => match status.opencode_pid {
-                Some(_) => format!(
-                    "当前：运行中 端口 {}",
-                    status.port.map(|p| p.to_string()).unwrap_or_default()
-                ),
-                None => "当前：未运行".to_string(),
-            },
-            MenuItem::Rathole => match status.rathole_pid {
-                Some(pid) => format!("当前：运行中 PID {pid}"),
-                None => "当前：未运行".to_string(),
-            },
+            MenuItem::OcServe => {
+                // 云服务在跑 → 单体卡片显示"锁定"
+                if status.rathole_pid.is_some() {
+                    return "🔒 已锁定：云服务在跑中,请先停止云服务".to_string();
+                }
+                match status.opencode_pid {
+                    Some(pid) => format!(
+                        "当前:单体运行中 端口 {} PID={pid}",
+                        status.port.map(|p| p.to_string()).unwrap_or_default()
+                    ),
+                    None => "当前:单体未运行".to_string(),
+                }
+            }
+            MenuItem::Rathole => {
+                // rathole 在跑但单体不在:异常告警
+                if status.rathole_pid.is_some() && status.opencode_pid.is_none() {
+                    return "⚠ 异常状态:仅 rathole 在跑(单体已退出?)".to_string();
+                }
+                // 单体在跑但 rathole 未启 → 点击会叠 rathole 形成云服务
+                if status.opencode_pid.is_some() && status.rathole_pid.is_none() {
+                    return "当前:单体已运行,点击叠加 rathole 形成云服务".to_string();
+                }
+                match (status.opencode_pid, status.rathole_pid) {
+                    (Some(oc), Some(rt)) => format!(
+                        "当前:云服务运行中 单体 PID={oc} + rathole PID={rt}"
+                    ),
+                    (None, None) => "当前:云服务未运行(点击将先启单体)".to_string(),
+                    _ => unreachable!(),
+                }
+            }
             MenuItem::OcProjects | MenuItem::UpgradeOpenCodeAndOmo => String::new(),
         }
     }
@@ -2745,6 +3337,10 @@ impl TuiApp {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
+        // 每帧渲染入口先消费设备选择触发信号 —— 后台 fetch 任务写入共享槽
+        // 后，即使用户没有任何键盘/鼠标输入（handle_key / click_at 不会
+        // 被调用），弹框也能在下一帧出现。与下方"端口占用"哨兵同思路。
+        self.consume_device_picker_trigger();
         // 每帧渲染前消费后台"端口占用"哨兵 —— 如果用户启动 opencode serve
         // 后没动键盘/鼠标，handle_key / click_at 不会被调用，弹框就出不来。
         // 在 render 入口消费一次保证"无操作也能看到弹框"。
@@ -2850,6 +3446,11 @@ impl TuiApp {
         if self.confirm.is_some() {
             self.render_confirm(frame);
         }
+
+        // 设备选择弹框最后绘制（前景层，盖过 settings / confirm）。
+        if self.device_picker.is_some() {
+            self.render_device_picker(frame);
+        }
     }
 
     /// 主布局:左 70%(服务与系统 + OC 项目 / 日志 5 行 / 状态 5 行)
@@ -2943,15 +3544,30 @@ impl TuiApp {
         let now = chrono::Local::now();
         let duration = (now - self.program_started_at).num_seconds().max(0);
         let op = self.status_message.lock().unwrap().clone();
-        let rathole_state = {
-            let rc = self.rathole_config.read().unwrap_or_else(|e| e.into_inner());
-            if rc.is_configured() {
-                format!("Rathole: ✅ {}:{}（{}）", rc.host, rc.port, rc.name)
+        // 账户登录状态（替代原 Rathole / 远端验证两行）：
+        // - 已配置 → 显示 账户ID @ 远程路径 + 从账户信息填充的 Basic 密码位数;
+        // - 未配置 → 引导去设置面板登录。
+        let (account_state, password_len) = {
+            let ac = self
+                .account_config
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let state = if ac.is_configured() {
+                format!(
+                    "账户: ✅ {}（{}）",
+                    ac.account_id,
+                    ac.remote_path.trim()
+                )
             } else {
-                "Rathole: 未配置（请在设置中填写 Host/Port/Name/Token）".to_string()
-            }
+                "账户: 未登录（请在设置中填写 账户ID / 密钥）".to_string()
+            };
+            (state, self.auth_password_mask_len)
         };
-        let remote = self.remote_status.lock().unwrap().clone();
+        let account_state = if password_len > 0 {
+            format!("{account_state} Basic密码 {password_len} 位")
+        } else {
+            account_state
+        };
         let status_text = vec![
             Line::from(format!(
                 "PID: {pid}    启动时间: {}",
@@ -2966,16 +3582,8 @@ impl TuiApp {
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                rathole_state,
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                if remote.is_empty() {
-                    "正在验证远端存储…".to_string()
-                } else {
-                    remote
-                },
-                Style::default().fg(Color::White),
+                account_state,
+                Style::default().fg(Color::Cyan),
             )),
         ];
         let status_para = Paragraph::new(status_text)
@@ -3117,8 +3725,6 @@ impl TuiApp {
     /// build_settings_lines 的第 `scroll_offset` 行,屏幕行 `r_inside` 对应
     /// 原始布局的第 `r_inside + scroll_offset` 行。
     fn settings_field_at_row(&self, row_inside: u16, scroll_offset: u16) -> Option<InputMode> {
-        // 与 register_settings_click_regions 中的 FIELD_LINE_IDX 保持一致
-        const FIELD_LINE_IDX: [u16; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
         FIELD_LINE_IDX
             .iter()
             .position(|&r| r == row_inside + scroll_offset)
@@ -3162,9 +3768,10 @@ impl TuiApp {
         c >= btn_x && c < btn_x + width
     }
 
-    /// 当前 auth 中**已保存**密码的长度 —— 仅在需要"显示密码已设置"
-    /// 这种纯信息展示(非输入掩码)时使用。**输入掩码渲染已统一用
-    /// [`render_auth_password_line`] 跟随当前 buffer**。
+    /// 当前 auth 中**已保存**密码的长度 —— 账户化后密码由
+    /// `submit_settings` 从账户信息自动填充,该长度记录在
+    /// `auth_password_mask_len` 并在状态栏展示;本方法是直接读 auth
+    /// 的便捷镜像(诊断 / 测试用)。
     #[allow(dead_code)]
     fn auth_password_len(&self) -> usize {
         self.auth
@@ -3176,44 +3783,28 @@ impl TuiApp {
 
     /// 生成设置弹框的所有行内容,同时为每个字段决定高亮样式。
     ///
-    /// 布局:
-    /// - 4 个分区(认证 / 端口 / SilverBullet / Rathole),每个分区一个标题行。
+    /// 布局（15 行,两个分区）:
     /// - 每个字段占两行:第一行是字段值(高亮由当前 input_mode 决定),
     ///   第二行是浅灰色「用途」说明(说明 env key、字段作用)。
     /// - 分区之间留一个空行分隔。
     ///
-    /// 行索引表(对应 [`settings_field_at_row`] 与 [`register_settings_click_regions`]):
-    /// - 0:  "认证设置"
-    /// - 1:  USERNAME 值       ← field 0
-    /// - 2:  USERNAME 说明
-    /// - 3:  PASSWORD 值       ← field 1
-    /// - 4:  PASSWORD 说明
-    /// - 5:  (空)
-    /// - 6:  "端口设置"
-    /// - 7:  系统端口 值       ← field 2
-    /// - 8:  系统端口 说明
-    /// - 9:  OpenCode 端口 值  ← field 3
-    /// - 10: OpenCode 端口 说明
-    /// - 11: (空)
-    /// - 12: "远程 SilverBullet 设置"
-    /// - 13: 远程路径 值       ← field 4
-    /// - 14: 远程路径 说明
-    /// - 15: 用户名 值         ← field 5
-    /// - 16: 用户名 说明
-    /// - 17: 密码 值           ← field 6
-    /// - 18: 密码 说明
-    /// - 19: (空)
-    /// - 20: "Rathole 内网穿透设置"
-    /// - 21: Host 值           ← field 7
-    /// - 22: Host 说明
-    /// - 23: Port 值           ← field 8
-    /// - 24: Port 说明
-    /// - 25: Name 值           ← field 9
-    /// - 26: Name 说明
-    /// - 27: Token 值          ← field 10
-    /// - 28: Token 说明
-    /// - 29: (空)
-    /// - 30: 帮助行
+    /// 行索引表(对应 [`settings_field_at_row`] 与
+    /// [`register_settings_click_regions`] 使用的 [`FIELD_LINE_IDX`]):
+    /// - 0:  "账户登录"
+    /// - 1:  账户ID 值       ← field 0
+    /// - 2:  账户ID 说明
+    /// - 3:  密钥 值(掩码)   ← field 1
+    /// - 4:  密钥 说明
+    /// - 5:  远程路径 值     ← field 2
+    /// - 6:  远程路径 说明
+    /// - 7:  (空)
+    /// - 8:  "端口设置"
+    /// - 9:  系统端口 值（锁定 9465,只渲染不进 FIELD_LINE_IDX）
+    /// - 10: 系统端口 说明
+    /// - 11: OpenCode 端口 值 ← field 3
+    /// - 12: OpenCode 端口 说明
+    /// - 13: (空)
+    /// - 14: 帮助行
     fn build_settings_lines(&self) -> Vec<Line<'static>> {
         let active = Style::default()
             .bg(Color::Green)
@@ -3232,43 +3823,79 @@ impl TuiApp {
         // 字段说明(在字段下一行)用浅灰,提示但不抢焦点高亮。
         let desc_style = Style::default().fg(Color::DarkGray);
 
-        // PASSWORD 字段的星号长度跟随当前输入 buffer 实时变化 —— 与
-        // SilverBullet 密码字段行为一致。粘贴 / 字符输入 / 退格都会
-        // 让 PASSWORD 行立即反映用户输入了多少位。
-        //
-        // 同时 `auth_password_mask_len` 在 `open_settings` 时一次性记录
-        // 「已保存密码长度」,作为底限占位:用户未动 buffer 也能看到对应
-        // 位数的 \*,而真实密码内容不会被回填到 `password_input`。
-        let auth_pw_line = render_auth_password_line(
-            &self.password_input,
-            self.auth_password_mask_len,
-        );
+        // 密钥字段的星号长度跟随 `account_key_input` buffer 实时变化 ——
+        // open_settings 回填了已保存密钥(真实值只以掩码呈现),粘贴 /
+        // 字符输入 / 退格都会让密钥行立即反映当前位数。
+        let account_key_line = render_account_key_line(&self.account_key_input);
+
+        // 已绑定设备名 —— 账户登录区域下方的可点击信息行,显示 env 中
+        // DEVICE_NAME 的当前值;缺失时显示「(未绑定)」。**不是**可编辑
+        // 字段,不进 SETTINGS_FIELDS、不参与 Tab/↑/↓ 焦点循环 —— 点击
+        // 该行触发「关闭设置弹框 + 弹出设备选择弹框」的重新绑定流程。
+        // 视觉上:行背景与「字段说明」一致(浅灰 desc_style),但用 cyan
+        // 下划线前景 + 「点击重新绑定」后缀双重传达可点击。
+        let bound_device_name = self
+            .account_config
+            .read()
+            .map(|a| a.device_name.clone())
+            .unwrap_or_default();
+        let bound_device_display = if bound_device_name.is_empty() {
+            "  绑定设备: (未绑定)  ▶ 点击选择设备".to_string()
+        } else {
+            format!("  绑定设备: {bound_device_name}  ▶ 点击重新绑定")
+        };
+        let bound_device_clickable_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED);
 
         vec![
-            // --- 认证设置 ---
-            Line::from(Span::styled("认证设置", title_style)),
+            // --- 账户登录 ---
+            Line::from(Span::styled("账户登录", title_style)),
             Line::from(Span::styled(
-                format!("  USERNAME: {}", self.username_input),
-                style_for(InputMode::SettingsAuthUsername),
+                format!("  账户ID: {}", self.account_id_input),
+                style_for(InputMode::SettingsAccountId),
             )),
             Line::from(Span::styled(
-                "    作用: HTTP Basic 用户名(env: OPENCODE_SERVER_USERNAME)",
+                "    作用: 账户中心登录ID(env: ACCOUNT_ID)",
                 desc_style,
             )),
             Line::from(Span::styled(
-                auth_pw_line,
-                style_for(InputMode::SettingsAuthPassword),
+                account_key_line,
+                style_for(InputMode::SettingsAccountKey),
             )),
             Line::from(Span::styled(
-                "    作用: HTTP Basic 密码(env: OPENCODE_SERVER_PASSWORD)",
+                "    作用: 账户鉴权密钥,用于 /api/user/info(env: ACCOUNT_KEY)",
+                desc_style,
+            )),
+            Line::from(Span::styled(bound_device_display, bound_device_clickable_style)),
+            Line::from(Span::styled(
+                "    作用: 当前已绑定的设备服务名(env: DEVICE_NAME,点击行 → 重新选择设备)",
+                desc_style,
+            )),
+            Line::from(Span::styled(
+                format!("  远程路径: {}", self.remote_path_input),
+                style_for(InputMode::SettingsRemotePath),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "    作用: 账户中心地址(env: REMOTE_PATH,默认 {})",
+                    DEFAULT_REMOTE_PATH
+                ),
                 desc_style,
             )),
             Line::from(""),
             // --- 端口设置 ---
             Line::from(Span::styled("端口设置", title_style)),
             Line::from(Span::styled(
-                format!("  系统端口:   {}", self.system_port_input),
-                style_for(InputMode::SettingsHttpPort),
+                // 系统端口强制锁定为 9465 —— 完全不读 buffer,
+                // 提示"[锁定]"让用户一眼看到该字段不可编辑。
+                format!(
+                    "  系统端口:   {} [锁定,不可修改]",
+                    crate::config::DEFAULT_SYSTEM_PORT
+                ),
+                // 不可编辑字段不再用 style_for(active 高亮),改用 desc_style
+                // (浅灰)以视觉传达"不可交互"。
+                desc_style,
             )),
             Line::from(Span::styled(
                 "    作用: 本程序 axum 监听端口(env: OC_SERVE_SYSTEM_PORT)",
@@ -3283,71 +3910,6 @@ impl TuiApp {
                 desc_style,
             )),
             Line::from(""),
-            // --- SilverBullet ---
-            Line::from(Span::styled("远程 SilverBullet 设置", title_style)),
-            Line::from(Span::styled(
-                format!("  远程路径: {}", self.sb_url_input),
-                style_for(InputMode::SettingsUrl),
-            )),
-            Line::from(Span::styled(
-                "    作用: 远程 SilverBullet URL(env: SB_URL,留空表示禁用)",
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                format!("  用户名:   {}", self.sb_user_input),
-                style_for(InputMode::SettingsUser),
-            )),
-            Line::from(Span::styled(
-                "    作用: 远程 SilverBullet 用户名(env: SB_USER)",
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                format!(
-                    "  密码:     {}",
-                    "*".repeat(self.sb_password_input.len())
-                ),
-                style_for(InputMode::SettingsPassword),
-            )),
-            Line::from(Span::styled(
-                "    作用: 远程 SilverBullet 密码(env: SB_PASSWORD)",
-                desc_style,
-            )),
-            Line::from(""),
-            // --- Rathole ---
-            Line::from(Span::styled("Rathole 内网穿透设置", title_style)),
-            Line::from(Span::styled(
-                format!("  Host:   {}", self.rathole_host_input),
-                style_for(InputMode::SettingsRatholeHost),
-            )),
-            Line::from(Span::styled(
-                "    作用: rathole 远端服务器地址(env: RATHOLE_HOST)",
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                format!("  Port:   {}", self.rathole_port_input),
-                style_for(InputMode::SettingsRatholePort),
-            )),
-            Line::from(Span::styled(
-                "    作用: rathole 远端端口(env: RATHOLE_PORT,1-65535)",
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                format!("  Name:   {}", self.rathole_name_input),
-                style_for(InputMode::SettingsRatholeName),
-            )),
-            Line::from(Span::styled(
-                "    作用: rathole 服务名(env: RATHOLE_NAME)",
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                format!("  Token:  {}", self.rathole_token_input),
-                style_for(InputMode::SettingsRatholeToken),
-            )),
-            Line::from(Span::styled(
-                "    作用: rathole 鉴权 Token(env: RATHOLE_TOKEN)",
-                desc_style,
-            )),
-            Line::from(""),
             Line::from(Span::styled(
                 "  Tab/↑/↓ 切换  Ctrl+V 粘贴  Enter 保存  Esc 取消  (点击字段行直接跳到该输入)",
                 help_style,
@@ -3357,43 +3919,31 @@ impl TuiApp {
 
     /// 为设置弹框内的每个字段注册 ClickRegion(鼠标点击切换焦点)。
     ///
-    /// `SETTINGS_FIELDS` 与 `build_settings_lines` 的顺序一一对应
-    /// (字段值在分区中排在第奇数位 1,3,7,9,13,15,17,21,23,25,27;
-    /// 偶数位是作用说明,不是字段本身)。
-    /// - 0: USERNAME  (line idx 1)
-    /// - 1: PASSWORD  (line idx 3)
-    /// - 2: HTTP 端口 (line idx 7)
-    /// - 3: Serve 端口(line idx 9)
-    /// - 4: SB URL    (line idx 13)
-    /// - 5: SB User   (line idx 15)
-    /// - 6: SB Password (line idx 17)
-    /// - 7: Rathole Host (line idx 21)
-    /// - 8: Rathole Port (line idx 23)
-    /// - 9: Rathole Name (line idx 25)
-    /// - 10: Rathole Token(line idx 27)
+    /// `SETTINGS_FIELDS` 与 `build_settings_lines` 的顺序一一对应,
+    /// 字段值所在行由模块级 [`FIELD_LINE_IDX`] 表决定(与
+    /// [`settings_field_at_row`] 共用同一张表):
+    /// - 0: 账户ID        (line idx 1)
+    /// - 1: 密钥          (line idx 3)
+    /// - 2: 远程路径      (line idx 5)
+    /// - 3: OpenCode 端口 (line idx 11)
     ///
     /// `scroll_offset` 是当前滚动偏移;屏幕行 `r` 对应 `build_settings_lines`
     /// 的第 `r + scroll_offset` 行。被滚动到屏幕外的字段(屏幕行 < 0 或 ≥ 内容区)
     /// **不**注册 click region —— 否则 `find_target` 会返回 None,触发
-    /// `click_at` 走 `dismiss_popup` 分支,造成"点 username 误关弹框"。
-    fn register_settings_click_regions(
+    /// `click_at` 走 `dismiss_popup` 分支,造成"点账户ID 误关弹框"。
+fn register_settings_click_regions(
         &mut self,
         rect: Rect,
         #[allow(unused_variables)] btn_line_idx: u16,
         scroll_offset: u16,
         popup_h: u16,
     ) {
-        // lines 数组内的"字段行"索引(从 0 开始);0 是分区标题,
-        // 1,3,7,9,13,15,17,21,23,25,27 是 11 个字段值各自所在行。
-        // 与 settings_field_at_row 中的索引保持一致。
-        const FIELD_LINE_IDX: [usize; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
-        // 弹框上方 border 占 1 行,所以字段 line idx 0 (认证设置标题) 在 rect.y + 1。
+        // 弹框上方 border 占 1 行,所以字段 line idx 0 (账户登录标题) 在 rect.y + 1。
         // 内容可视行数 = popup_h - 2 (上下边框) - 1 (按钮区空行) - 1 (按钮行)。
         let content_h = popup_h.saturating_sub(4);
         for (i, field) in SETTINGS_FIELDS.iter().enumerate() {
-            let line_idx = FIELD_LINE_IDX[i];
-            // 字段在 build_settings_lines 中的原始行 idx。
-            let line_idx_u16 = line_idx as u16;
+            // 字段在 build_settings_lines 中的原始行 idx(模块级表)。
+            let line_idx_u16 = FIELD_LINE_IDX[i];
             // 减去滚动偏移后,该字段的"屏幕内 row" = line_idx_u16 - scroll_offset。
             // 若屏幕行不在 [0, content_h) 内 → 已被滚动到弹框外 → 跳过。
             let screen_row = match line_idx_u16.checked_sub(scroll_offset) {
@@ -3409,10 +3959,28 @@ impl TuiApp {
                 target: ClickTarget::SettingsField(*field),
             });
         }
+
+        // 「绑定设备」行(idx 5)单独注册 click region:不进 SETTINGS_FIELDS,
+        // 因此不参与 Tab/↑/↓ 焦点循环,但鼠标点击会关闭设置弹框并触发
+        // 设备选择弹框。命中 screen_row >= content_h 的跳过(滚动出屏)。
+        const BIND_DEVICE_LINE_IDX: u16 = 5;
+        if let Some(screen_row) = BIND_DEVICE_LINE_IDX.checked_sub(scroll_offset) {
+            if screen_row < content_h {
+                let target_y = rect.y + 1 + screen_row;
+                // 每次点击都强制重新拉取用户信息(bug 2 + bug 4)—— 不再
+                // 携带缓存。ClickRegion 仅标志位置 + 路由;触发器由 click_at
+                // 处理时统一走 spawn → fetch → consume_device_picker_trigger。
+                self.click_regions.push(ClickRegion {
+                    rect: Rect::new(rect.x + 1, target_y, rect.width.saturating_sub(2), 1),
+                    target: ClickTarget::SettingsBindDevice,
+                });
+            }
+        }
+
         // 底部按钮 click region:确认按钮 + 取消按钮 + 打开配置目录按钮,
-// 三个按钮都在弹框**下边框上方一行**(中间隔了空行,不是紧贴下边框)。
-// 与 mouse_pos_in_settings_btn 的坐标计算保持完全一致,避免
-// "hover 高亮但点击无反应"或反之。布局见 render_settings_popup 注释。
+        // 三个按钮都在弹框**下边框上方一行**(中间隔了空行,不是紧贴下边框)。
+        // 与 mouse_pos_in_settings_btn 的坐标计算保持完全一致,避免
+        // "hover 高亮但点击无反应"或反之。布局见 render_settings_popup 注释。
         let btn_y = rect.y + popup_h - 2;
         self.click_regions.push(ClickRegion {
             rect: Rect::new(rect.x + 2, btn_y, 8, 1),
@@ -3547,6 +4115,135 @@ impl TuiApp {
         self.click_regions.push(ClickRegion {
             rect: cancel_rect,
             target: ClickTarget::CancelBtn,
+        });
+    }
+
+    /// 渲染设备选择弹框（本地未配置 DEVICE_NAME 时由后台任务触发）。
+    ///
+    /// 布局与确认弹框同款：居中矩形 + Clear + 黄色边框。
+    /// - 设备清单每行展示 `name（端口 N）` + 已绑定标记；
+    /// - ↑/↓ 移动设备选中（青底反白 + ▶ 前缀）；
+    /// - 鼠标点击行直接选中；
+    /// - 底部「确认 / 取消」按钮（鼠标点击 / 左右箭头切换 / Enter 触发）；
+    /// - Esc 跳过（重启后可重新触发）。
+    fn render_device_picker(&mut self, frame: &mut Frame<'_>) {
+        let Some(picker) = self.device_picker.as_mut() else {
+            return;
+        };
+        // 高度 = 边框 2 + 账号行 1 + 空行 1 + 设备清单 + 空行 1 + 按钮行 1；
+        // 设备过多时封顶 20 行（Paragraph 自动裁剪，常见设备数远小于此）。
+        let device_count = picker.user_info.devices.len() as u16;
+        let w = 52u16;
+        let h = (device_count + 7).min(22);
+        let area = frame.area();
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        let rect = Rect::new(x, y, w, h);
+
+        let title_line = if picker.user_info.display_name().is_empty() {
+            "设备清单：".to_string()
+        } else {
+            format!("账号 {} 的设备清单：", picker.user_info.display_name())
+        };
+        // 设备区起始 y = rect.y + 1（top border 占 1 行）+ 标题 1 + 空 1。
+        let devices_start_y = rect.y + 3;
+
+        let mut lines: Vec<Line<'_>> = vec![
+            Line::from(Span::styled(
+                title_line,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+        for (i, dev) in picker.user_info.devices.iter().enumerate() {
+            let bound_tag = if dev.bound { "（已绑定）" } else { "" };
+            let selected = i == picker.selected;
+            let style = if selected {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let prefix = if selected { "▶ " } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{}  端口 {}{}", dev.name, dev.port, bound_tag),
+                style,
+            )));
+        }
+        lines.push(Line::from(""));
+
+        // 底部按钮行（位于弹框下边框上方一行）。
+        // 左右按钮位置:确认在左,取消在右(参考 render_confirm 风格)。
+        let confirm_selected = picker.button_focus == ConfirmChoice::Confirm;
+        let cancel_selected = picker.button_focus == ConfirmChoice::Cancel;
+        let selected_style = Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let idle_style = Style::default().fg(Color::DarkGray);
+        let confirm_btn = Span::styled(
+            if confirm_selected { "▶ [ 确认 ]" } else { "  [ 确认 ]" },
+            if confirm_selected { selected_style } else { idle_style },
+        );
+        let cancel_btn = Span::styled(
+            if cancel_selected { "▶ [ 取消 ]" } else { "  [ 取消 ]" },
+            if cancel_selected { selected_style } else { idle_style },
+        );
+        lines.push(Line::from(vec![
+            confirm_btn,
+            Span::raw("   "),
+            cancel_btn,
+            Span::raw("   ←/→ 切换"),
+        ]));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("选择要绑定的设备")
+            .border_style(Style::default().fg(Color::Yellow));
+        let para = Paragraph::new(lines).block(block);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(para, rect);
+
+        // === click region 注册 ===
+        // 设备行 click region —— 设备清单每行（从 devices_start_y 起）。
+        let content_inner_w = w.saturating_sub(2);
+        let inner_x = rect.x + 1;
+        for i in 0..picker.user_info.devices.len() {
+            let row_y = devices_start_y + i as u16;
+            // 越界保护（设备过多被裁剪时跳过）
+            if row_y >= rect.y + rect.height.saturating_sub(1) {
+                break;
+            }
+            self.click_regions.push(ClickRegion {
+                rect: Rect::new(inner_x, row_y, content_inner_w, 1),
+                target: ClickTarget::DevicePickerRow(i),
+            });
+        }
+
+        // 按钮行 y = rect.y + rect.height - 2（下边框上方一行）。
+        let btn_y = rect.y + rect.height.saturating_sub(2);
+        // 鼠标 hover 时把 button_focus 切过去（与 confirm 弹框一致体验）。
+        if let Some((c, r)) = self.mouse_pos {
+            if r == btn_y {
+                // [ 确认 ] 占 11 列,起始 rect.x + 2;[ 取消 ] 占 11 列,起始 + 13。
+                if c >= inner_x + 1 && c < inner_x + 12 {
+                    picker.button_focus = ConfirmChoice::Confirm;
+                } else if c >= inner_x + 13 && c < inner_x + 24 {
+                    picker.button_focus = ConfirmChoice::Cancel;
+                }
+            }
+        }
+        // 确认按钮 click region（x = inner_x+1, w=11）。
+        self.click_regions.push(ClickRegion {
+            rect: Rect::new(inner_x + 1, btn_y, 11, 1),
+            target: ClickTarget::DevicePickerConfirm,
+        });
+        // 取消按钮 click region。
+        self.click_regions.push(ClickRegion {
+            rect: Rect::new(inner_x + 13, btn_y, 11, 1),
+            target: ClickTarget::DevicePickerCancel,
         });
     }
 
@@ -4070,11 +4767,13 @@ impl TuiApp {
     }
 
     fn render_logs(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        // 主界面日志固定只显示最近 5 行(全屏日志模式不受此限制,见 render_full_log)。
+        // 主界面日志固定只显示最近几行(全屏日志模式不受此限制,见 render_full_log)。
+        // 取条数略多于可视行数:启用自动换行后,一条长日志会占多屏行,
+        // 多取几条能提高"可视区填满"的概率,超出部分由 Paragraph 裁剪。
         let inner_height = area.height.saturating_sub(2).clamp(1, 5) as usize;
         let lines: Vec<Line<'_>> = self
             .log_buffer
-            .tail(inner_height)
+            .tail(inner_height * 3)
             .into_iter()
             .map(Line::from)
             .collect();
@@ -4094,12 +4793,16 @@ impl TuiApp {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let log = Paragraph::new(lines).block(
-            Block::default()
-                .title("日志 [显示全部: l]")
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        );
+        // `.wrap` 让超长日志行自动换行显示,而不是被右侧硬截断 ——
+        // 设备绑定 / 网络错误这类长消息在窄面板里也能看全。
+        let log = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("日志 [显示全部: l]")
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            );
         // 注册 click region（hover 高亮同区域 click_at 共享）
         self.click_regions.push(ClickRegion {
             rect: area,
@@ -4108,28 +4811,143 @@ impl TuiApp {
         frame.render_widget(log, area);
     }
 
+    /// 全屏日志：按显示宽度自动换行，支持鼠标左键拖选（行级），
+    /// 松开时自动把选中行复制到系统剪贴板（见 `handle_mouse` 的
+    /// `show_full_log` 分支与 [`Self::copy_log_selection_to_clipboard`]）。
+    ///
+    /// 布局：顶部 1 行提示（帮助文案 / 复制结果通知），其余为带边框的
+    /// 日志内容区。内容区按 wrap 后的**屏行**渲染与滚动：
+    /// - 每条日志先按 `inner.width` 切成若干屏行（CJK 记 2 列）；
+    /// - 滚动窗口取屏行数组的尾部 `inner.height` 行，`log_scroll`
+    ///   表示从底部向上偏移的屏行数；
+    /// - 拖选高亮：`log_select_anchor` 与 `log_select_current` 的 y
+    ///   范围（夹在内容区内）对应屏行整行反色。
     fn render_full_log(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
+        let hint_text = self.full_log_notice.clone().unwrap_or_else(|| {
+            "日志（全屏）  Esc/q/l 退出    ↑/↓ 滚动    鼠标拖选行 → 松开自动复制".to_string()
+        });
         let hint = Paragraph::new(Span::styled(
-            "日志（全屏）  Esc / q / l 退出    ↑/↓ 滚动",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            hint_text,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(hint, chunks[0]);
 
-        let height = chunks[1].height as usize;
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(chunks[1]);
+        frame.render_widget(block, chunks[1]);
+        // 记录内容区 —— mouse up 时用同样的宽度重建 wrapped 行做映射。
+        self.last_full_log_inner = Some(inner);
+
         let total = self.log_buffer.tail(500);
-        let start = total.len().saturating_sub(height + self.log_scroll);
-        let end = total.len().saturating_sub(self.log_scroll);
-let lines: Vec<Line<'_>> = total[start..end]
-            .iter()
-            .map(|s| Line::from(s.clone()))
+        let width = inner.width as usize;
+        let mut wrapped: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in total.iter().enumerate() {
+            for scr in wrap_line_display_width(line, width) {
+                wrapped.push((idx, scr));
+            }
+        }
+
+        let inner_h = inner.height as usize;
+        // 滚动上限 clamp:wrap 后屏行数随窗口宽度 / 日志条数动态变化,
+        // 键盘 / 滚轮累加的 log_scroll 可能超过"总屏行 - 可视行"导致
+        // 白屏 —— 渲染时收紧到恰好滚到最旧一行。
+        let max_scroll = wrapped.len().saturating_sub(inner_h);
+        if self.log_scroll > max_scroll {
+            self.log_scroll = max_scroll;
+        }
+        let end = wrapped.len().saturating_sub(self.log_scroll);
+        let start = end.saturating_sub(inner_h);
+        let selected_style = Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        // 拖选高亮的屏行范围（相对内容区顶行），夹在 [0, inner_h)。
+        let highlight_rows: Option<(u16, u16)> = match (self.log_select_anchor, self.log_select_current)
+        {
+            (Some((_, ay)), Some((_, cy))) => {
+                let (lo, hi) = if ay <= cy { (ay, cy) } else { (cy, ay) };
+                let lo = lo.saturating_sub(inner.y).min(inner.height.saturating_sub(1));
+                let hi = hi.saturating_sub(inner.y).min(inner.height.saturating_sub(1));
+                Some((lo, hi))
+            }
+            _ => None,
+        };
+
+        for (row, (_orig_idx, text)) in wrapped[start..end].iter().enumerate()
+        {
+            let y = inner.y + row as u16;
+            let selected = matches!(highlight_rows, Some((lo, hi)) if row as u16 >= lo && row as u16 <= hi);
+            let style = if selected { selected_style } else { Style::default() };
+            let line_area = Rect::new(inner.x, y, inner.width, 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text.clone(), style))),
+                line_area,
+            );
+        }
+    }
+
+    /// 把当前拖选范围（anchor → current 覆盖的屏行）映射回**原始日志行**，
+    /// 去重保序后拼接，写入系统剪贴板。
+    ///
+    /// 映射方式：用上一帧记录的 `last_full_log_inner` 宽度重建 wrapped
+    /// 屏行（与 render_full_log 完全同一套切行逻辑），再把拖选覆盖的
+    /// 屏行 y 范围换算成窗口内索引 → 原始行下标集合。选中范围夹在
+    /// 内容区内，超出部分忽略。
+    fn copy_log_selection_to_clipboard(&mut self) {
+        let (Some(inner), Some((_, ay)), Some((_, cy))) =
+            (self.last_full_log_inner, self.log_select_anchor, self.log_select_current)
+        else {
+            return;
+        };
+        let (lo, hi) = if ay <= cy { (ay, cy) } else { (cy, ay) };
+        // 换算成"内容区内相对行号"，并夹在可视范围。
+        let rel_lo = (lo.saturating_sub(inner.y) as usize)
+            .min(inner.height.saturating_sub(1) as usize);
+        let rel_hi = (hi.saturating_sub(inner.y) as usize)
+            .min(inner.height.saturating_sub(1) as usize);
+
+        let total = self.log_buffer.tail(500);
+        let width = inner.width as usize;
+        let mut wrapped: Vec<usize> = Vec::with_capacity(total.len() * 2);
+        for (idx, line) in total.iter().enumerate() {
+            for _scr in wrap_line_display_width(line, width) {
+                wrapped.push(idx);
+            }
+        }
+        let inner_h = inner.height as usize;
+        let end = wrapped.len().saturating_sub(self.log_scroll);
+        let start = end.saturating_sub(inner_h);
+        let window = &wrapped[start..end];
+
+        // 收集选中的原始行下标（去重保序 —— wrap 后同一行占多屏行）。
+        let mut picked: Vec<usize> = Vec::new();
+        for rel in rel_lo..=rel_hi {
+            if let Some(&orig) = window.get(rel) {
+                if !picked.contains(&orig) {
+                    picked.push(orig);
+                }
+            }
+        }
+        if picked.is_empty() {
+            self.full_log_notice = Some("未选中任何日志行".to_string());
+            return;
+        }
+        let text: Vec<String> = picked
+            .into_iter()
+            .filter_map(|i| total.get(i).cloned())
             .collect();
-        let log = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
-        frame.render_widget(log, chunks[1]);
+        let count = text.len();
+        let payload = text.join("\n");
+        if write_clipboard_text(&payload) {
+            self.full_log_notice = Some(format!("✅ 已复制 {count} 行日志到剪贴板"));
+        } else {
+            self.full_log_notice = Some("⚠️ 剪贴板不可用，复制失败".to_string());
+        }
     }
 }
 
@@ -4240,11 +5058,84 @@ mod tests {
 
     #[test]
     fn item_title_toggles_by_running_state() {
-        // 标题必须根据运行状态切换:运行中显示"停止",未运行显示"启动"。
+        // 标题必须根据运行状态切换:未运行显示"启动",运行中显示"停止"。
         let mut status = ServeStatus::default();
-        assert!(TuiApp::item_title(MenuItem::OcServe, &status).contains("启动"));
+        let stopped_title = TuiApp::item_title(MenuItem::OcServe, &status);
+        assert!(
+            stopped_title.contains("启动"),
+            "stopped title should contain 启动, got: {stopped_title}"
+        );
+        assert!(
+            stopped_title.contains("单体"),
+            "stopped title should contain 单体, got: {stopped_title}"
+        );
         status.opencode_pid = Some(1234);
-        assert!(TuiApp::item_title(MenuItem::OcServe, &status).contains("停止"));
+        let running_title = TuiApp::item_title(MenuItem::OcServe, &status);
+        assert!(
+            running_title.contains("停止"),
+            "running title should contain 停止, got: {running_title}"
+        );
+    }
+
+    #[test]
+    fn item_title_uses_single_and_cloud_labels() {
+        // 文案:OcServe -> "单体 OpenCode 服务",Rathole -> "OpenCode 云服务"。
+        let stopped = ServeStatus::default();
+        assert_eq!(
+            TuiApp::item_title(MenuItem::OcServe, &stopped),
+            "🚀 启动单体 OpenCode 服务"
+        );
+        assert_eq!(
+            TuiApp::item_title(MenuItem::Rathole, &stopped),
+            "🚀 启动 OpenCode 云服务"
+        );
+
+        let mut running_oc = ServeStatus::default();
+        running_oc.opencode_pid = Some(1);
+        assert_eq!(
+            TuiApp::item_title(MenuItem::OcServe, &running_oc),
+            "⏹ 停止单体 OpenCode 服务"
+        );
+
+        let mut running_cloud = ServeStatus::default();
+        running_cloud.opencode_pid = Some(1);
+        running_cloud.rathole_pid = Some(2);
+        assert_eq!(
+            TuiApp::item_title(MenuItem::Rathole, &running_cloud),
+            "⏹ 停止 OpenCode 云服务"
+        );
+
+        // OC 项目 / omo 升级 仍为中文
+        assert_eq!(
+            TuiApp::item_title(MenuItem::OcProjects, &stopped),
+            "📂 OC 项目"
+        );
+        assert_eq!(
+            TuiApp::item_title(MenuItem::UpgradeOpenCodeAndOmo, &stopped),
+            "⬆️ 升级 OpenCode + omo"
+        );
+    }
+
+    #[test]
+    fn item_status_line_shows_locked_when_other_running() {
+        // 云服务在跑时,单体卡片的 status line 应提示锁定。
+        let mut cloud_running = ServeStatus::default();
+        cloud_running.opencode_pid = Some(1);
+        cloud_running.rathole_pid = Some(2);
+        let line = TuiApp::item_status_line(MenuItem::OcServe, &cloud_running);
+        assert!(
+            line.contains("锁定") || line.contains("云服务"),
+            "OcServe status line should indicate locked by cloud, got: {line}"
+        );
+
+        // 单体在跑但 rathole 未启:云服务卡片应提示"单体已就绪待叠加"。
+        let mut single_running = ServeStatus::default();
+        single_running.opencode_pid = Some(1);
+        let line = TuiApp::item_status_line(MenuItem::Rathole, &single_running);
+        assert!(
+            line.contains("单体") || line.contains("叠加"),
+            "Rathole status line should indicate single already running, got: {line}"
+        );
     }
 
     /// 构造测试用的 Rect(0,0) 起点。
@@ -4370,16 +5261,17 @@ let left = ratatui::layout::Layout::default()
 
     /// 端口字段粘贴时,非数字字符必须被丢弃,5 位上限必须生效。
     #[test]
-    fn paste_into_http_port_filters_non_digits_and_caps_at_five() {
-        // 用户从某处复制了 "9a465#9" — 9 留下,a / # 丢,长度裁到 5 位。
+    fn paste_into_http_port_is_locked_noop() {
+        // 系统端口 (`SettingsHttpPort`) 已强制锁定为 9465,粘贴
+        // 不能修改 buf —— 无论传入什么数字 / 字符,buffer 保持不变。
+        // 这是 `apply_paste_to_buffer` 层的硬锁定;
+        // `apply_settings_paste` 还会在外层 early return 做一次防御。
         let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "", "9a465#9");
-        assert_eq!(got, "94659");
-        // 已经 4 位 → 再粘 3 位数字 → 只追加 1 位,变成 5 位。
-        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9464", "12345");
-        assert_eq!(got, "94641");
-        // 完全非数字 → 保持原样。
-        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9464", "abc");
-        assert_eq!(got, "9464");
+        assert_eq!(got, "", "空 buf + 数字粘贴应保持空");
+        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9465", "12345");
+        assert_eq!(got, "9465", "非空 buf + 数字粘贴应保持原样");
+        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9465", "abc");
+        assert_eq!(got, "9465", "非数字粘贴应保持原样");
     }
 
     #[test]
@@ -4388,27 +5280,30 @@ let left = ratatui::layout::Layout::default()
         assert_eq!(got, "9464");
     }
 
-    #[test]
-    fn paste_into_rathole_port_filters_and_caps() {
-        let got = apply_paste_to_buffer(InputMode::SettingsRatholePort, "", "7abc0123");
-        assert_eq!(got, "70123");
-    }
-
     /// 普通文本字段粘贴时,整段追加,保留所有字符(含中文 / 空格)。
     #[test]
     fn paste_into_text_field_appends_verbatim() {
         let got = apply_paste_to_buffer(
-            InputMode::SettingsUrl,
+            InputMode::SettingsRemotePath,
             "",
-            "https://md.isoops.com/中文路径",
+            "https://oc.isoops.com/中文路径",
         );
-        assert_eq!(got, "https://md.isoops.com/中文路径");
+        assert_eq!(got, "https://oc.isoops.com/中文路径");
+    }
+
+    /// 账户ID / 密钥 同为文本字段,粘贴同样整段追加。
+    #[test]
+    fn paste_into_account_fields_appends_verbatim() {
+        let got = apply_paste_to_buffer(InputMode::SettingsAccountId, "u", "-123");
+        assert_eq!(got, "u-123");
+        let got = apply_paste_to_buffer(InputMode::SettingsAccountKey, "", "k3y-中文");
+        assert_eq!(got, "k3y-中文");
     }
 
     /// 空 payload 必须是 no-op(用于 Ctrl+V → 剪贴板拉空的兜底)。
     #[test]
     fn paste_with_empty_payload_is_noop() {
-        let got = apply_paste_to_buffer(InputMode::SettingsUrl, "https://x", "");
+        let got = apply_paste_to_buffer(InputMode::SettingsRemotePath, "https://x", "");
         assert_eq!(got, "https://x");
     }
 
@@ -4420,85 +5315,110 @@ let left = ratatui::layout::Layout::default()
         assert_eq!(got, "anything");
     }
 
-    /// `render_auth_password_line` 纯函数契约 —— 星号数量 = max(buffer
-    /// 长度, mask_len),前缀必须始终为 `"  PASSWORD: "`。
-    ///
-    /// 设计意图:`mask_len` 是"已保存密码长度"占位,用户没动 buffer 时
-    /// 也能看到对应位数的 \*;一旦开始输入,buffer 长度 > mask_len 时
-    /// 跟 buffer 走(反映用户实际输入了多少位)。
-    #[test]
-    fn render_auth_password_line_counts_chars_verbatim() {
-        // mask_len=0:行为退化为旧版(只跟 buffer)。
-        assert_eq!(render_auth_password_line("", 0), "  PASSWORD: ");
-        assert_eq!(render_auth_password_line("a", 0), "  PASSWORD: *");
-        assert_eq!(render_auth_password_line("abc", 0), "  PASSWORD: ***");
-        assert_eq!(
-            render_auth_password_line("Sup3rSecret!", 0),
-            "  PASSWORD: ************"
+    /// 进入 OC 项目入口完全依赖远端:未配置 RemoteClient 时必须报错,
+    /// 且不进入 sub_page(用户可重试)。
+    #[tokio::test]
+    async fn enter_projects_fails_without_remote() {
+        let mut app = TuiApp::test_stub(); // store 没配 remote
+
+        app.input_mode = InputMode::Menu;
+        app.enter_projects().await;
+
+        assert!(
+            app.sub_page.is_none(),
+            "未配置 remote 时 enter_projects 不应进入 sub_page"
         );
-        // mask_len=N,buffer 空:显示 N 个 * (回显已保存密码长度)。
-        assert_eq!(render_auth_password_line("", 12), "  PASSWORD: ************");
-        assert_eq!(render_auth_password_line("", 5), "  PASSWORD: *****");
-        // mask_len < buffer:跟 buffer(用户在输入更长新密码)。
-        assert_eq!(render_auth_password_line("abcdef", 3), "  PASSWORD: ******");
-        // mask_len > buffer:跟 mask_len(用户开始删,未删完,占位还在)。
-        assert_eq!(render_auth_password_line("ab", 5), "  PASSWORD: *****");
+        let status = app.status_message.lock().unwrap().clone();
+        assert!(
+            status.contains("远程") || status.contains("失败") || status.contains("未配置"),
+            "应显示错误状态,实际: {status}"
+        );
     }
 
-    /// 回归:设置页 PASSWORD 行的星号长度必须跟随当前 `password_input`
-    /// buffer 实时变化 —— 不能读已保存密码长度(那样粘贴后星号不更新)。
-    ///
-    /// 之前 bug:`build_settings_lines` 调用 `auth_password_len()`
-    /// (返回已保存密码长度),粘贴 / 字符输入 / 退格都改的是 `password_input`,
-    /// 导致用户粘贴一长串后星号还停留在 auth 已保存密码长度上,看不到自己输入了几位。
-    /// 这里用 `apply_paste_to_buffer` 模拟 Ctrl+V 路径,跑真实
-    /// `build_settings_lines`,断言 PASSWORD 行(line idx=3)的 `*` 数量
-    /// 等于 `password_input.len()`。
-    ///
-    /// PASSWORD 行(line idx=3)在 `build_settings_lines` 里是
-    /// `format!("  PASSWORD: {auth_pw_stars}")`,所以
-    /// - 0 字符 → `"  PASSWORD: "`
-    /// - 1 字符 → `"  PASSWORD: *"`
-    /// - 5 字符 → `"  PASSWORD: *****"`
+    /// `parse_path_entries_from_json` 契约:合法条目解析、格式错误条目跳过、
+    /// 空 body / 非数组 body 视为空列表、非法 JSON 报错。
     #[test]
-    fn password_line_stars_track_paste_into_buffer() {
+    fn parse_path_entries_from_json_skips_malformed_entries() {
+        // 空 body / 纯空白 → 空列表
+        assert!(parse_path_entries_from_json("").unwrap().is_empty());
+        assert!(parse_path_entries_from_json("   ").unwrap().is_empty());
+
+        // 一个合法 + 一个格式错误(path 类型不对)→ 只保留合法项
+        let body = r#"[
+            {"path": "/tmp/a"},
+            {"path": 123, "sections": "bad"}
+        ]"#;
+        let got = parse_path_entries_from_json(body).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/tmp/a");
+
+        // 合法 JSON 但不是数组 → 空列表(与 sync::refresh 的容错语义一致)
+        assert!(parse_path_entries_from_json("{\"not\":\"array\"}").unwrap().is_empty());
+
+        // 非法 JSON → Err
+        assert!(parse_path_entries_from_json("not-json").is_err());
+    }
+
+    /// `render_account_key_line` 纯函数契约 —— 星号数量 = buffer 字符数,
+    /// 前缀必须始终为 `"  密钥: "`。
+    #[test]
+    fn render_account_key_line_counts_chars_verbatim() {
+        assert_eq!(render_account_key_line(""), "  密钥: ");
+        assert_eq!(render_account_key_line("a"), "  密钥: *");
+        assert_eq!(render_account_key_line("abc"), "  密钥: ***");
+        assert_eq!(
+            render_account_key_line("Sup3rSecretKey!"),
+            "  密钥: ***************"
+        );
+    }
+
+    /// 回归:设置页「密钥」行的星号长度必须跟随当前 `account_key_input`
+    /// buffer 实时变化(粘贴 / 输入 / 退格)。
+    /// 这里用 `apply_paste_to_buffer` 模拟 Ctrl+V 路径,跑真实
+    /// `build_settings_lines`,断言密钥行(line idx=3)的 `*` 数量
+    /// 等于 `account_key_input.chars().count()`。
+    #[test]
+    fn account_key_line_stars_track_paste_into_buffer() {
         let mut app = TuiApp::test_stub();
-        // 模拟 Ctrl+V 粘贴一段密码到 SettingsAuthPassword 字段。
+        // 模拟 Ctrl+V 粘贴一段密钥到 SettingsAccountKey 字段。
         let pasted = apply_paste_to_buffer(
-            InputMode::SettingsAuthPassword,
-            &app.password_input,
+            InputMode::SettingsAccountKey,
+            &app.account_key_input,
             "Sup3rSecret!",
         );
-        app.password_input = pasted;
+        app.account_key_input = pasted;
         let lines = app.build_settings_lines();
-        // 验证 PASSWORD 行(line idx=3)星号数量 = password_input.len()
-        let pw_line = &lines[3];
+        // 验证密钥行(line idx=3)星号数量 = account_key_input 长度
+        let key_line = &lines[3];
         // 拼接 line 内所有 span 的文本以便断言
-        let text: String = pw_line
+        let text: String = key_line
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        let expected_stars = "*".repeat(app.password_input.len());
-        let expected = format!("  PASSWORD: {expected_stars}");
+        let expected_stars = "*".repeat(app.account_key_input.chars().count());
+        let expected = format!("  密钥: {expected_stars}");
         assert_eq!(
             text, expected,
-            "粘贴后 PASSWORD 行星号必须等于 password_input.len()={}",
-            app.password_input.len()
+            "粘贴后密钥行星号必须等于 account_key_input 长度={}",
+            app.account_key_input.chars().count()
         );
-        assert_eq!(app.password_input.len(), 12);
-        // sanity: 整行确实以 "  PASSWORD: " 开头,后面全是 `*`
-        assert!(text.starts_with("  PASSWORD: "));
-        assert_eq!(text.matches('*').count(), app.password_input.len());
+        assert_eq!(app.account_key_input.chars().count(), 12);
+        // sanity: 整行确实以 "  密钥: " 开头,后面全是 `*`
+        assert!(text.starts_with("  密钥: "));
+        assert_eq!(
+            text.matches('*').count(),
+            app.account_key_input.chars().count()
+        );
     }
 
-    /// 同上,但走单字符追加路径(`SettingsAuthPassword` 下按普通键):
-    /// 每次输入都应让 PASSWORD 行星号数 = buffer 长度。
+    /// 同上,但走单字符追加路径(`SettingsAccountKey` 下按普通键):
+    /// 每次输入都应让密钥行星号数 = buffer 长度。
     #[test]
-    fn password_line_stars_track_per_char_input() {
+    fn account_key_line_stars_track_per_char_input() {
         let mut app = TuiApp::test_stub();
         for c in "abc".chars() {
-            app.password_input.push(c);
+            app.account_key_input.push(c);
         }
         let lines = app.build_settings_lines();
         let text: String = lines[3]
@@ -4506,15 +5426,14 @@ let left = ratatui::layout::Layout::default()
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(text, "  PASSWORD: ***");
+        assert_eq!(text, "  密钥: ***");
     }
 
-    /// 退格(`password_input.pop()`)后星号必须同步减少 —— 与 SilverBullet
-    /// 密码字段(`sb_password_input`)的渲染行为保持一致。
+    /// 退格(`account_key_input.pop()`)后星号必须同步减少。
     #[test]
-    fn password_line_stars_shrink_on_pop() {
+    fn account_key_line_stars_shrink_on_pop() {
         let mut app = TuiApp::test_stub();
-        app.password_input.push_str("hello");
+        app.account_key_input.push_str("hello");
         // 先确认 5 个星号
         let lines = app.build_settings_lines();
         let text_before: String = lines[3]
@@ -4522,53 +5441,52 @@ let left = ratatui::layout::Layout::default()
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(text_before, "  PASSWORD: *****");
+        assert_eq!(text_before, "  密钥: *****");
         // 退格两次
-        app.password_input.pop();
-        app.password_input.pop();
+        app.account_key_input.pop();
+        app.account_key_input.pop();
         let lines = app.build_settings_lines();
         let text_after: String = lines[3]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(text_after, "  PASSWORD: ***");
+        assert_eq!(text_after, "  密钥: ***");
     }
 
     /// 行 idx → InputMode 映射:必须与 build_settings_lines 的布局
     /// 保持一致。每多一个字段,这里就要多一个 case;少一个就会失败。
-    /// 索引顺序 = SETTINGS_FIELDS 顺序 = [USERNAME, PASSWORD, 系统端口,
-    /// OpenCode 端口, 远程路径, 用户名, 密码, RatholeHost, RatholePort,
-    /// RatholeName, RatholeToken]。
+    /// 索引顺序 = SETTINGS_FIELDS 顺序 = [账户ID, 密钥, 远程路径,
+    /// OpenCode 端口]。
     #[test]
     fn settings_field_at_row_maps_every_field_to_correct_input_mode() {
         let cases = [
-            (1, InputMode::SettingsAuthUsername),
-            (3, InputMode::SettingsAuthPassword),
-            (7, InputMode::SettingsHttpPort),
-            (9, InputMode::SettingsServePort),
-            (13, InputMode::SettingsUrl),
-            (15, InputMode::SettingsUser),
-            (17, InputMode::SettingsPassword),
-            (21, InputMode::SettingsRatholeHost),
-            (23, InputMode::SettingsRatholePort),
-            (25, InputMode::SettingsRatholeName),
-            (27, InputMode::SettingsRatholeToken),
+            (1, InputMode::SettingsAccountId),
+            (3, InputMode::SettingsAccountKey),
+            (7, InputMode::SettingsRemotePath),
+            (13, InputMode::SettingsServePort),
         ];
         // `settings_field_at_row` 是 &self 方法但完全不用 self(只读
-        // 内嵌的常量表),我们走 helper 镜像逻辑,避免构造 TuiApp 的
+        // 模块级常量表),我们走 helper 镜像逻辑,避免构造 TuiApp 的
         // 重依赖(supervisor / log buffer / store)。
         for (row, expected) in cases {
             let got = helper_settings_field_at_row(row);
             assert_eq!(got, Some(expected), "row={row}");
         }
-        // 标题 / 空行 / 帮助 / 描述行 / 越界 → None
+        // 标题 / 空行 / 帮助 / 描述行 / 锁定端口行 / 越界 → None
         assert_eq!(helper_settings_field_at_row(0), None);
-        assert_eq!(helper_settings_field_at_row(2), None); // USERNAME 说明
-        assert_eq!(helper_settings_field_at_row(4), None); // PASSWORD 说明
-        assert_eq!(helper_settings_field_at_row(5), None); // 空
-        assert_eq!(helper_settings_field_at_row(29), None); // 空
-        assert_eq!(helper_settings_field_at_row(30), None); // 帮助
+        assert_eq!(helper_settings_field_at_row(2), None); // 账户ID 说明
+        assert_eq!(helper_settings_field_at_row(4), None); // 密钥 说明
+        assert_eq!(helper_settings_field_at_row(5), None); // 绑定设备 值(只读)
+        assert_eq!(helper_settings_field_at_row(6), None); // 绑定设备 说明
+        assert_eq!(helper_settings_field_at_row(8), None); // 远程路径 说明
+        assert_eq!(helper_settings_field_at_row(9), None); // 空
+        assert_eq!(helper_settings_field_at_row(10), None); // 端口设置 标题
+        assert_eq!(helper_settings_field_at_row(11), None); // 系统端口(锁定)
+        assert_eq!(helper_settings_field_at_row(12), None); // 系统端口 说明
+        assert_eq!(helper_settings_field_at_row(14), None); // OpenCode 端口 说明
+        assert_eq!(helper_settings_field_at_row(15), None); // 空
+        assert_eq!(helper_settings_field_at_row(16), None); // 帮助
         assert_eq!(helper_settings_field_at_row(999), None);
     }
 
@@ -4584,11 +5502,12 @@ let left = ratatui::layout::Layout::default()
 // `#[cfg(test)] impl TuiApp { ... }` 块中。`#[test]` 函数全部留在本
 // `mod tests` 块内。
 
-    /// 行表大小必须严格 = 11,且与 SETTINGS_FIELDS 一一对应。
-    /// 任何不一致(增减字段、改分区顺序)都会让这个测试失败。
+    /// 行表大小必须严格 = SETTINGS_FIELDS.len(),且与 SETTINGS_FIELDS
+    /// 一一对应。任何不一致(增减字段、改分区顺序)都会让这个测试失败。
+    /// 注意:系统端口行(row 9)不在 FIELD_LINE_IDX 中 —— 该字段
+    /// 锁定为 9465,不可点击/Tab;见 `settings_fields_excludes_locked_system_port`。
     #[test]
-    fn settings_field_at_row_table_has_exactly_eleven_entries() {
-        const FIELD_LINE_IDX: [u16; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
+    fn settings_field_at_row_table_matches_settings_fields() {
         assert_eq!(FIELD_LINE_IDX.len(), SETTINGS_FIELDS.len());
         // 行 idx 必须严格递增(否则 click region 会重叠,鼠标逻辑乱)。
         for w in FIELD_LINE_IDX.windows(2) {
@@ -4604,74 +5523,269 @@ let left = ratatui::layout::Layout::default()
         assert_eq!(sorted.len(), FIELD_LINE_IDX.len());
     }
 
-    /// `build_settings_lines` 必须为 11 个字段都给出 env key 提示 —— 这是
-    /// "在每个配置旁显示作用说明"需求的可测版本。每个字段后下一行必须含
-    /// "OPENCODE_SERVER_USERNAME" / "OC_SERVE_SYSTEM_PORT" / "SB_URL" /
-    /// "RATHOLE_HOST" 等明显的 env key,否则用户看不到字段作用。
-    ///
-    /// 写法:对每个字段行 idx +1 取其描述行,断言至少含一对"("和")"
-    /// 包裹的 env 名,覆盖到全部 11 个字段。
+    /// `build_settings_lines` 必须为每个可编辑字段都给出 env key 提示
+    /// —— 这是"在每个配置旁显示作用说明"需求的可测版本。每个字段
+    /// 下一行(说明行)必须含 "ACCOUNT_ID" / "ACCOUNT_KEY" /
+    /// "REMOTE_PATH" / "OC_SERVE_OPENCODE_PORT" 等明显的 env key,
+    /// 否则用户看不到字段作用。
+    /// 注:系统端口 (`OC_SERVE_SYSTEM_PORT`) 已锁定为 9465,不可编辑;
+    /// 但其只读行的描述里仍提到该 env key(用户在文件里能找到这个常量)。
     #[test]
     fn build_settings_lines_documents_every_field() {
-        // 直接 hardcode 期望的 11 个 env key 串,与 build_settings_lines
-        // 内部常量保持一致。这两个常量不在同一处声明,但作用必须一致。
-        const EXPECTED_KEYS: [&str; 11] = [
-            "OPENCODE_SERVER_USERNAME",
-            "OPENCODE_SERVER_PASSWORD",
-            "OC_SERVE_SYSTEM_PORT",
+        let app = TuiApp::test_stub();
+        let lines = app.build_settings_lines();
+        // 期望的 4 个可编辑字段 env key,顺序与 FIELD_LINE_IDX 同步:
+        // 账户ID → 密钥 → 远程路径 → OpenCode 端口。
+        const EXPECTED_KEYS: [&str; 4] = [
+            "ACCOUNT_ID",
+            "ACCOUNT_KEY",
+            "REMOTE_PATH",
             "OC_SERVE_OPENCODE_PORT",
-            "SB_URL",
-            "SB_USER",
-            "SB_PASSWORD",
-            "RATHOLE_HOST",
-            "RATHOLE_PORT",
-            "RATHOLE_NAME",
-            "RATHOLE_TOKEN",
         ];
-        // 字段行 → 下一行为说明;索引顺序与 FIELD_LINE_IDX 同步。
-        const FIELD_LINE_IDX: [usize; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
-        // 在调用真函数前,先做行数 sanity check —— build_settings_lines
-        // 总行数应当 ≥ 30(分区标题 4 + 11 字段值 + 11 说明 + 4 空行 + 1 帮助)。
-        // 我们用一个最简化的方式:只断言"每个字段的 env key 在其说明里"
-        // 这一不变性 + 总行数至少 30。
-        // 注:由于 build_settings_lines 是 &self 方法,需要实例。这里
-        // 我们只测试**纯字符串 / 行数**特征 —— 不实际渲染。
-        // 改为断言 FIELD_LINE_IDX 与 EXPECTED_KEYS 一一对应(顺序 +
-        // 数量),并要求每个 idx +1 < 总行数(说明行存在)。
         assert_eq!(FIELD_LINE_IDX.len(), EXPECTED_KEYS.len());
+        let row_text = |idx: usize| -> String {
+            lines[idx]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
         for (i, &idx) in FIELD_LINE_IDX.iter().enumerate() {
+            let desc_idx = idx as usize + 1;
             assert!(
-                idx + 1 < 31,
+                desc_idx < lines.len(),
                 "field {i} at line {idx} has no room for desc line below"
             );
-            // idx 必须按分区顺序排序:认证组 2 字段(USERNAME, PASSWORD)→
-            // 端口组 2 → SB 组 3 → Rathole 组 4。
-            // 顺序由 EXPECTED_KEYS 自身保证。
+            let desc = row_text(desc_idx);
             assert!(
-                !EXPECTED_KEYS[i].is_empty(),
-                "field {i} must declare its env key"
+                desc.contains(EXPECTED_KEYS[i]),
+                "field {i} (line {idx}) desc must mention {}: {desc}",
+                EXPECTED_KEYS[i]
+            );
+            assert!(
+                desc.contains("作用"),
+                "field {i} (line {idx}) desc should start with 用途说明: {desc}"
             );
         }
-        // 描述行全部用「作用:」开头 —— 这是样式约定,提示用户可看。
-        // 同样通过 EXPECTED_KEYS 集合间接验证。
+        // 系统端口锁定行(row 11)+ 说明(row 12)仍渲染并提到 env key。
+        let sys_line = row_text(11);
+        assert!(
+            sys_line.contains("9465") && sys_line.contains("锁定"),
+            "locked system port row should show 9465 [锁定]: {sys_line}"
+        );
+        assert!(row_text(12).contains("OC_SERVE_SYSTEM_PORT"));
+    }
+
+    /// 「绑定设备」是设置面板中账户登录区的可点击信息行 —— 显示 env 中
+    /// DEVICE_NAME 的当前值;缺失时显示「(未绑定)」。**不是**可编辑字段
+    /// (不进 SETTINGS_FIELDS),但鼠标点击该行 → 关闭设置弹框 + 打开
+    /// 设备选择弹框(重新绑定)。Tab/↑/↓ 不能跳到。
+    #[test]
+    fn settings_panel_shows_bound_device_clickable_rebind() {
+        let mut app = TuiApp::test_stub();
+        let row_text = |idx: usize| -> String {
+            app.build_settings_lines()[idx]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+
+        // 未绑定时:行 idx=5 显示「(未绑定)」,并提示「点击选择设备」。
+        let unbound = row_text(5);
+        assert!(
+            unbound.contains("(未绑定)") && unbound.contains("点击"),
+            "未绑定时绑定设备行应显示 (未绑定) + 点击提示,实际: {unbound}"
+        );
+        // 绑定设备说明行(idx=6)含 DEVICE_NAME env key 与点击行为提示。
+        let unbound_desc = row_text(6);
+        assert!(
+            unbound_desc.contains("DEVICE_NAME")
+                && unbound_desc.contains("点击行")
+                && unbound_desc.contains("重新选择设备"),
+            "绑定设备说明行应提及 DEVICE_NAME + 点击重新选择: {unbound_desc}"
+        );
+        // 该行不在 FIELD_LINE_IDX 中 —— Tab/↑/↓ 不能进入编辑。
+        assert!(
+            !FIELD_LINE_IDX.contains(&5),
+            "绑定设备行(5)不应在 FIELD_LINE_IDX 中,否则 Tab 会进入"
+        );
+        assert!(
+            helper_settings_field_at_row(5).is_none(),
+            "绑定设备行(row=5)不应被 settings_field_at_row 识别为可编辑字段"
+        );
+
+        // 绑定后:同一行显示真实设备名 + 「点击重新绑定」标记,内容随
+        // account_config.device_name 实时变化。
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.device_name = "my-dev-pc".to_string();
+        }
+        let bound = row_text(5);
+        assert!(
+            bound.contains("my-dev-pc") && bound.contains("点击重新绑定"),
+            "已绑定时绑定设备行应显示真实设备名 + 点击重新绑定: {bound}"
+        );
+        // 描述行不变(env key + 点击行为提示保持一致)。
+        assert!(row_text(6).contains("DEVICE_NAME") && row_text(6).contains("点击行"));
+    }
+
+    /// 端到端:点击「绑定设备」只读行后,设置弹框关闭,缓存清空
+    /// (避免展示过期设备清单),后台 fetch 任务被 spawn。
+    /// 关键回归断言:fetch 未完成时 trigger 槽**必须保持空**,
+    /// 防止旧实现中"空壳 RemoteUserInfo(devices=vec![])被立即消费
+    /// → 弹出空设备弹窗" 的根因 bug 重新出现。
+    ///
+    /// 真实环境(fetch 网络成功)由 consume_device_picker_trigger
+    /// 单测覆盖:fetch 完成后 trigger 槽会被真 RemoteUserInfo 填入,
+    /// 下一帧 consume_device_picker_trigger 自动弹出设备选择弹框。
+    #[tokio::test]
+    async fn clicking_bound_device_row_closes_settings_and_does_not_eagerly_pop_empty_picker() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        // 首启标志关闭(避免首启规则阻止关弹框)
+        app.first_setup_required = false;
+        // 已配置账户(否则状态栏提示「未配置」)
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.account_id = "u-1".to_string();
+            guard.account_key = "k-abcdef".to_string();
+            guard.remote_path = "https://oc.isoops.com".to_string();
+        }
+        // 打开设置弹框,模拟点击「绑定设备」行的屏幕坐标。
+        app.input_mode = InputMode::SettingsAccountId;
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let bind_y = rect.y + 1 + 5;
+        let bind_x = rect.x + 4;
+        match app.find_target(bind_x, bind_y) {
+            Some(ClickTarget::SettingsBindDevice) => {}
+            other => panic!("expected SettingsBindDevice, got {other:?}"),
+        }
+
+        // 点击 —— 设置弹框关闭,缓存立即清空(避免过期数据被弹窗用),
+        // device_picker 不被立即填入空壳(原 bug 根因),trigger 槽等待
+        // fetch 完成后才写入。
+        app.click_at(bind_x, bind_y).await;
+        assert_eq!(
+            app.input_mode,
+            InputMode::Menu,
+            "点击绑定设备行后应关闭设置弹框(input_mode=Menu)"
+        );
+        assert!(
+            app.last_settings_popup_rect.is_none(),
+            "点击绑定设备行后应清空 last_settings_popup_rect"
+        );
+        assert!(
+            app.cached_user_info.is_none(),
+            "点击后应清空 cached_user_info —— 防止弹窗展示过期设备列表"
+        );
+        // 关键回归断言:fetch 未完成时,**不应**预先弹一个空设备清单弹窗。
+        // 旧实现会立刻写空壳 RemoteUserInfo(devices=vec![])到 trigger 槽,
+        // 下一帧 consume_device_picker_trigger 立即 take,弹出空弹窗。
+        // 修复后 trigger 槽必须保持空,直到 fetch 任务完成才写入。
+        assert!(
+            app.device_picker_trigger
+                .lock()
+                .map(|g| g.is_none())
+                .unwrap_or(true),
+            "fetch 未完成时 trigger 槽应保持空(避免空壳被立即消费弹出空弹窗)"
+        );
+        assert!(
+            app.device_picker.is_none(),
+            "fetch 未完成时 device_picker 应仍为 None(没有空弹窗)"
+        );
+    }
+
+    /// 根因回归测试:**已绑定状态下点击「重新绑定」,force=true 的触发
+    /// 必须弹窗**。
+    ///
+    /// 旧 bug:`consume_device_picker_trigger` 的 `already_bound` 检查
+    /// 无差别拦截所有触发 —— 用户点「重新绑定」时本地 DEVICE_NAME 必然
+    /// 非空,trigger 被静默丢弃(无弹窗、无日志),表现为"点击后没反应"。
+    /// 修复:trigger.force=true(用户主动触发)跳过已绑定检查。
+    #[test]
+    fn force_trigger_pops_picker_even_when_already_bound() {
+        let mk_info = || RemoteUserInfo {
+            id: "u-1".to_string(),
+            name: "alice".to_string(),
+            key: "k-abcdef".to_string(),
+            cloud_ip: None,
+            last_used_at: None,
+            devices: vec![RemoteDevice {
+                name: "dev-pc-1".to_string(),
+                port: 9464,
+                bound: false,
+            }],
+            sb: crate::account::RemoteSbConfig {
+                base_url: "https://md.isoops.com".to_string(),
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            },
+            created_at: None,
+            updated_at: None,
+        };
+
+        // 场景 1:已绑定 + force=true(用户点击「重新绑定」)→ 必须弹窗。
+        let mut app = TuiApp::test_stub();
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.device_name = "old-dev".to_string();
+        }
+        *app.device_picker_trigger.lock().unwrap() = Some(DevicePickerTrigger {
+            user_info: mk_info(),
+            account_key: "k-abcdef".to_string(),
+            remote_path: "https://oc.isoops.com".to_string(),
+            force: true,
+        });
+        app.consume_device_picker_trigger();
+        assert!(
+            app.device_picker.is_some(),
+            "已绑定 + force=true(用户主动重新绑定)必须弹出设备选择弹窗"
+        );
+
+        // 场景 2:已绑定 + force=false(启动时自动触发)→ 不弹(旧行为)。
+        let mut app2 = TuiApp::test_stub();
+        {
+            let mut guard = app2.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.device_name = "old-dev".to_string();
+        }
+        *app2.device_picker_trigger.lock().unwrap() = Some(DevicePickerTrigger {
+            user_info: mk_info(),
+            account_key: "k-abcdef".to_string(),
+            remote_path: "https://oc.isoops.com".to_string(),
+            force: false,
+        });
+        app2.consume_device_picker_trigger();
+        assert!(
+            app2.device_picker.is_none(),
+            "已绑定 + force=false(自动触发)不应弹窗(保持旧行为)"
+        );
     }
 
     #[test]
     fn build_settings_lines_has_expected_row_count_for_popup_geometry() {
         // 回归:设置弹框按钮行之前被裁掉,因为 `desired_h` 只算了上下边框,
-        // 漏算了 push 进去的空行和按钮行(`render_settings_popup` line 2970-2979)。
+        // 漏算了 push 进去的空行和按钮行(`render_settings_popup`)。
         // 锁住两个不变性,防止任何人不小心改坏:
-        // 1. build_settings_lines() 的输出行数 = 31(4 段标题 + 11 字段 +
-        //    11 字段说明 + 4 段间空行 + 1 help 行)。
+        // 1. build_settings_lines() 的输出行数 = 15(2 段标题 + 4 可编辑
+        //    字段 + 4 字段说明 + 1 系统端口只读行 + 1 系统端口说明 +
+        //    2 段间空行 + 1 help 行)。系统端口虽不进入 SETTINGS_FIELDS,
+        //    但行仍渲染 + 仍有描述行(写明 env key 给用户在 .env 中找)。
         // 2. desired_h 必须 ≥ lines.len() + 4(空行 + 按钮 + 上下边框),
-        //    这样 Paragraph 渲染区能装下完整 33 行内容(31 + 空 + 按钮),
-        //    按钮行不被裁,click region 与视觉位置一致。
+        //    这样 Paragraph 渲染区能装下完整内容,按钮行不被裁,
+        //    click region 与视觉位置一致。
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let backend = TestBackend::new(120, 60);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = TuiApp::test_stub();
-        app.input_mode = InputMode::SettingsAuthUsername;
+        app.input_mode = InputMode::SettingsAccountId;
         terminal
             .draw(|frame| {
                 app.render_settings_popup(frame);
@@ -4679,20 +5793,20 @@ let left = ratatui::layout::Layout::default()
             .expect("draw");
 
         let lines = app.build_settings_lines();
-        // 不变性 1:build_settings_lines 返回固定 31 行。改 build_settings_lines
+        // 不变性 1:build_settings_lines 返回固定 17 行。改 build_settings_lines
         // 时必须同步改这里,否则说明弹框内容布局发生重大变化,需要重新审视
         // 滚动逻辑 + click region + desired_h 公式。
         assert_eq!(
             lines.len(),
-            31,
-            "build_settings_lines must produce exactly 31 rows; \
+            17,
+            "build_settings_lines must produce exactly 17 rows; \
              if you intentionally added/removed a row, also re-derive \
              desired_h, FIELD_LINE_IDX, and max_offset"
         );
 
-        // 不变性 2:渲染后 last_settings_popup_rect 的高度必须 ≥ 35
-        // (33 行 Paragraph 内容 + 2 边框 = 35),否则按钮行视觉上被裁掉,
-        // click region 落在 rect 边界,用户看不到按钮 → "无法被点击"。
+        // 不变性 2:渲染后 last_settings_popup_rect 的高度必须 ≥
+        // lines.len() + 4(内容 + 空 + 按钮 + 2 边框),否则按钮行视觉上
+        // 被裁掉,click region 落在 rect 边界,用户看不到按钮。
         // 60 行的终端远大于所需,所以这里 h 应该等于 desired_h(不被 max_h 截)。
         let rect = app
             .last_settings_popup_rect
@@ -4757,7 +5871,7 @@ let left = ratatui::layout::Layout::default()
             let backend = TestBackend::new(120, terminal_h);
             let mut terminal = Terminal::new(backend).expect("terminal");
             let mut app = TuiApp::test_stub();
-            app.input_mode = InputMode::SettingsAuthUsername;
+            app.input_mode = InputMode::SettingsAccountId;
             terminal
                 .draw(|frame| {
                     app.render_settings_popup(frame);
@@ -4806,56 +5920,59 @@ let left = ratatui::layout::Layout::default()
             }
             // 不变性 4:scroll 后最后一行内容(应落在可视区底) ≤ total_content - 1
             // 即 max_offset 不会越界。
-            assert!(app.settings_scroll_offset <= 31, "scroll offset out of range");
+            assert!(
+                app.settings_scroll_offset <= 17,
+                "scroll offset out of range"
+            );
         }
     }
 
     // -----------------------------------------------------------------
     // 滚动行为回归测试
     //
-    // 这些测试模拟小终端(height < 31 行)的极端情况:设置弹框全部内容
+    // 这些测试模拟小终端(height < 15 行)的极端情况:设置弹框全部内容
     // 撑不下时,渲染层必须:
     //   (a) 把 FIELD_LINE_IDX 按 scroll_offset 平移到屏幕坐标;
     //   (b) 不再注册屏幕外字段的 click region(否则 find_target 失败 →
     //       click_at 走 dismiss_popup 分支 → 设置页误关)。
     //
-    // 之前的小终端 bug:USERNAME 在 build_settings_lines 第 1 行,但弹框
-    // 实际只能渲染 11 行,click region 仍按"完整布局"注册到屏幕 y =
-    // rect.y + 2,落在弹框外,find_target 返回 None,触发 dismiss。
+    // 之前的小终端 bug:账户ID 在 build_settings_lines 第 1 行,但弹框
+    // 实际只能渲染少数行,click region 仍按"完整布局"注册到屏幕外,
+    // find_target 返回 None,触发 dismiss。
     // -----------------------------------------------------------------
 
     // -----------------------------------------------------------------
     // 设置弹框点击行为(用户最新精确要求)
     //
     // 三条规则:
-    //   1. 点击弹框内部(含 USERNAME 字段、空白、说明、边框)→ 永不关闭。
+    //   1. 点击弹框内部(含账户ID 字段、空白、说明、边框)→ 永不关闭。
     //   2. 点击弹框外,普通设置(已配置)→ 关闭弹框。
     //   3. 点击弹框外,首次启动未配置 → 保持弹框打开,仅 Esc 可关闭。
     //
     // 决策抽成纯函数 `should_dismiss_settings_on_click`,可独立单测。
     // -----------------------------------------------------------------
 
-    /// 80 列宽 31 行高的"完整"设置弹框 rect(全屏可视、无滚动)。
-    /// x=20, y=5;向右向下覆盖到 100, 36。用于模拟典型桌面终端场景。
+    /// 80 列宽 19 行高的"完整"设置弹框 rect(15 行内容 + 边框/空行/按钮,
+    /// 全屏可视、无滚动)。x=20, y=5;向右向下覆盖到 100, 24。
     const FULL_POPUP_RECT: Rect = Rect {
         x: 20,
         y: 5,
         width: 80,
-        height: 31,
+        height: 19,
     };
 
     #[test]
     fn settings_outside_click_inside_popup_never_dismisses() {
         // 规则 1:点击弹框内部任何位置都不关闭,无论是否首启。
-        // 这里覆盖:左上角/右下角边框、USERNAME 字段行(模拟点击)
+        // 这里覆盖:左上角/右下角边框、账户ID 字段行(模拟点击)
         // 与字段之间的"空白 / 说明行"。
         let cases: [(u16, u16, &str); 6] = [
             (20, 5, "左上角边框"),                    // 弹框最左上
-            (99, 35, "右下角边框"),                    // 弹框最右下
-            (22, 6, "USERNAME 字段行(首行)"),          // USERNAME 在 line_idx=1
-            (50, 8, "USERNAME 字段说明行"),            // line_idx=2 是说明
-            (50, 11, "端口组标题行(line=6 空行后)"),   // line_idx=5/6 范围
-            (40, 30, "按钮行(底部)"),                  // 弹框最后一行
+            (99, 23, "右下角边框"),                   // 弹框最右下
+            (22, 7, "账户ID 字段行(首字段)"),        // 账户ID 在 line_idx=1
+            (50, 8, "账户ID 字段说明行"),             // line_idx=2 是说明
+            (50, 10, "远程路径字段行(line=5)"),      // line_idx=5 范围
+            (40, 22, "按钮行(底部)"),                 // 弹框底部按钮行
         ];
         for (col, row, label) in cases {
             // 普通设置模式:
@@ -4934,9 +6051,9 @@ let left = ratatui::layout::Layout::default()
             SettingsOutsideAction::Inside,
             "弹框顶边框应判定为 Inside"
         );
-        // 底边界(最后一行 row=35 = y + height - 1)仍 inside。
+        // 底边界(最后一行 row=23 = y + height - 1)仍 inside。
         assert_eq!(
-            should_dismiss_settings_on_click((50, 35), Some(FULL_POPUP_RECT), false),
+            should_dismiss_settings_on_click((50, 23), Some(FULL_POPUP_RECT), false),
             SettingsOutsideAction::Inside,
             "弹框底边框应判定为 Inside"
         );
@@ -4946,11 +6063,11 @@ let left = ratatui::layout::Layout::default()
             SettingsOutsideAction::DismissOutside,
             "col=100 已超出弹框右边框一列,应判定为弹框外"
         );
-        // 下方外侧(row=36 = y + height)→ 弹框外。
+        // 下方外侧(row=24 = y + height)→ 弹框外。
         assert_eq!(
-            should_dismiss_settings_on_click((50, 36), Some(FULL_POPUP_RECT), false),
+            should_dismiss_settings_on_click((50, 24), Some(FULL_POPUP_RECT), false),
             SettingsOutsideAction::DismissOutside,
-            "row=36 已超出弹框下边框一行,应判定为弹框外"
+            "row=24 已超出弹框下边框一行,应判定为弹框外"
         );
     }
 
@@ -4991,7 +6108,7 @@ let left = ratatui::layout::Layout::default()
         let mut app = TuiApp::test_stub();
         app.first_setup_required = first_setup_required;
         app.last_settings_popup_rect = Some(rect);
-        app.input_mode = InputMode::SettingsAuthUsername; // 设置弹框已开
+        app.input_mode = InputMode::SettingsAccountId; // 设置弹框已开
         // 注册与渲染几何一致的 click region(字段、按钮都注册)。
         // 这样"在 rect 内某 line idx 上有 SettingsField region"的点
         // 会命中 → 模拟字段点击;而"在 rect 内某 line idx 无 region"
@@ -5002,12 +6119,12 @@ let left = ratatui::layout::Layout::default()
 
     #[test]
     fn click_at_inside_settings_popup_on_blank_keeps_popup_open() {
-        // 关键 bug 场景:点弹框内的"说明行"(line_idx=2 是 USERNAME 的
+        // 关键 bug 场景:点弹框内的"说明行"(line_idx=2 是 账户ID 的
         // 作用说明),该行没有 click region;旧 click_at 会把它判成
         // "点弹框外" → dismiss。修复后必须保持打开。
         let rect = Rect::new(20, 5, 80, 31);
         let mut app = open_settings_app(false, rect);
-        // (50, 8) = 弹框内第 3 行(USERNAME 字段说明行),无 click region。
+        // (50, 8) = 弹框内第 3 行(账户ID 字段说明行),无 click region。
         tokio_test::block_on(app.click_at(50, 8));
         assert!(
             app.input_mode.is_settings_field(),
@@ -5074,6 +6191,103 @@ let left = ratatui::layout::Layout::default()
         );
     }
 
+    // -----------------------------------------------------------------
+    // /api/user/info mock server
+    //
+    // submit_settings 现在必须先通过 /api/user/info 拉取账户信息才能
+    // 落盘。为了不依赖真实网络,测试里用一个最小 std::net HTTP 服务
+    // 对任何请求回固定 200 JSON。reqwest 走 http://127.0.0.1:<port>
+    // 无需 TLS。
+    // -----------------------------------------------------------------
+
+    /// mock 用户信息(sb 字段为空 → submit 不触发 store 后台刷新任务;
+    /// 需要完整 sb 的用 [`FULL_USER_INFO_JSON`)。
+    const MOCK_USER_INFO_JSON: &str = r#"{
+        "id": "tester",
+        "name": "Tester",
+        "key": "test-key-0123456789abcdef",
+        "sb": { "base_url": "", "username": "", "password": "" }
+    }"#;
+
+    /// 带完整 sb 凭据的 mock 用户信息(触发 store.with_remote 后台任务)。
+    const FULL_USER_INFO_JSON: &str = r#"{
+        "id": "tester",
+        "name": "Tester",
+        "key": "test-key-0123456789abcdef",
+        "sb": {
+            "base_url": "http://127.0.0.1:1",
+            "username": "sb-user",
+            "password": "sb-pass"
+        }
+    }"#;
+
+    /// submit 类测试都写同一个 `unified_env_path()` 文件(测试 bin 目录),
+    /// 并行跑会互相覆盖 / 误删。用全局互斥锁把这类测试串行化。
+    /// 持锁跨 await 是刻意为之:锁必须覆盖 submit_settings 的整个
+    /// await 期间;#[tokio::test] 是单线程 runtime,不会自死锁。
+    static ENV_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// 在 127.0.0.1 随机端口起一个单线程 HTTP 服务,对任何请求返回
+    /// `200 {body}`。返回 (base_url, join_handle)。最多服务 16 个连接,
+    /// 之后线程退出,避免测试进程残留阻塞线程。
+    fn spawn_user_info_server(body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                // 读满 header(到 \r\n\r\n)。
+                let header_end = loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break None,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                                break Some(pos + 4);
+                            }
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(header_end) = header_end else { continue };
+                // 按 Content-Length 读满 body(忽略内容)。
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     /// 模拟小终端:弹框高 8 行(含边框),build_settings_lines 有 31 行内容。
     /// 注册 click region 后,**字段** click region 的屏幕 y 必须落在
     /// 内容区内(`rect.y + 1` 到 `rect.y + popup_h - 4`,最后两行为空行+按钮保留)。
@@ -5124,39 +6338,47 @@ let left = ratatui::layout::Layout::default()
                 _ => {}
             }
         }
-        // 至少注册到一些字段(USERNAME 在 row=1,offset=0 → 屏幕 row=1 可见)。
+        // 至少注册到一些字段(账户ID 在 row=1,offset=0 → 屏幕 row=1 可见)。
         assert!(
             app.click_regions
                 .iter()
-                .any(|r| matches!(r.target, ClickTarget::SettingsField(InputMode::SettingsAuthUsername))),
-            "scroll_offset=0 时 USERNAME (line 1) 必须可见"
+                .any(|r| matches!(r.target, ClickTarget::SettingsField(InputMode::SettingsAccountId))),
+            "scroll_offset=0 时 账户ID (line 1) 必须可见"
         );
     }
 
-    #[test]
-    fn settings_popup_button_click_triggers_handler_end_to_end() {
-        // 端到端验证:点击设置弹框的 [确认] / [取消] / [打开配置目录]
-        // 按钮位置必须真正触发对应 handler。这是用户原报告"按钮点不动"
-        // 的核心回归测试 —— 之前 btn_y 错位到下边框 row,鼠标点击按钮
-        // 区域时 find_target 找不到 click region,handler 不触发。
-        //
-        // submit_settings 内部有必填校验(USERNAME / PASSWORD 不能空),
-        // 校验失败时会把 input_mode 改回对应字段并 return。我们填好
-        // 必填字段 + 端口,SUBMIT 才会一路走到关闭弹框。
+    /// 端到端验证(带 /api/user/info mock):点击设置弹框的
+    /// [确认] / [取消] / [打开配置目录] 按钮位置必须真正触发对应 handler。
+    ///
+    /// submit_settings 现在会先调 /api/user/info(真实网络),所以本测试:
+    /// 1. 起本地 mock server 返回固定用户信息(sb 为空,避免触发
+    ///    store 后台刷新的 tokio::spawn —— 本测试跑在 #[tokio::test]
+    ///    runtime 上,spawn 本身可用,但空 sb 让断言更聚焦);
+    /// 2. remote_path_input 指向 mock,让 fetch 成功 → submit 一路走到
+    ///    关闭弹框。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_WRITE_LOCK 必须覆盖 await,见其文档注释
+    async fn settings_popup_button_click_triggers_handler_end_to_end() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        let _env_guard = ENV_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (remote, _server) = spawn_user_info_server(MOCK_USER_INFO_JSON.to_string());
         let backend = TestBackend::new(120, 50);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = TuiApp::test_stub();
         // first_setup_required = false:让 SettingsCancel 点完能正常关闭
         // 弹框(否则首启规则会阻止关闭)。
         app.first_setup_required = false;
-        // 填必填字段,让 submit_settings 通过校验关闭弹框。
-        app.username_input = "tester".to_string();
-        app.password_input = "secret".to_string();
+        // 填必填账户字段 + 端口,让 submit_settings 通过校验关闭弹框。
+        app.account_id_input = "tester".to_string();
+        app.account_key_input = "test-key-0123456789abcdef".to_string();
+        app.remote_path_input = remote;
         app.system_port_input = "9465".to_string();
         app.opencode_port_input = "9464".to_string();
-        app.input_mode = InputMode::SettingsAuthUsername;
+        app.input_mode = InputMode::SettingsAccountId;
+        // 清掉历史 env,避免残留干扰断言(测试结束再次清理)。
+        let env_path = crate::config::unified_env_path();
+        let _ = std::fs::remove_file(&env_path);
 
         terminal
             .draw(|frame| app.render_settings_popup(frame))
@@ -5185,7 +6407,7 @@ let left = ratatui::layout::Layout::default()
         ));
 
         // 1) 点 [确认]:input_mode 应跳到 Menu(说明弹框被关闭)。
-        tokio_test::block_on(app.click_at(ok_x, btn_y));
+        app.click_at(ok_x, btn_y).await;
         assert_eq!(
             app.input_mode,
             InputMode::Menu,
@@ -5195,16 +6417,23 @@ let left = ratatui::layout::Layout::default()
             app.last_settings_popup_rect.is_none(),
             "clicking [确认] should clear last_settings_popup_rect"
         );
+        // submit 成功后 auth 应被账户信息自动填充(name 优先,sb 密码为空
+        // 时回退账户密钥)。
+        {
+            let auth = app.auth.read().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(auth.basic_user, "Tester");
+            assert_eq!(auth.basic_password, "test-key-0123456789abcdef");
+        }
 
         // 2) 重新打开弹框,点 [取消]:弹框应关闭,input_mode = Menu。
-        app.input_mode = InputMode::SettingsAuthUsername;
+        app.input_mode = InputMode::SettingsAccountId;
         app.last_settings_popup_rect = None;
         terminal
             .draw(|frame| app.render_settings_popup(frame))
             .expect("draw 2");
         let rect2 = app.last_settings_popup_rect.expect("popup rect 2");
         let btn_y2 = rect2.y + rect2.height - 2;
-        tokio_test::block_on(app.click_at(rect2.x + 15, btn_y2));
+        app.click_at(rect2.x + 15, btn_y2).await;
         assert_eq!(
             app.input_mode,
             InputMode::Menu,
@@ -5213,7 +6442,7 @@ let left = ratatui::layout::Layout::default()
 
         // 3) 重新打开弹框,点 [打开配置目录]:弹框保持打开(不关闭),
         // handler 不改 input_mode(open_config_dir 失败仅写状态条)。
-        app.input_mode = InputMode::SettingsAuthUsername;
+        app.input_mode = InputMode::SettingsAccountId;
         app.last_settings_popup_rect = None;
         terminal
             .draw(|frame| app.render_settings_popup(frame))
@@ -5221,7 +6450,7 @@ let left = ratatui::layout::Layout::default()
         let rect3 = app.last_settings_popup_rect.expect("popup rect 3");
         let btn_y3 = rect3.y + rect3.height - 2;
         let prev_mode = app.input_mode;
-        tokio_test::block_on(app.click_at(rect3.x + 28, btn_y3));
+        app.click_at(rect3.x + 28, btn_y3).await;
         assert_eq!(
             app.input_mode, prev_mode,
             "clicking [打开配置目录] should NOT close popup"
@@ -5230,28 +6459,32 @@ let left = ratatui::layout::Layout::default()
         // 4) 边界:点击按钮下方一行(下边框)应识别为"在弹框内",不关闭弹框。
         // 早期版本 btn_y 错位到这里,导致点击按钮"误中"了下边框行 →
         // click_at 走 dismiss 路径把弹框关掉。这条断言锁住 reverse bug。
-        tokio_test::block_on(app.click_at(rect3.x + 4, rect3.y + rect3.height - 1));
+        app.click_at(rect3.x + 4, rect3.y + rect3.height - 1).await;
         assert_eq!(
             app.input_mode, prev_mode,
             "clicking on bottom border row should NOT close popup"
         );
+
+        // 清理:删除测试 env,避免污染后续 cargo test run。
+        let _ = std::fs::remove_file(&env_path);
     }
 
     #[test]
     fn settings_popup_submit_without_required_fields_keeps_popup_open() {
-        // 真实场景:用户点 [确认] 但没填必填字段(USERNAME/PASSWORD),
+        // 真实场景:用户点 [确认] 但没填必填字段(账户ID / 密钥),
         // submit_settings 校验失败 → input_mode 改回对应字段 + 弹框保留。
         // 这是用户报告"三个按钮功能未生效"的真实原因之一:
         // 必填校验把弹框拦下来,但视觉上像是"没反应"。
+        // 注:校验在任何网络请求之前,不需要 mock server。
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let backend = TestBackend::new(120, 50);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = TuiApp::test_stub();
         app.first_setup_required = false;
-        // 注意:username/password/system_port/opencode_port 都是空字符串 —
-        // 这正是用户没填任何字段的状态。
-        app.input_mode = InputMode::SettingsAuthUsername;
+        // 注意:账户ID / 密钥都是空字符串 —— 这正是用户没填任何字段的
+        // 状态。remote_path 虽有默认值,但账户校验先失败。
+        app.input_mode = InputMode::SettingsAccountId;
 
         terminal
             .draw(|frame| app.render_settings_popup(frame))
@@ -5260,12 +6493,12 @@ let left = ratatui::layout::Layout::default()
         let btn_y = rect.y + rect.height - 2;
         let ok_x = rect.x + 4;
         // 点 [确认]:submit_settings 应在校验处 return,input_mode 应
-        // 改成 SettingsAuthUsername(让用户去填用户名)而不是 Menu。
+        // 改成 SettingsAccountId(让用户去填账户ID)而不是 Menu。
         tokio_test::block_on(app.click_at(ok_x, btn_y));
         assert_eq!(
             app.input_mode,
-            InputMode::SettingsAuthUsername,
-            "未填 USERNAME 时 submit 应把焦点切回 USERNAME 字段,弹框应保留"
+            InputMode::SettingsAccountId,
+            "未填 账户ID 时 submit 应把焦点切回账户ID 字段,弹框应保留"
         );
         assert!(
             app.last_settings_popup_rect.is_some(),
@@ -5274,7 +6507,7 @@ let left = ratatui::layout::Layout::default()
         // 状态条应给出错误提示(供 UI 显示)。
         let status = app.status_message.lock().unwrap().clone();
         assert!(
-            status.contains("USERNAME") || status.contains("用户名") || status.contains("PASSWORD") || status.contains("密码"),
+            status.contains("账户ID") || status.contains("账户"),
             "submit 校验失败应写错误提示到状态条,实际: {status}"
         );
     }
@@ -5290,7 +6523,7 @@ let left = ratatui::layout::Layout::default()
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = TuiApp::test_stub();
         app.first_setup_required = false;
-        app.input_mode = InputMode::SettingsAuthUsername;
+        app.input_mode = InputMode::SettingsAccountId;
 
         terminal
             .draw(|frame| app.render_settings_popup(frame))
@@ -5327,7 +6560,7 @@ let left = ratatui::layout::Layout::default()
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = TuiApp::test_stub();
         app.first_setup_required = false;
-        app.input_mode = InputMode::SettingsAuthUsername;
+        app.input_mode = InputMode::SettingsAccountId;
 
         // 第一次 render:画弹框
         terminal.draw(|f| app.render(f)).expect("draw 1");
@@ -5360,16 +6593,16 @@ let left = ratatui::layout::Layout::default()
     fn settings_click_regions_shift_with_scroll_offset() {
         let mut app = TuiApp::test_stub();
         let rect = ratatui::layout::Rect::new(10, 5, 80, 8);
-        // scroll_offset=20:屏幕行 0..7 对应 build_settings_lines 行 20..27。
-        // FIELD_LINE_IDX 中 21, 23, 25, 27 都在 20..28,可见;1, 3, 7, 9, 13, 15, 17
-        // 都不在 20..28 范围,不可见 → 不应注册。
-        app.register_settings_click_regions(rect, 99, 20, 8);
+        // scroll_offset=10:屏幕行 0..3(内容区 4 行)对应 build_settings_lines
+        // 行 10..14。FIELD_LINE_IDX [1, 3, 7, 13] 中只有 13 在 [10,14) 可见;
+        // 1, 3, 7 都不在范围,不可见 → 不应注册。
+        app.register_settings_click_regions(rect, 99, 10, 8);
 
         let visible_y_min = rect.y + 1;
         let visible_y_max = rect.y + rect.height.saturating_sub(1);
         // 收集所有 field click region 的 y,断言:
         //   (a) 全部在可见范围 [visible_y_min, visible_y_max) 内;
-        //   (b) 屏幕外字段(USERNAME line=1)不能出现。
+        //   (b) 屏幕外字段(账户ID line=1)不能出现。
         for region in &app.click_regions {
             if matches!(region.target, ClickTarget::SettingsField(_)) {
                 assert!(
@@ -5382,16 +6615,16 @@ let left = ratatui::layout::Layout::default()
         assert!(
             !app.click_regions.iter().any(|r| matches!(
                 r.target,
-                ClickTarget::SettingsField(InputMode::SettingsAuthUsername)
+                ClickTarget::SettingsField(InputMode::SettingsAccountId)
             )),
-            "scroll_offset=20 时 USERNAME (line 1) 不可见,不应注册 click region"
+            "scroll_offset=10 时 账户ID (line 1) 不可见,不应注册 click region"
         );
         assert!(
             app.click_regions.iter().any(|r| matches!(
                 r.target,
-                ClickTarget::SettingsField(InputMode::SettingsRatholeHost)
+                ClickTarget::SettingsField(InputMode::SettingsServePort)
             )),
-            "scroll_offset=20 时 RatholeHost (line 21) 可见,必须注册"
+            "scroll_offset=10 时 OpenCode 端口 (line 13) 可见,必须注册"
         );
     }
 
@@ -5400,32 +6633,207 @@ let left = ratatui::layout::Layout::default()
     /// 越界(屏幕外)行 → None,与 scroll_offset=0 的旧行为兼容。
     #[test]
     fn settings_field_at_row_respects_scroll_offset() {
-        // offset=0:行为与原测试一致(USERNAME 在屏幕 row 1)。
+        // offset=0:行为与原测试一致(账户ID 在屏幕 row 1)。
         assert_eq!(
             TuiApp::helper_settings_field_at_row_with_offset(1, 0),
-            Some(InputMode::SettingsAuthUsername)
+            Some(InputMode::SettingsAccountId)
         );
-        // offset=20:屏幕 row 1 对应原始行 21 → RatholeHost。
+        // offset=10:屏幕 row 1 对应原始行 11 → 系统端口(锁定行,不在表中 → None)。
+        // 改为 offset=12 → 屏幕 row 1 对应原始行 13 → OpenCode 端口。
         assert_eq!(
-            TuiApp::helper_settings_field_at_row_with_offset(1, 20),
-            Some(InputMode::SettingsRatholeHost)
+            TuiApp::helper_settings_field_at_row_with_offset(1, 12),
+            Some(InputMode::SettingsServePort)
         );
-        // offset=20:屏幕 row 5 对应原始行 25 → RatholeName。
+        // offset=10:屏幕 row 3 对应原始行 13 → OpenCode 端口(内容区底行)。
         assert_eq!(
-            TuiApp::helper_settings_field_at_row_with_offset(5, 20),
-            Some(InputMode::SettingsRatholeName)
+            TuiApp::helper_settings_field_at_row_with_offset(3, 10),
+            Some(InputMode::SettingsServePort)
         );
-        // offset=20:屏幕 row 0 是原始行 20("Rathole 内网穿透设置"标题) → None。
-        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(0, 20), None);
-        // offset=20:屏幕 row 6 是原始行 26(描述行) → None。
-        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(6, 20), None);
-        // offset=20:屏幕 row 7 对应原始行 27 → RatholeToken(刚好可见)。
+        // offset=12:屏幕 row 0 是原始行 12(系统端口说明行) → None。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(0, 12), None);
+        // offset=10:屏幕 row 4 是原始行 14(OpenCode 端口说明) → None。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(4, 10), None);
+        // offset=0:屏幕 row 7 对应原始行 7 → 远程路径。
         assert_eq!(
-            TuiApp::helper_settings_field_at_row_with_offset(7, 20),
-            Some(InputMode::SettingsRatholeToken)
+            TuiApp::helper_settings_field_at_row_with_offset(7, 0),
+            Some(InputMode::SettingsRemotePath)
         );
-        // offset=20:屏幕 row 8 超出 popup_h=8 → 内容区外,即便有 FIELD_LINE_IDX 也不该出现。
-        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(8, 20), None);
+        // 屏幕行 8 超出 popup_h=8 → 内容区外,即便有 FIELD_LINE_IDX 也不该出现。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(8, 10), None);
+    }
+
+    /// 系统端口(`OC_SERVE_SYSTEM_PORT`)在设置面板中**强制锁定为 9465**,
+    /// 用户不可编辑。因此 `SETTINGS_FIELDS` 中必须不包含
+    /// `SettingsHttpPort` —— Tab / ↑ / ↓ / 点击都不会跳到该字段。
+    #[test]
+    fn settings_fields_excludes_locked_system_port() {
+        assert!(
+            !SETTINGS_FIELDS.contains(&InputMode::SettingsHttpPort),
+            "系统端口已强制为 9465,不应出现在 Tab 循环的字段列表中"
+        );
+    }
+
+    /// 系统端口位于 build_settings_lines 的 row 9;该行仍是渲染行
+    /// (展示 "系统端口: 9465 [锁定]" 等),但**点击/Tab 不能进入编辑**——
+    /// `settings_field_at_row(9, _)` 必须返回 `None`。
+    #[test]
+    fn locked_system_port_row_is_not_an_editable_field() {
+        // 锁定字段位置:row 9(在 popup 顶部计数)。
+        assert_eq!(
+            TuiApp::helper_settings_field_at_row_with_offset(9, 0),
+            None,
+            "row 9 是显示用的系统端口行,不应被点击/Tab 选中"
+        );
+    }
+
+    /// 端到端(mock /api/user/info):即使 `system_port_input` 被外部篡改
+    /// 为非 9465,调用 `submit_settings` 后持久化的 env 文件里
+    /// `OC_SERVE_SYSTEM_PORT` 仍是 `9465`。这是"硬锁定"的最终防线 ——
+    /// 即便绕过 UI,内部 buffer 也无法把端口写到非 9465。
+    /// 同时验证 AccountConfig / auth 被正确落盘(增量 upsert,不整文件覆盖)。
+    ///
+    /// 注:`submit_settings` 写到 `unified_env_path()`,测试 cargo 跑出的
+    /// binary 落在 `target/debug/deps/`,所以写入位置是测试 bin 目录,
+    /// 不污染用户真实配置。运行后从该路径读回校验。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_WRITE_LOCK 必须覆盖 await,见其文档注释
+    async fn submit_settings_always_writes_9465_for_system_port() {
+        use crate::account::read_env_kv;
+        use crate::config::unified_env_path;
+
+        let _env_guard = ENV_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (remote, _server) = spawn_user_info_server(FULL_USER_INFO_JSON.to_string());
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        // 模拟"用户成功绕过 UI 把 system_port_input 改成 9999"。
+        app.account_id_input = "tester".to_string();
+        app.account_key_input = "test-key-0123456789abcdef".to_string();
+        app.remote_path_input = remote.clone();
+        app.system_port_input = "9999".to_string();
+        app.opencode_port_input = "9464".to_string();
+        app.input_mode = InputMode::SettingsAccountId;
+
+        // 先清空目标 env(避免历史残留干扰断言)。
+        let env_path = unified_env_path();
+        let _ = std::fs::remove_file(&env_path);
+
+        app.submit_settings().await;
+
+        let kv = read_env_kv(&env_path);
+        let get = |k: &str| -> String {
+            kv.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            get(crate::config::keys::SYSTEM_PORT),
+            "9465",
+            "系统端口被锁定为 9465,即使 buffer 里有别的值也不能写出去"
+        );
+        // 账户配置写盘(ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH)。
+        assert_eq!(get("ACCOUNT_ID"), "tester");
+        assert_eq!(get("ACCOUNT_KEY"), "test-key-0123456789abcdef");
+        assert_eq!(get("REMOTE_PATH"), remote);
+        // auth 从账户信息自动填充:name 优先做 basic_user,sb.password 做
+        // basic_password。
+        assert_eq!(get("OPENCODE_SERVER_USERNAME"), "Tester");
+        assert_eq!(get("OPENCODE_SERVER_PASSWORD"), "sb-pass");
+        assert_eq!(get(crate::config::keys::OPENCODE_PORT), "9464");
+        // 内存 auth 与 AccountConfig 同步更新。
+        {
+            let auth = app.auth.read().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(auth.basic_user, "Tester");
+            assert_eq!(auth.basic_password, "sb-pass");
+        }
+        {
+            let ac = app
+                .account_config
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(ac.account_id, "tester");
+            assert!(ac.is_configured());
+        }
+        // 从账户信息填充时记录"已保存密码长度"("sb-pass" = 7 位)。
+        assert_eq!(app.auth_password_mask_len, 7);
+
+        // 清理:删除测试 env,避免污染后续 cargo test run。
+        let _ = std::fs::remove_file(&env_path);
+    }
+
+    /// submit 校验:远程路径必须 http(s):// 开头(校验发生在任何网络
+    /// 请求之前,无需 mock server)。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_WRITE_LOCK 必须覆盖 await,见其文档注释
+    async fn submit_settings_rejects_non_http_remote_path() {
+        let _env_guard = ENV_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        app.account_id_input = "tester".to_string();
+        app.account_key_input = "test-key-0123456789abcdef".to_string();
+        app.remote_path_input = "ftp://oc.isoops.com".to_string();
+        app.opencode_port_input = "9464".to_string();
+        app.input_mode = InputMode::SettingsAccountId;
+
+        let env_path = crate::config::unified_env_path();
+        let _ = std::fs::remove_file(&env_path);
+
+        app.submit_settings().await;
+        assert_eq!(
+            app.input_mode,
+            InputMode::SettingsRemotePath,
+            "远程路径非法时 submit 应把焦点切回该字段"
+        );
+        let status = app.status_message.lock().unwrap().clone();
+        assert!(
+            status.contains("http"),
+            "应提示 http(s):// 前缀要求,实际: {status}"
+        );
+        // 校验失败不落盘。
+        assert!(!env_path.exists(), "校验失败时不应写 env 文件");
+        let _ = std::fs::remove_file(&env_path);
+    }
+
+    /// 设置弹框分节标题:账户化后只有「账户登录」与「端口设置」两段。
+    #[test]
+    fn settings_section_titles_use_account_and_port_labels() {
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        app.opencode_port_input = "9464".to_string();
+        app.input_mode = InputMode::Menu;
+
+        let lines = app.build_settings_lines();
+        let all_text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            all_text.iter().any(|t| t.contains("账户登录")),
+            "expected '账户登录' title, got: {all_text:?}"
+        );
+        assert!(
+            all_text.iter().any(|t| t.contains("端口设置")),
+            "expected '端口设置' title, got: {all_text:?}"
+        );
+        // 旧标题 / 旧分区不应再出现。
+        for banned in [
+            "认证设置",
+            "SilverBullet",
+            "Rathole 内网穿透设置",
+            "云服务配置",
+            "USERNAME",
+            "PASSWORD",
+        ] {
+            assert!(
+                !all_text.iter().any(|t| t.contains(banned)),
+                "old section/field '{banned}' should be gone: {all_text:?}"
+            );
+        }
     }
 }
 
@@ -5436,11 +6844,12 @@ let left = ratatui::layout::Layout::default()
 impl TuiApp {
     /// 带滚动偏移版本的 helper:屏幕行 `row` 对应 `build_settings_lines`
     /// 的第 `row + scroll_offset` 行,所以查找的是 FIELD_LINE_IDX == row + offset。
+    /// 行表直接复用模块级 [`FIELD_LINE_IDX`],与生产代码共享同一张表,
+    /// 布局改动时测试自动跟随。
     fn helper_settings_field_at_row_with_offset(
         row: u16,
         scroll_offset: u16,
     ) -> Option<InputMode> {
-        const FIELD_LINE_IDX: [u16; 11] = [1, 3, 7, 9, 13, 15, 17, 21, 23, 25, 27];
         FIELD_LINE_IDX
             .iter()
             .position(|&r| r == row + scroll_offset)
@@ -5455,8 +6864,8 @@ impl TuiApp {
     /// 构造函数要求一个可写路径;tempdir 保证测试结束后自动清理。
     #[allow(clippy::too_many_lines)]
     fn test_stub() -> TuiApp {
+        use crate::account::AccountConfig as TestAccountConfig;
         use crate::auth::AuthConfig;
-        use crate::config::{RatholeConfig, SbConfig};
         use crate::serve::ServeStatus;
         use crate::storage::FileCache;
         use crate::storage::PathListStore;
@@ -5468,7 +6877,6 @@ impl TuiApp {
             auth: Arc::new(RwLock::new(AuthConfig {
                 basic_user: String::new(),
                 basic_password: String::new(),
-                sb_cookie_name: None,
             })),
             log_buffer: LogBuffer::default(),
             store: Arc::new(PathListStore::new(cache)),
@@ -5478,7 +6886,7 @@ impl TuiApp {
             status_message: Arc::new(Mutex::new(String::new())),
             cached_status: Arc::new(Mutex::new(ServeStatus::default())),
             should_quit: false,
-            input_mode: InputMode::SettingsAuthUsername,
+            input_mode: InputMode::SettingsAccountId,
             focus: Focus::Main,
             sub_page: None,
             attached_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -5488,30 +6896,19 @@ impl TuiApp {
             auth_password_mask_len: 0,
             show_full_log: false,
             log_scroll: 0,
+            log_select_anchor: None,
+            log_select_current: None,
+            last_full_log_inner: None,
+            full_log_notice: None,
             confirm: None,
             confirm_choice: ConfirmChoice::Confirm,
-            sb_config: Arc::new(RwLock::new(SbConfig {
-                url: String::new(),
-                user: String::new(),
-                password: String::new(),
-            })),
-            remote_status: Arc::new(Mutex::new(String::new())),
+            account_config: Arc::new(RwLock::new(TestAccountConfig::default())),
             program_started_at: chrono::Local::now(),
             system_port_input: String::new(),
             opencode_port_input: String::new(),
-            sb_url_input: String::new(),
-            sb_user_input: String::new(),
-            sb_password_input: String::new(),
-            rathole_config: Arc::new(RwLock::new(RatholeConfig {
-                host: String::new(),
-                port: String::new(),
-                name: String::new(),
-                token: String::new(),
-            })),
-            rathole_host_input: String::new(),
-            rathole_port_input: String::new(),
-            rathole_name_input: String::new(),
-            rathole_token_input: String::new(),
+            account_id_input: String::new(),
+            account_key_input: String::new(),
+            remote_path_input: DEFAULT_REMOTE_PATH.to_string(),
             click_regions: Vec::new(),
             mouse_pos: None,
             settings_scroll_offset: 0,
@@ -5520,6 +6917,9 @@ impl TuiApp {
             last_settings_popup_rect: None,
             first_setup_required: true,
             pending_attach: None,
+            device_picker: None,
+            device_picker_trigger: Arc::new(Mutex::new(None)),
+            cached_user_info: None,
         }
     }
 }

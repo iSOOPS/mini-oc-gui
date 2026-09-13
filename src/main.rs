@@ -15,8 +15,11 @@ use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use mini_oc_gui_serve::{
+    account::{
+        AccountConfig, DevicePickerTrigger, DevicePickerTriggerSlot, fetch_user_info,
+        validate_user_info_integrity,
+    },
     auth::AuthConfig,
-    config::{RatholeConfig, SbConfig},
     error::AppError,
     handlers::{AppState, router},
     serve::ServeSupervisor,
@@ -42,8 +45,11 @@ struct Cli {
     #[arg(long)]
     no_http: bool,
 
-    /// Generate a random HTTP Basic password, write it to
+    /// (Deprecated) Generate a random HTTP Basic password, write it to
     /// `.oc-serve-auth.env` (chmod 600 on Unix) and exit.
+    ///
+    /// Kept for backward compatibility; account login (ACCOUNT_KEY) is
+    /// now the preferred way to provision credentials.
     #[arg(long)]
     generate_auth: bool,
 
@@ -84,21 +90,13 @@ async fn main() -> Result<()> {
     let unified_env_path = cli
         .auth_env
         .clone()
-        .map(PathBuf::from)
         .or_else(|| Some(mini_oc_gui_serve::config::unified_env_path()))
         .expect("unified_env_path always returns Some");
 
-    // 一次性迁移 1:旧版独立的 .oc-serve-sb.env / .oc-serve-rathole.env 文件
-    // 合并进统一 env 后删除。完成后 Ok(false) 不再处理。
-    match mini_oc_gui_serve::config::migrate_legacy_env(&unified_env_path) {
-        Ok(true) => tracing::info!("已将旧 SB / Rathole env 合并到 {}", unified_env_path.display()),
-        Ok(false) => {}
-        Err(e) => tracing::warn!("迁移旧 env 文件失败: {e}"),
-    }
-
-    // 一次性迁移 2:cwd 下的旧 .oc-serve-auth.env → 新位置(可执行文件同目录)
+    // 一次性迁移:cwd 下的旧 .oc-serve-auth.env → 新位置(可执行文件同目录)
     // 旧位置(通常 ./)有文件 + 新位置没有 → 复制内容过去 + 删除旧文件。
     // 这一步只在用户没设 OC_SERVE_AUTH_ENV / --auth-env 时生效。
+    // 该文件承载 ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH 账户登录信息。
     if cli.auth_env.is_none() && std::env::var("OC_SERVE_AUTH_ENV").is_err() {
         let legacy_cwd_path = PathBuf::from(mini_oc_gui_serve::config::UNIFIED_ENV_FILE);
         if legacy_cwd_path.exists() && !unified_env_path.exists() {
@@ -117,7 +115,24 @@ async fn main() -> Result<()> {
 
     let _ = dotenvy::from_filename_override(&unified_env_path);
 
-    // 4. Resolve config from env + auth file.
+    // 4. 加载账户配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH）。
+    let account_config = AccountConfig::load();
+
+    // --no-tui 模式无交互终端，未配置账户时提前退出。
+    if cli.no_tui && !account_config.is_configured() {
+        anyhow::bail!(
+            "未配置账户登录信息。\n\
+             --no-tui 模式无法交互填写，请先运行 TUI 模式完成首次配置。"
+        );
+    }
+
+    // 每次启动都验证 device-name：未绑定（DEVICE_NAME 为空）时，等下方
+    // fetch_user_info 后台任务拿到远端设备清单后，由 TUI 弹出设备选择。
+    if account_config.is_configured() && !account_config.has_bound_device() {
+        tracing::info!("本地未配置 DEVICE_NAME —— fetch_user_info 完成后将弹出设备选择");
+    }
+
+    // 5. Resolve config from env + auth file.
     // 系统监听端口(axum path-list 管理接口)。独立于 opencode 服务端口
     // `OC_SERVE_OPENCODE_PORT`(默认 9464),避免两者同时监听同一端口,
     // 导致「启动 serv」时报「端口被占用」。
@@ -171,24 +186,97 @@ async fn main() -> Result<()> {
     }
     let cache = FileCache::new(&path_list_file);
     let store = PathListStore::new(cache);
-    let sb_config = Arc::new(std::sync::RwLock::new(SbConfig::load()));
-    let rathole_config = Arc::new(std::sync::RwLock::new(RatholeConfig::load()));
-    if let Ok(cfg) = sb_config.read() {
-        if cfg.is_configured() {
-            let remote = RemoteClient::with_credentials(cfg.url.clone(), cfg.user.clone(), cfg.password.clone());
-            store.with_remote(remote).await;
-        }
-    }
-    // One-shot legacy-path migration (runs only if remote is configured).
-    // Idempotent: no-op on subsequent process restarts.
-    if let Err(e) = store.migrate_from_legacy_remote().await {
-        tracing::warn!("legacy migration failed: {e}");
-    }
     // 无论是否配置远端，都从本地 path-list.md 刷新一次缓存。
     if let Err(e) = store.refresh().await {
         tracing::warn!("initial refresh failed: {e}");
     }
     let store = Arc::new(store);
+
+    // 运行时可共享的账户配置（TUI 设置面板热更新；后台任务读取
+    // has_bound_device 判定是否触发设备选择）。
+    let account_config = Arc::new(std::sync::RwLock::new(account_config));
+
+    // 设备选择触发槽：后台 fetch 任务发现本地未绑定设备（DEVICE_NAME 为空）
+    // 且远端设备清单非空时写入，TUI 主循环每帧 render 轮询消费后弹出
+    // 设备选择弹框。用共享 Option 槽而非 mpsc channel —— TUI 只需要
+    // "最新一条"信号，且渲染线程不便 await。
+    let device_picker_trigger: DevicePickerTriggerSlot =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // 账户已配置时，启动后台任务调用 /api/user/info 获取最新信息；
+    // 成功后：完整性验证（仅记日志）→ 用返回的 sb 配置接管远端 path-list
+    // 同步（含一次性 legacy 远端路径迁移）→ 触发一次远端刷新 → 若本地
+    // 未绑定设备则向 TUI 发出设备选择信号。
+    if account_config
+        .read()
+        .map(|a| a.is_configured())
+        .unwrap_or(false)
+    {
+        let account = account_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let store_for_user_info = store.clone();
+        let account_for_picker = account_config.clone();
+        let trigger_for_task = device_picker_trigger.clone();
+        tokio::spawn(async move {
+            match fetch_user_info(&account.remote_path, &account.account_key).await {
+                Ok(info) => {
+                    // 1. 数据完整性验证 —— 不满足时仅记 warning 日志，不中断
+                    //    流程（sb / 设备清单部分可用时后续步骤仍可降级工作）。
+                    if let Err(problems) = validate_user_info_integrity(&info) {
+                        tracing::warn!(
+                            "用户信息完整性问题（设备绑定/sb 配置可能异常）: {problems}"
+                        );
+                    }
+
+                    // 2. 配置 RemoteClient + 一次性 legacy 迁移 + 远端刷新。
+                    //    v2 构造携带 user_id + device_name（未绑定时为空，
+                    //    路径段回退 OS 用户名），path-list 走新格式路径
+                    //    serv/opencode/{user_id}/{pctype}/{device_name}/path-list。
+                    tracing::info!("已获取用户信息: id={}, name={}", info.id, info.name);
+                    let remote = RemoteClient::from_user_info_v2(
+                        &info,
+                        account.device_name.clone(),
+                        info.sb.password.clone(),
+                    );
+                    store_for_user_info.with_remote(remote).await;
+                    // One-shot legacy-path migration (runs only if remote is
+                    // configured). Idempotent: no-op on later restarts.
+                    if let Err(e) = store_for_user_info.migrate_from_legacy_remote().await {
+                        tracing::warn!("legacy migration failed: {e}");
+                    }
+                    if let Err(e) = store_for_user_info.refresh().await {
+                        tracing::warn!("remote refresh failed: {e}");
+                    }
+
+                    // 3. 本地未绑定设备（DEVICE_NAME 为空）且远端清单非空 →
+                    //    通过共享槽通知 TUI 弹出设备选择。std Mutex 临界区内
+                    //    没有 await，不存在跨 await 持锁问题。
+                    let currently_bound = account_for_picker
+                        .read()
+                        .map(|a| a.has_bound_device())
+                        .unwrap_or(false);
+                    if !currently_bound && !info.devices.is_empty() {
+                        tracing::info!(
+                            "本地未绑定设备，已请求 TUI 弹出设备选择（{} 个设备）",
+                            info.devices.len()
+                        );
+                        *trigger_for_task.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(DevicePickerTrigger {
+                                user_info: info,
+                                account_key: account.account_key.clone(),
+                                remote_path: account.remote_path.clone(),
+                                force: false,
+                            });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("获取用户信息失败: {e}");
+                }
+            }
+        });
+    }
 
     // 5. Auth.
     let auth = if let Some(path) = cli.auth_env.as_ref() {
@@ -206,6 +294,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         auth: auth.clone(),
         default_dir: default_dir.clone(),
+        supervisor: Arc::new(supervisor.clone()),
     };
 
     // 7. --no-tui 模式无交互终端，未配置凭据时提前安全退出，避免无认证监听。
@@ -253,8 +342,8 @@ async fn main() -> Result<()> {
         auth.clone(),
         log_buffer.clone(),
         store.clone(),
-        sb_config.clone(),
-        rathole_config.clone(),
+        account_config.clone(),
+        device_picker_trigger,
     )
     .run(terminal)
     .await

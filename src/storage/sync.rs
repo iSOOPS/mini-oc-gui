@@ -66,6 +66,38 @@ impl PathListStore {
         *self.remote.write().await = Some(remote);
     }
 
+    /// Build the [`RemotePaths`] the store currently syncs to.
+    ///
+    /// Reflects the identity carried by the attached [`RemoteClient`]:
+    /// when it has a `user_id` (set via
+    /// [`RemoteClient::from_user_info_v2`](super::remote::RemoteClient::from_user_info_v2))
+    /// the new layout `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`
+    /// is used; otherwise the legacy sb-username layout.
+    ///
+    /// Uses `blocking_read` internally — call from synchronous code only
+    /// (the async paths inside this module use `RemoteClient::remote_paths`
+    /// on an already-acquired handle instead).
+    ///
+    /// # Errors
+    /// Propagates [`AppError::Internal`] from [`RemoteClient::remote_paths`]
+    /// when `user_id` is set but `device_name` is missing or whitespace-only
+    /// (i.e. the new-format path identity is incomplete).
+    pub fn build_remote_paths(&self) -> Result<RemotePaths, AppError> {
+        let remote = self.remote.blocking_read();
+        match remote.as_ref() {
+            Some(r) => r.remote_paths(),
+            None => Ok(RemotePaths::with_user_info("", "")),
+        }
+    }
+
+    /// Clone the currently configured [`RemoteClient`], if any.
+    ///
+    /// For callers that need a remote-only read (e.g. the OC-projects entry
+    /// flow) without going through the local-cache merge in [`refresh`].
+    pub async fn remote_client(&self) -> Option<RemoteClient> {
+        self.remote.read().await.clone()
+    }
+
     /// Return the in-memory snapshot of entries (no I/O).
     pub async fn list(&self) -> Result<Vec<PathEntry>, AppError> {
         Ok(self.inner.read().await.clone())
@@ -86,8 +118,23 @@ impl PathListStore {
         let (status, remote_value) = match self.remote.read().await.as_ref() {
             Some(remote) => {
                 let mut r = remote.clone();
-                let path = RemotePaths::new(r.user.as_deref().unwrap_or("unknown"))
-                    .path_list_with_slash();
+                let path = match r.remote_paths() {
+                    Ok(rp) => rp.path_list_with_slash(),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "sync",
+                            "refresh: cannot derive remote path ({}); falling back to local cache",
+                            e
+                        );
+                        *self.inner.write().await = local.clone();
+                        return Ok(RefreshReport {
+                            from_remote: 0,
+                            from_local: local_count,
+                            merged: local_count,
+                            seeded_remote: false,
+                        });
+                    }
+                };
                 match r.get(&path).await {
                     Ok((s, body)) => {
                         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Array(Vec::new()));
@@ -212,6 +259,90 @@ impl PathListStore {
         Ok(snapshot)
     }
 
+    /// 在远端创建空 path-list 条目（sections 为空）。
+    ///
+    /// 用户新选一个项目路径时调用：确保该路径以 `sections: []` 的空结构
+    /// 出现在远端 path-list（新格式
+    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`）。
+    ///
+    /// 与 [`upsert_path`](Self::upsert_path) 的差异：远端 PUT 是
+    /// **同步**的（`push_blocking`，3 次重试）—— 调用方能立刻知道是否
+    /// 成功。若条目尚不存在会先补进本地快照（幂等，可与 `upsert_path`
+    /// 连续调用不冲突），再整体推送快照，避免单条 PUT 覆盖远端全量。
+    ///
+    /// # Errors
+    /// Returns [`AppError::PathValidation`] if `target` fails validation,
+    /// or [`AppError::Internal`] if the remote push fails after retries.
+    pub async fn create_remote_path(&self, target: &str) -> Result<(), AppError> {
+        let target = PathValidator::validate(target)?;
+        {
+            let mut entries = self.inner.write().await;
+            if !entries.iter().any(|e| e.path == target) {
+                let now = chrono::Local::now().with_timezone(chrono::Local::now().offset());
+                entries.push(PathEntry {
+                    path: target,
+                    sections: Vec::new(),
+                    created_at: Some(now),
+                    last_opened_at: Some(now),
+                });
+            }
+        }
+        let snapshot = self.inner.read().await.clone();
+        self.cache.write(&snapshot).await?;
+        self.push_blocking(snapshot).await
+    }
+
+    /// 批量同步一个项目从 opencode serve 读到的 sessions 到 path-list。
+    ///
+    /// 合并语义与 [`append_session`](Self::append_session) 一致（按
+    /// `session.id` 去重，同 id 时 `updated_at` 较新者胜出；路径缺失时
+    /// 创建新条目），但**只落一次盘、推一次远端** —— 选已有项目进入
+    /// 会话列表时的「整理后汇总上传」走这里，而不是逐条 append。
+    ///
+    /// # Errors
+    /// Returns [`AppError::PathValidation`] if `target` fails validation.
+    pub async fn sync_project_sessions(
+        &self,
+        target: &str,
+        sessions: &[crate::domain::Session],
+    ) -> Result<Vec<PathEntry>, AppError> {
+        let target = PathValidator::validate(target)?;
+        let mut entries = self.inner.write().await;
+        let now = chrono::Local::now().with_timezone(chrono::Local::now().offset());
+        match entries.iter_mut().find(|e| e.path == target) {
+            Some(e) => {
+                for session in sessions {
+                    let mut replaced = false;
+                    for sec in e.sections.iter_mut() {
+                        if sec.id == session.id {
+                            if session.updated_at > sec.updated_at {
+                                *sec = session.clone();
+                            }
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if !replaced {
+                        e.sections.push(session.clone());
+                    }
+                }
+                e.last_opened_at = Some(now);
+            }
+            None => {
+                entries.push(PathEntry {
+                    path: target,
+                    sections: sessions.to_vec(),
+                    created_at: Some(now),
+                    last_opened_at: Some(now),
+                });
+            }
+        }
+        let snapshot = entries.clone();
+        drop(entries);
+        self.persist(&snapshot, false).await?;
+        Ok(snapshot)
+    }
+
     /// Refresh `lastOpenedAt` on an existing path (no-op if missing).
     pub async fn touch_path(&self, target: &str) -> Result<Vec<PathEntry>, AppError> {
         let target = PathValidator::validate(target)?;
@@ -234,22 +365,43 @@ impl PathListStore {
         Ok(snapshot)
     }
 
-    /// Append a session id to a path's `sections` (deduplicated).
-    pub async fn append_session(&self, target: &str, sid: &str) -> Result<Vec<PathEntry>, AppError> {
+    /// Append (or upsert) a session in a path's `sections`.
+    ///
+    /// If a section with the same `session.id` already exists, it is
+    /// replaced only when `session.updated_at` is strictly newer than the
+    /// existing entry's `updated_at`; otherwise the existing entry is kept
+    /// unchanged. If the path does not yet exist, it is created with this
+    /// session as its only section. The path's `lastOpenedAt` is always
+    /// refreshed to `now`.
+    pub async fn append_session(
+        &self,
+        target: &str,
+        session: &crate::domain::Session,
+    ) -> Result<Vec<PathEntry>, AppError> {
         let target = PathValidator::validate(target)?;
         let mut entries = self.inner.write().await;
         let now = chrono::Local::now().with_timezone(chrono::Local::now().offset());
         match entries.iter_mut().find(|e| e.path == target) {
             Some(e) => {
-                if !e.sections.contains(&sid.to_string()) {
-                    e.sections.push(sid.to_string());
+                let mut replaced = false;
+                for sec in e.sections.iter_mut() {
+                    if sec.id == session.id {
+                        if session.updated_at > sec.updated_at {
+                            *sec = session.clone();
+                        }
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    e.sections.push(session.clone());
                 }
                 e.last_opened_at = Some(now);
             }
             None => {
                 entries.push(PathEntry {
                     path: target,
-                    sections: vec![sid.to_string()],
+                    sections: vec![session.clone()],
                     created_at: Some(now),
                     last_opened_at: Some(now),
                 });
@@ -308,7 +460,7 @@ impl PathListStore {
         for e in entries.iter_mut() {
             if e.path == target {
                 let before = e.sections.len();
-                e.sections.retain(|s| s != sid);
+                e.sections.retain(|s| s.id != sid);
                 if e.sections.len() != before {
                     found = true;
                 }
@@ -371,8 +523,7 @@ impl PathListStore {
         })?;
 
         let mut remote = remote_arc;
-        let path = RemotePaths::new(remote.user.as_deref().unwrap_or("unknown"))
-            .path_list_with_slash();
+        let path = remote.remote_paths()?.path_list_with_slash();
 
         tracing::info!(
             target: "sync",
@@ -438,9 +589,23 @@ impl PathListStore {
                 }
             };
             let mut remote = remote_arc;
+            // Derive the path once: device_name must be selected upstream,
+            // so re-deriving on every retry would only surface the same
+            // configuration error repeatedly. A failure here aborts the
+            // push — fire-and-forget upserts have nothing to retry.
+            let path = match remote.remote_paths() {
+                Ok(rp) => rp.path_list_with_slash(),
+                Err(e) => {
+                    tracing::error!(
+                        target: "sync",
+                        "async push aborted: cannot derive remote path ({}); \
+                         local cache is authoritative until device is selected",
+                        e
+                    );
+                    return;
+                }
+            };
             for attempt in 1..=3 {
-                let path = RemotePaths::new(remote.user.as_deref().unwrap_or("unknown"))
-                    .path_list_with_slash();
                 match remote.put(&path, &body).await {
                     Ok(200..=299) => return,
                     Ok(status) if status == 0 => {
@@ -551,8 +716,7 @@ impl PathListStore {
         // If the new path is empty, seed it with the merged set so other
         // clients (e.g. running on a different machine under the same
         // sb_user) can pick it up on their next refresh.
-        let new_path = RemotePaths::new(remote.user.as_deref().unwrap_or("unknown"))
-            .path_list_with_slash();
+        let new_path = remote.remote_paths()?.path_list_with_slash();
         let need_seeding = match remote.get(&new_path).await {
             Ok((200, body)) => {
                 let v: Value =
@@ -612,8 +776,12 @@ fn json_arr_to_entries(v: &Value) -> Result<Vec<PathEntry>, AppError> {
     Ok(out)
 }
 
-/// Merge two entry sets by `path` key. `createdAt` = min, `lastOpenedAt` = max,
-/// `sections` = set union (preserves order).
+/// Merge two entry sets by `path` key.
+///
+/// For each `path`, sections are de-duplicated by `session.id`; when the
+/// same id appears on both sides, the entry with the strictly larger
+/// `updated_at` wins (ties keep the existing one). Path-level
+/// `createdAt` = min, `lastOpenedAt` = max.
 #[must_use]
 pub fn merge_entries(mut remote: Vec<PathEntry>, mut local: Vec<PathEntry>) -> Vec<PathEntry> {
     remote.append(&mut local);
@@ -622,18 +790,17 @@ pub fn merge_entries(mut remote: Vec<PathEntry>, mut local: Vec<PathEntry>) -> V
     for e in remote {
         match by_path.get_mut(&e.path) {
             Some(existing) => {
-                let merged_secs: Vec<String> = existing
-                    .sections
-                    .iter()
-                    .chain(e.sections.iter())
-                    .cloned()
-                    .collect();
-                let mut seen = std::collections::HashSet::new();
-                let secs: Vec<String> = merged_secs
-                    .into_iter()
-                    .filter(|s| seen.insert(s.clone()))
-                    .collect();
-                existing.sections = secs;
+                // 合并 sections：按 id 去重，同 id 按 updated_at 较新者胜出
+                for new_sec in e.sections {
+                    match existing.sections.iter_mut().find(|s| s.id == new_sec.id) {
+                        Some(existing_sec) => {
+                            if new_sec.updated_at > existing_sec.updated_at {
+                                *existing_sec = new_sec;
+                            }
+                        }
+                        None => existing.sections.push(new_sec),
+                    }
+                }
 
                 let a_created = format_dt(existing.created_at);
                 let b_created = format_dt(e.created_at);
@@ -668,11 +835,18 @@ fn parse_dt(s: &str) -> Option<DateTime<FixedOffset>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Session;
+    use chrono::{Duration, FixedOffset, TimeZone};
 
     fn e(path: &str, created: &str, last: &str, sections: &[&str]) -> PathEntry {
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let dt = off.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         PathEntry {
             path: path.to_string(),
-            sections: sections.iter().map(|s| s.to_string()).collect(),
+            sections: sections
+                .iter()
+                .map(|s| Session::new(*s, format!("session-{}", &s[..s.len().min(8)]), path.to_string(), dt))
+                .collect(),
             created_at: crate::storage::cache::parse_dt(created),
             last_opened_at: crate::storage::cache::parse_dt(last),
         }
@@ -691,7 +865,8 @@ mod tests {
         let merged = merge_entries(r, l);
 
         let a = merged.iter().find(|e| e.path == "/a").expect("/a present");
-        assert_eq!(a.sections, vec!["s1".to_string(), "s2".to_string()]);
+        let ids: Vec<&str> = a.sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["s1", "s2"]);
         assert_eq!(
             format_dt(a.created_at),
             "2026-08-01T00:00:00+0800",
@@ -705,6 +880,126 @@ mod tests {
 
         assert!(merged.iter().any(|e| e.path == "/b"));
         assert!(merged.iter().any(|e| e.path == "/c"));
+    }
+
+    #[test]
+    fn merge_unions_sessions_by_id_and_takes_newer_when_conflict() {
+        let off = FixedOffset::east_opt(8 * 3600).unwrap();
+        let t0 = off.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let t1 = t0 + Duration::days(5);
+
+        let mk = |id: &str, title: &str, updated: chrono::DateTime<FixedOffset>| Session {
+            id: id.into(),
+            title: title.into(),
+            directory: "/p".into(),
+            created_at: updated,
+            updated_at: updated,
+        };
+
+        let remote = vec![PathEntry {
+            path: "/a".into(),
+            sections: vec![mk("ses_1", "remote title", t0)],
+            created_at: parse_dt("2026-08-01T00:00:00+0800"),
+            last_opened_at: parse_dt("2026-08-10T00:00:00+0800"),
+        }];
+
+        let local = vec![PathEntry {
+            path: "/a".into(),
+            sections: vec![mk("ses_1", "local newer title", t1)],
+            created_at: parse_dt("2026-08-02T00:00:00+0800"),
+            last_opened_at: parse_dt("2026-08-12T00:00:00+0800"),
+        }];
+
+        let merged = merge_entries(remote, local);
+        let a = merged.iter().find(|e| e.path == "/a").expect("/a present");
+        assert_eq!(a.sections.len(), 1, "同 id 应合并为一份");
+        assert_eq!(a.sections[0].title, "local newer title");
+        assert_eq!(a.sections[0].updated_at, t1);
+    }
+
+    #[test]
+    fn merge_unions_different_session_ids() {
+        let off = FixedOffset::east_opt(8 * 3600).unwrap();
+        let t = off.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let mk = |id: &str| Session::new(id, "t", "/p", t);
+
+        let remote = vec![PathEntry {
+            path: "/a".into(),
+            sections: vec![mk("ses_1")],
+            created_at: None,
+            last_opened_at: None,
+        }];
+        let local = vec![PathEntry {
+            path: "/a".into(),
+            sections: vec![mk("ses_2")],
+            created_at: None,
+            last_opened_at: None,
+        }];
+
+        let merged = merge_entries(remote, local);
+        let a = merged.iter().find(|e| e.path == "/a").expect("/a");
+        let ids: Vec<&str> = a.sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"ses_1"));
+        assert!(ids.contains(&"ses_2"));
+    }
+
+    #[tokio::test]
+    async fn append_session_dedupes_by_id_and_updates_existing_when_newer() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let t0 = off.with_ymd_and_hms(2026, 9, 13, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::hours(1);
+
+        let s1 = Session::new("ses_x", "old title", "/proj", t0);
+        store.append_session("/proj", &s1).await.expect("append 1");
+
+        let s2_newer = Session {
+            id: "ses_x".into(),
+            title: "new title".into(),
+            directory: "/proj/sub".into(),
+            created_at: t0,
+            updated_at: t1,
+        };
+        store.append_session("/proj", &s2_newer).await.expect("append 2");
+
+        let list = store.list().await.expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].sections.len(), 1, "同 id 不应产生重复 section");
+        assert_eq!(list[0].sections[0].id, "ses_x");
+        assert_eq!(list[0].sections[0].title, "new title");
+        assert_eq!(list[0].sections[0].directory, "/proj/sub");
+        assert_eq!(list[0].sections[0].updated_at, t1);
+    }
+
+    #[tokio::test]
+    async fn append_session_keeps_existing_when_incoming_older() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let t0 = off.with_ymd_and_hms(2026, 9, 13, 10, 0, 0).unwrap();
+        let t_old = t0 - Duration::hours(1);
+
+        let newer = Session::new("ses_y", "newer", "/proj", t0);
+        store.append_session("/proj", &newer).await.expect("append 1");
+
+        let older = Session {
+            id: "ses_y".into(),
+            title: "older".into(),
+            directory: "/proj".into(),
+            created_at: t_old,
+            updated_at: t_old,
+        };
+        store.append_session("/proj", &older).await.expect("append 2");
+
+        let list = store.list().await.expect("list");
+        assert_eq!(list[0].sections.len(), 1);
+        assert_eq!(list[0].sections[0].title, "newer");
     }
 
     #[tokio::test]
@@ -776,13 +1071,16 @@ mod tests {
         let cache = FileCache::new(dir.path().join("path-list.md"));
         let store = PathListStore::new(cache);
 
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let t = off.with_ymd_and_hms(2026, 9, 13, 10, 0, 0).unwrap();
+
         store.upsert_path("/proj").await.expect("upsert");
         store
-            .append_session("/proj", "ses_keep")
+            .append_session("/proj", &Session::new("ses_keep", "k", "/proj", t))
             .await
             .expect("append keep");
         store
-            .append_session("/proj", "ses_drop")
+            .append_session("/proj", &Session::new("ses_drop", "d", "/proj", t))
             .await
             .expect("append drop");
 
@@ -791,6 +1089,113 @@ mod tests {
             .await
             .expect("remove_session must succeed when no remote");
         let entry = after.iter().find(|e| e.path == "/proj").expect("/proj");
-        assert_eq!(entry.sections, vec!["ses_keep".to_string()]);
+        let ids: Vec<&str> = entry.sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["ses_keep"]);
+    }
+
+    #[tokio::test]
+    async fn create_remote_path_without_remote_seeds_empty_entry_locally() {
+        // 无远端时 create_remote_path 应当 Ok（push_blocking 对无远端
+        // 按定义视为成功），且把 sections=[] 的空结构条目落进本地缓存。
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        store
+            .create_remote_path("/proj/new-empty")
+            .await
+            .expect("create_remote_path must succeed when no remote");
+
+        let list = store.list().await.expect("list");
+        let entry = list.iter().find(|e| e.path == "/proj/new-empty").expect("entry");
+        assert!(entry.sections.is_empty(), "新项目远端结构 sections 应为空");
+        assert!(entry.created_at.is_some());
+
+        // 幂等：重复调用不产生重复条目。
+        store
+            .create_remote_path("/proj/new-empty")
+            .await
+            .expect("idempotent create_remote_path");
+        let list = store.list().await.expect("list");
+        assert_eq!(
+            list.iter().filter(|e| e.path == "/proj/new-empty").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn create_remote_path_keeps_existing_entries_in_snapshot() {
+        // create_remote_path 推送的是全量快照：不能把已有条目从远端冲掉。
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        store.upsert_path("/proj/keep").await.expect("upsert keep");
+        store
+            .create_remote_path("/proj/new-empty")
+            .await
+            .expect("create_remote_path");
+
+        let list = store.list().await.expect("list");
+        assert!(list.iter().any(|e| e.path == "/proj/keep"));
+        assert!(list.iter().any(|e| e.path == "/proj/new-empty"));
+    }
+
+    #[tokio::test]
+    async fn sync_project_sessions_bulk_merges_and_dedupes() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache.clone());
+
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let t0 = off.with_ymd_and_hms(2026, 9, 14, 9, 0, 0).unwrap();
+        let t1 = t0 + Duration::hours(2);
+
+        // 先有一条本地记录的同 id session（旧标题）。
+        store
+            .append_session("/proj", &Session::new("ses_a", "old", "/proj", t0))
+            .await
+            .expect("seed");
+
+        // 模拟 opencode serve 读回的会话：一条同 id 更新（应胜出）、
+        // 一条新 id（应并入）。
+        let fetched = vec![
+            Session::new("ses_a", "fresh-from-serve", "/proj", t1),
+            Session::new("ses_b", "another", "/proj", t0),
+        ];
+        let snapshot = store
+            .sync_project_sessions("/proj", &fetched)
+            .await
+            .expect("sync");
+
+        let entry = snapshot.iter().find(|e| e.path == "/proj").expect("/proj");
+        let a = entry.sections.iter().find(|s| s.id == "ses_a").expect("ses_a");
+        assert_eq!(a.title, "fresh-from-serve");
+        assert!(entry.sections.iter().any(|s| s.id == "ses_b"));
+
+        // 本地缓存与内存快照一致。
+        let on_disk = cache.read().await.expect("read cache");
+        let entry = on_disk.iter().find(|e| e.path == "/proj").expect("/proj");
+        assert_eq!(entry.sections.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_project_sessions_creates_entry_when_missing() {
+        // 远端/本地都还没有该项目条目时，汇总上传应创建新条目。
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let t = off.with_ymd_and_hms(2026, 9, 14, 9, 0, 0).unwrap();
+        let fetched = vec![Session::new("ses_x", "x", "/proj", t)];
+
+        let snapshot = store
+            .sync_project_sessions("/proj", &fetched)
+            .await
+            .expect("sync");
+        let entry = snapshot.iter().find(|e| e.path == "/proj").expect("/proj");
+        assert_eq!(entry.sections.len(), 1);
+        assert_eq!(entry.sections[0].id, "ses_x");
     }
 }

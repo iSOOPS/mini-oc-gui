@@ -54,8 +54,8 @@ pub async fn put_file(
     // Round-trip through the store so cache + remote get updated.
     for entry in &entries {
         state.store.upsert_path(&entry.path).await?;
-        for sid in &entry.sections {
-            state.store.append_session(&entry.path, sid).await?;
+        for session in &entry.sections {
+            state.store.append_session(&entry.path, session).await?;
         }
     }
     // Remove paths that are no longer present.

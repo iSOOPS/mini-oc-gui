@@ -9,4 +9,4 @@ pub mod session;
 
 pub use path_entry::{PathEntry, PathValidator};
 pub use project::Project;
-pub use session::{CreateSessionRequest, CreateSessionResponse, Location, Session, SessionData};
+pub use session::{CreateSessionRequest, Location, Session};
