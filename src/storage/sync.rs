@@ -504,17 +504,15 @@ impl PathListStore {
     /// backoff, each transition logged at `info` / `warn` / `error`. On
     /// exhaustion returns `AppError::Internal` with a short, actionable
     /// message — the caller (TUI status bar) is expected to surface it.
+    ///
+    /// **Bug 2 修复**:之前在没有 remote client 时静默 `return Ok(())`,
+    /// 让调用方误以为远端已同步。现改为返回明确的 `AppError::Internal`,
+    /// 调用方可显示"远程存储未配置"提示。
     async fn push_blocking(&self, entries: Vec<PathEntry>) -> Result<(), AppError> {
         let Some(remote_arc) = self.remote.read().await.clone() else {
-            // No remote configured: delete is "local-only" by definition.
-            // Still log so it's clear in the audit trail why we silently
-            // returned Ok.
-            tracing::info!(
-                target: "sync",
-                "remote not configured; delete applied to local cache only ({} entries)",
-                entries.len()
-            );
-            return Ok(());
+            return Err(AppError::Internal(
+                "远程存储未配置（需要先完成账户登录 + fetch_user_info）".to_string(),
+            ));
         };
 
         let body = serde_json::to_string_pretty(&entries).map_err(|e| {
@@ -1031,11 +1029,9 @@ mod tests {
         assert_eq!(report.migrated_entries, 0);
     }
 
+    /// Bug 2 修复:无 remote 时 remove_path 现在返回 Err,但本地 cache 仍更新。
     #[tokio::test]
     async fn remove_path_without_remote_returns_ok_and_drops_locally() {
-        // Without a remote configured, removing a path is a local-only
-        // operation and must succeed. Locks the "is_delete=true path is
-        // exercised, no remote -> Ok" branch of push_blocking.
         let dir = tempfile::TempDir::new().expect("tmpdir");
         let cache = FileCache::new(dir.path().join("path-list.md"));
         let store = PathListStore::new(cache.clone());
@@ -1049,24 +1045,19 @@ mod tests {
             .await
             .expect("upsert /proj/drop");
 
-        let after = store
-            .remove_path("/proj/drop")
-            .await
-            .expect("remove_path must succeed when no remote");
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].path, "/proj/keep");
-
-        // Local cache must reflect the delete — otherwise the next
-        // process restart would resurrect the entry from disk.
+        let after = store.remove_path("/proj/drop").await;
+        // 修复后:无 remote 时返回 Err,但本地 cache 仍更新
+        assert!(after.is_err(), "无 remote 时必须返回 Err");
+        let after = after.unwrap_err();
+        // 检查本地 cache 已删除
         let on_disk = cache.read().await.expect("read cache");
         assert_eq!(on_disk.len(), 1);
         assert_eq!(on_disk[0].path, "/proj/keep");
     }
 
+    /// Bug 2 修复:无 remote 时 remove_session 现在返回 Err,但本地 snapshot 仍过滤掉 sid。
     #[tokio::test]
     async fn remove_session_without_remote_returns_ok() {
-        // Same contract for remove_session: no remote -> Ok, local
-        // snapshot has the sid filtered out.
         let dir = tempfile::TempDir::new().expect("tmpdir");
         let cache = FileCache::new(dir.path().join("path-list.md"));
         let store = PathListStore::new(cache);
@@ -1084,38 +1075,36 @@ mod tests {
             .await
             .expect("append drop");
 
-        let after = store
-            .remove_session("/proj", "ses_drop")
-            .await
-            .expect("remove_session must succeed when no remote");
-        let entry = after.iter().find(|e| e.path == "/proj").expect("/proj");
+        let result = store.remove_session("/proj", "ses_drop").await;
+        // 修复后:无 remote 时返回 Err,但本地 snapshot 已过滤
+        assert!(result.is_err(), "无 remote 时必须返回 Err");
+        // 验证本地 cache 已过滤掉 ses_drop
+        let list = store.list().await.expect("list");
+        let entry = list.iter().find(|e| e.path == "/proj").expect("/proj");
         let ids: Vec<&str> = entry.sections.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["ses_keep"]);
     }
 
+    /// Bug 2 修复:create_remote_path 在无 remote 时现在返回 Err 而不是 Ok(())。
+    /// 本测试更新断言以反映新行为,但保留「本地仍 seeds 空条目」的语义验证。
     #[tokio::test]
     async fn create_remote_path_without_remote_seeds_empty_entry_locally() {
-        // 无远端时 create_remote_path 应当 Ok（push_blocking 对无远端
-        // 按定义视为成功），且把 sections=[] 的空结构条目落进本地缓存。
         let dir = tempfile::TempDir::new().expect("tmpdir");
         let cache = FileCache::new(dir.path().join("path-list.md"));
         let store = PathListStore::new(cache);
 
-        store
-            .create_remote_path("/proj/new-empty")
-            .await
-            .expect("create_remote_path must succeed when no remote");
-
+        let result = store.create_remote_path("/proj/new-empty").await;
+        // 修复后:无 remote 时返回 Err
+        assert!(result.is_err(), "无 remote 时必须返回 Err");
+        // 但本地 cache 仍写入(由 create_remote_path 在 push_blocking 之前的代码完成)
         let list = store.list().await.expect("list");
         let entry = list.iter().find(|e| e.path == "/proj/new-empty").expect("entry");
         assert!(entry.sections.is_empty(), "新项目远端结构 sections 应为空");
         assert!(entry.created_at.is_some());
 
         // 幂等：重复调用不产生重复条目。
-        store
-            .create_remote_path("/proj/new-empty")
-            .await
-            .expect("idempotent create_remote_path");
+        let result2 = store.create_remote_path("/proj/new-empty").await;
+        assert!(result2.is_err(), "idempotent: 无 remote 时仍返回 Err");
         let list = store.list().await.expect("list");
         assert_eq!(
             list.iter().filter(|e| e.path == "/proj/new-empty").count(),
@@ -1123,19 +1112,19 @@ mod tests {
         );
     }
 
+    /// Bug 2 修复:无 remote 时 create_remote_path 返回 Err,但本地 list 仍包含已有条目。
     #[tokio::test]
     async fn create_remote_path_keeps_existing_entries_in_snapshot() {
-        // create_remote_path 推送的是全量快照：不能把已有条目从远端冲掉。
         let dir = tempfile::TempDir::new().expect("tmpdir");
         let cache = FileCache::new(dir.path().join("path-list.md"));
         let store = PathListStore::new(cache);
 
         store.upsert_path("/proj/keep").await.expect("upsert keep");
-        store
-            .create_remote_path("/proj/new-empty")
-            .await
-            .expect("create_remote_path");
+        let result = store.create_remote_path("/proj/new-empty").await;
+        // 修复后:无 remote 时返回 Err
+        assert!(result.is_err(), "无 remote 时必须返回 Err");
 
+        // 但本地 list 仍包含已有条目(不受 push_blocking 失败影响)
         let list = store.list().await.expect("list");
         assert!(list.iter().any(|e| e.path == "/proj/keep"));
         assert!(list.iter().any(|e| e.path == "/proj/new-empty"));
@@ -1197,5 +1186,31 @@ mod tests {
         let entry = snapshot.iter().find(|e| e.path == "/proj").expect("/proj");
         assert_eq!(entry.sections.len(), 1);
         assert_eq!(entry.sections[0].id, "ses_x");
+    }
+
+    /// Bug 2 (storage 层):修复前 push_blocking 在没有 remote client 时静默
+    /// return Ok(()) —— 调用方无从知晓远端同步未发生。
+    /// 修复后返回 AppError::Internal("远程存储未配置...")。
+    #[tokio::test]
+    async fn push_blocking_without_remote_returns_error() {
+        use crate::storage::cache::FileCache;
+        use crate::storage::sync::PathListStore;
+        // 不调用 with_remote —— 默认无 remote
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("path-list.md");
+        let cache = FileCache::new(&cache_path);
+        let store = PathListStore::new(cache);
+        // create_remote_path 内部最终调 push_blocking
+        let result = store.create_remote_path("/tmp/test-project").await;
+        assert!(
+            result.is_err(),
+            "无 remote 时 create_remote_path 必须返回 Err,实际: {result:?}"
+        );
+        let err = result.unwrap_err();
+        // AppError::Internal(String) 变体
+        assert!(
+            matches!(err, crate::error::AppError::Internal(_)),
+            "应返回 AppError::Internal,实际: {err:?}"
+        );
     }
 }
