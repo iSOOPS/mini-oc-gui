@@ -3960,20 +3960,27 @@ fn register_settings_click_regions(
             });
         }
 
-        // 「绑定设备」行(idx 5)单独注册 click region:不进 SETTINGS_FIELDS,
-        // 因此不参与 Tab/↑/↓ 焦点循环,但鼠标点击会关闭设置弹框并触发
-        // 设备选择弹框。命中 screen_row >= content_h 的跳过(滚动出屏)。
-        const BIND_DEVICE_LINE_IDX: u16 = 5;
-        if let Some(screen_row) = BIND_DEVICE_LINE_IDX.checked_sub(scroll_offset) {
-            if screen_row < content_h {
-                let target_y = rect.y + 1 + screen_row;
-                // 每次点击都强制重新拉取用户信息(bug 2 + bug 4)—— 不再
-                // 携带缓存。ClickRegion 仅标志位置 + 路由;触发器由 click_at
-                // 处理时统一走 spawn → fetch → consume_device_picker_trigger。
-                self.click_regions.push(ClickRegion {
-                    rect: Rect::new(rect.x + 1, target_y, rect.width.saturating_sub(2), 1),
-                    target: ClickTarget::SettingsBindDevice,
-                });
+        // 「绑定设备」行：未配置账户时**不**注册 click region —— 鼠标
+        // 点不到、点击静默无响应。解锁条件与 build_settings_lines 一致：
+        // 复用 AccountConfig::is_configured() 三字段判定（账号+密钥+远程路径）。
+        let bind_unlocked = self
+            .account_config
+            .read()
+            .map(|a| a.is_configured())
+            .unwrap_or(false);
+        if bind_unlocked {
+            const BIND_DEVICE_LINE_IDX: u16 = 5;
+            if let Some(screen_row) = BIND_DEVICE_LINE_IDX.checked_sub(scroll_offset) {
+                if screen_row < content_h {
+                    let target_y = rect.y + 1 + screen_row;
+                    // 每次点击都强制重新拉取用户信息(bug 2 + bug 4)—— 不再
+                    // 携带缓存。ClickRegion 仅标志位置 + 路由;触发器由 click_at
+                    // 处理时统一走 spawn → fetch → consume_device_picker_trigger。
+                    self.click_regions.push(ClickRegion {
+                        rect: Rect::new(rect.x + 1, target_y, rect.width.saturating_sub(2), 1),
+                        target: ClickTarget::SettingsBindDevice,
+                    });
+                }
             }
         }
 
@@ -6834,6 +6841,31 @@ let left = ratatui::layout::Layout::default()
                 "old section/field '{banned}' should be gone: {all_text:?}"
             );
         }
+    }
+
+    /// 锁定态：`account_config` 三字段缺失时，第 5 行（绑定设备）坐标不应
+    /// 注册任何 click region —— `find_target` 必须返回 None。
+    /// 锁定态的渲染样式在 Task 3 覆盖；本测试只验证"点击不到"。
+    #[test]
+    fn bind_device_row_unregistered_when_account_unconfigured() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        // 首启标志关闭（让 click_at 走 dismiss_popup 分支，不影响本测试断言）
+        app.first_setup_required = false;
+        // 默认 account_config 三字段就是空（test_stub 不填充），无需显式清空
+        app.input_mode = InputMode::SettingsAccountId;
+        terminal.draw(|frame| app.render_settings_popup(frame)).expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let bind_y = rect.y + 1 + 5; // FIELD_LINE_IDX[绑定设备] = 5
+        let bind_x = rect.x + 4;
+        let target = app.find_target(bind_x, bind_y);
+        assert!(
+            target.is_none(),
+            "锁定态不应注册 SettingsBindDevice region，但 find_target 返回了 {target:?}"
+        );
     }
 }
 
