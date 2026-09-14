@@ -19,3 +19,6 @@
 assets/icon.png
 assets/icon.ico
 assets/icon.icns
+
+# Playwright MCP tool artifacts (browser automation test sessions)
+.playwright-mcp/
