@@ -35,7 +35,7 @@ TUI 进入「OC 项目」子页面后存在两个用户可见的 bug：
 | Bug 2 推送策略          | **统一改用 `create_remote_path`**（已存在），从 `confirm_manual_path` / `choose_folder_flow` 中移除冗余的 `upsert_path` 预先调用 |
 | Bug 2 错误可见性        | `push_blocking` 在没有 remote 时返回 `AppError::Internal("远程存储未配置")`，不再静默成功         |
 | Bug 2 成功可见性        | `confirm_manual_path` / `choose_folder_flow` 在 `create_remote_path` 成功时写 status_message：`"✅ 已同步到远端: <path>"` |
-| Bug 2 缓存刷新          | `confirm_manual_path` / `choose_folder_flow` 成功时调用 `enter_projects()`（**不进入子页面，只刷新缓存**）—— 实现新增一个 `refresh_projects_list()` |
+| Bug 2 缓存刷新          | **不需要显式刷新** — `pop_sub_page`（line 3060）从 Sessions/ManualPath/NewPathChoice 返回时已经调 `enter_projects()` 重新从远端拉取最新 |
 | 改动文件范围            | `src/ui/app.rs`（多处）+ `src/storage/sync.rs`（push_blocking 错误处理）                         |
 | 新增测试                | 至少 2 个：① padding 修复后卡片渲染可见 ② push_blocking 无 remote 时返回 Err                       |
 
@@ -130,7 +130,7 @@ async fn choose_folder_flow(&mut self) {
 #### 3.2.3 新增 `create_remote_path_and_refresh` 辅助方法（src/ui/app.rs）
 
 ```rust
-/// 选完新路径后调用：同步推远端 + 刷新本地 Projects 缓存 + 状态栏反馈。
+/// 选完新路径后调用：同步推远端 + 状态栏反馈。
 ///
 /// 成功 → 返回 Ok(())，调用方决定后续（enter_sessions 等）
 /// 失败 → 返回 Err(AppError)，调用方决定错误展示
@@ -140,49 +140,20 @@ async fn choose_folder_flow(&mut self) {
 ///   已经幂等包含 upsert 逻辑（sync.rs:280-288）
 /// - 同步阻塞推送，错误立即可见
 /// - 成功后写成功状态栏；失败留给调用方写（避免重复）
+/// - **不**主动刷新 Projects 缓存：`pop_sub_page`（line 3060）从
+///   Sessions/ManualPath/NewPathChoice 返回时已调 `enter_projects()` 重新
+///   从远端拉取最新数据
 async fn create_remote_path_and_refresh(&mut self, path: &str) -> Result<(), AppError> {
     self.store.create_remote_path(path).await?;
-    self.refresh_projects_list().await;
     *self.status_message.lock().unwrap() =
         format!("✅ 已同步到远端：{path}");
     Ok(())
 }
 ```
 
-#### 3.2.4 新增 `refresh_projects_list`（src/ui/app.rs）
+#### 3.2.4 （已删除）`refresh_projects_list`
 
-```rust
-/// 重新拉取 Projects 列表（写入 self.sub_page.Projects.projects）。
-///
-/// 不改变当前 sub_page 类型 —— 只在已经是 Projects 时刷新 contents；
-/// 其他类型（Sessions / NewPathChoice / ManualPath）不动。
-async fn refresh_projects_list(&mut self) {
-    // 仅在 Projects 子页面时刷新缓存；其他子页面不破坏用户当前所在的位置
-    if let Some(SubPage::Projects { .. }) = &self.sub_page {
-        match self.fetch_remote_projects_only().await {
-            Ok(projects) => {
-                if let Some(SubPage::Projects { list_state, .. }) = &mut self.sub_page {
-                    let prev = list_state.selected();
-                    *projects_for_refresh = projects;
-                    // 保留选中索引（如果还在范围内）
-                    if let Some(idx) = prev {
-                        if projects_for_refresh.is_empty() {
-                            list_state.select(None);
-                        } else {
-                            list_state.select(Some(idx.min(projects_for_refresh.len() - 1)));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("refresh_projects_list failed: {e}");
-            }
-        }
-    }
-}
-```
-
-**注意**：上面 `projects_for_refresh` 是伪变量名 — 实际写法是用 `let projects_for_refresh = projects;`，再赋值给 enum variant 时用 `*SubPage::Projects { list_state, projects } = ...` 解构。完整代码请 implementer 根据既有的 `enter_projects`（line 2626-2643）模式实现。
+经自审发现：**不需要**新增此方法。`pop_sub_page`（line 3060-3070）从 Sessions / ManualPath / NewPathChoice 返回时已经调 `enter_projects()` 重新从远端拉取，所以用户 Esc 返回 Projects 列表时会看到最新数据。Spec 初稿误以为需要显式刷新，自审时发现 `enter_projects` 已经覆盖此场景。
 
 #### 3.2.5 `push_blocking` 修复（src/storage/sync.rs:507-518）
 
@@ -206,7 +177,7 @@ async fn push_blocking(&self, entries: Vec<PathEntry>) -> Result<(), AppError> {
 | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `render_card_stack_shows_card_content`                   | `Padding::uniform(1)` + `card_h = 7` 后，用 TestBackend 渲染 `SubPage::Projects` 含 1 个项目，确认项目名 Line 出现在屏幕 buffer 中 |
 | `push_blocking_without_remote_returns_error`            | 在没有 remote client 的 store 上调 `create_remote_path` → 返回 `Err(AppError::Internal)` 而不是 `Ok(())`               |
-| `create_remote_path_and_refresh_writes_status_on_success` | mock remote client → 调辅助方法 → 验证 status_message 含 `"✅ 已同步到远端"` + `self.sub_page` 的 projects 已刷新 |
+| `create_remote_path_and_refresh_writes_status_on_success` | mock remote client → 调辅助方法 → 验证 status_message 含 `"✅ 已同步到远端"`                                          |
 | `confirm_manual_path_enters_sessions_on_remote_success`  | mock remote → 调 `confirm_manual_path("valid path")` → 验证 sub_page = `Some(SubPage::Sessions { ... })`              |
 | `confirm_manual_path_keeps_manual_form_on_remote_failure` | 无 remote → 调 `confirm_manual_path("valid path")` → 验证 sub_page = `Some(SubPage::ManualPath { ..., error: Some(...) })`，不进入 sessions |
 | `choose_folder_flow_with_remote_enters_sessions`         | mock remote + mock `choose_folder` → 调 `choose_folder_flow` → 验证 sub_page = `Sessions { ... }` + status 含 "已同步" |
@@ -232,7 +203,7 @@ async fn push_blocking(&self, entries: Vec<PathEntry>) -> Result<(), AppError> {
 5. 选完路径（系统 / 手动）后**状态栏立即显示「✅ 已同步到远端：<path>」**
 6. 远端存储（如 curl GET `<remote>/serv/opencode/{user_id}/{pctype}/{device_name}/path-list`）**包含新加的路径条目**（sections=[]）
 7. 远程未配置时（账户未登录），选完路径**状态栏显示「⚠️ 远端同步失败：远程存储未配置...」**，不进入 sessions
-8. 选完路径后回到 OC Projects 列表（如按 Esc）— **新加的路径出现在列表中**
+8. 选完路径后进入 Sessions、按 Esc 返回 Projects 列表 — **新加的路径出现在列表中**（由 `pop_sub_page` 触发 `enter_projects` 重新拉远端保证）
 
 ### 整体
 9. `cargo test --lib` 全量通过，新增测试 + 既有 184 全部通过
