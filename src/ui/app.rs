@@ -2862,19 +2862,27 @@ impl TuiApp {
         if trimmed.is_empty() {
             let default_dir = std::env::var("OC_DEFAULT_DIR")
                 .unwrap_or_else(|_| "/Users/samuel/.config/opencode".to_string());
-            self.enter_sessions(default_dir).await;
+            match self.create_remote_path_and_refresh(&default_dir).await {
+                Ok(()) => self.enter_sessions(default_dir).await,
+                Err(e) => {
+                    *self.status_message.lock().unwrap() =
+                        format!("⚠️ 远端同步失败：{e}");
+                }
+            }
             return;
         }
         match PathValidator::validate(trimmed) {
             Ok(path) => {
-                let _ = self.store.upsert_path(&path).await;
-                // 选新项目：在远端创建空结构（sections=[]），同步执行
-                // 让用户立刻知道是否成功。
-                if let Err(e) = self.store.create_remote_path(&path).await {
-                    *self.status_message.lock().unwrap() =
-                        format!("⚠️ 远端创建空结构失败：{e}");
+                match self.create_remote_path_and_refresh(&path).await {
+                    Ok(()) => self.enter_sessions(path).await,
+                    Err(e) => {
+                        *self.status_message.lock().unwrap() =
+                            format!("⚠️ 远端同步失败：{e}");
+                        if let Some(SubPage::ManualPath { error, .. }) = &mut self.sub_page {
+                            *error = Some(format!("远端同步失败：{e}"));
+                        }
+                    }
                 }
-                self.enter_sessions(path).await;
             }
             Err(e) => {
                 if let Some(SubPage::ManualPath { error, .. }) = &mut self.sub_page {
@@ -3213,16 +3221,23 @@ impl TuiApp {
         }
     }
 
+    async fn create_remote_path_and_refresh(&mut self, path: &str) -> Result<(), AppError> {
+        self.store.create_remote_path(path).await?;
+        *self.status_message.lock().unwrap() =
+            format!("✅ 已同步到远端：{path}");
+        Ok(())
+    }
+
     async fn choose_folder_flow(&mut self) {
         match choose_folder().await {
             Ok(path) => {
-                let _ = self.store.upsert_path(&path).await;
-                // 选新项目：在远端创建空结构（sections=[]）。
-                if let Err(e) = self.store.create_remote_path(&path).await {
-                    *self.status_message.lock().unwrap() =
-                        format!("⚠️ 远端创建空结构失败：{e}");
+                match self.create_remote_path_and_refresh(&path).await {
+                    Ok(()) => self.enter_sessions(path).await,
+                    Err(e) => {
+                        *self.status_message.lock().unwrap() =
+                            format!("⚠️ 远端同步失败：{e}");
+                    }
                 }
-                self.enter_sessions(path).await;
             }
             Err(e) => {
                 *self.status_message.lock().unwrap() = format!("⚠️ {e}");
@@ -7081,6 +7096,52 @@ let left = ratatui::layout::Layout::default()
             if found { break; }
         }
         assert!(found, "项目卡片的 📁 emoji 应出现在屏幕 buffer 中(卡片内容可见)");
+    }
+
+    /// Bug 2 (UI 层):成功同步时 status_message 应包含"✅ 已同步到远端"。
+    /// **Mock 复杂,标 todo!()** —— 需要 mock RemoteClient。
+    #[tokio::test]
+    #[ignore = "需要 mock RemoteClient —— 见 plan §3.2.5 mock 模式,留待后续 follow-up"]
+    async fn create_remote_path_and_refresh_writes_status_on_success() {
+        todo!("需要 mock RemoteClient(见 plan §3.2.5 mock 模式)");
+    }
+
+    /// Bug 2 (UI 层):mock remote client 后,confirm_manual_path("valid path") 应:
+    /// 1. 调 store.create_remote_path(成功)
+    /// 2. 设置 status_message 含"✅ 已同步到远端"
+    /// 3. 切换到 SubPage::Sessions
+    ///
+    /// **Mock 复杂,标 todo!()**。
+    #[tokio::test]
+    #[ignore = "需要 mock RemoteClient —— 见 plan §3.2.5 mock 模式,留待后续 follow-up"]
+    async fn confirm_manual_path_enters_sessions_on_remote_success() {
+        todo!("需要 mock RemoteClient");
+    }
+
+    /// Bug 2 (UI 层):无 remote client 时,confirm_manual_path("valid path") 应:
+    /// 1. 调 store.create_remote_path(返回 Err)
+    /// 2. 设置 status_message 含"⚠️ 远端同步失败..."
+    /// 3. 保持在 SubPage::ManualPath(不进入 Sessions),error 字段被设置
+    ///
+    /// 这是无外部 mock 的可执行测试 —— 因为 default TuiApp::test_stub() 的 store
+    /// 默认无 remote。`create_remote_path` 内部会在 cache.write 或 push_blocking
+    /// 阶段失败，err 都会被捕获并写入 status_message。
+    #[tokio::test]
+    async fn confirm_manual_path_keeps_manual_form_on_remote_failure() {
+        let mut app = TuiApp::test_stub();
+        app.sub_page = Some(SubPage::ManualPath { input: String::new(), error: None });
+        app.confirm_manual_path("/tmp/test-project".to_string()).await;
+        let status = app.status_message.lock().unwrap().clone();
+        assert!(
+            status.contains("远端同步失败"),
+            "status_message 应包含远端同步失败提示,实际: {status}"
+        );
+        match &app.sub_page {
+            Some(SubPage::ManualPath { error, .. }) => {
+                assert!(error.is_some(), "ManualPath.error 应被设置");
+            }
+            other => panic!("应保持在 ManualPath 子页面,实际: {other:?}"),
+        }
     }
 }
 
