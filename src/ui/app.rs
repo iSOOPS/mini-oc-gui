@@ -4681,7 +4681,7 @@ fn register_settings_click_regions(
             title_area,
         );
 
-        let card_h = 5u16;
+        let card_h = 7u16;
         let visible_h = area.height.saturating_sub(1);
         let visible_count = (visible_h / card_h).max(1) as usize;
         let selected = state.selected().unwrap_or(0);
@@ -4707,7 +4707,7 @@ fn register_settings_click_regions(
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .padding(Padding::uniform(5));
+                .padding(Padding::uniform(1));
             let para = Paragraph::new(cards[idx].clone()).block(block);
             frame.render_widget(para, card_area);
             y += card_h;
@@ -7040,6 +7040,47 @@ let left = ratatui::layout::Layout::default()
             !status.contains("绑定设备") && !status.contains("拉取设备清单"),
             "锁定态点击不应产生绑定设备相关状态栏消息，实际: {status}"
         );
+    }
+
+    /// Bug 1: 修复前 Padding::uniform(5) + card_h=5 → 内容区为负,卡片只显示边框
+    /// 看不到内容。修复后 Padding::uniform(1) + card_h=7 → 内容区 3 行,
+    /// 项目名 Line 应出现在 TestBackend buffer 中（通过 emoji 确认）。
+    #[test]
+    fn render_card_stack_shows_card_content() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use chrono::FixedOffset;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        let mut list_state = ListState::default();
+        list_state.select(Some(1)); // idx=0 是"+新建 path", idx=1 是项目
+        let off = FixedOffset::east_opt(8 * 3600).expect("offset");
+        let now = chrono::Local::now().with_timezone(&off);
+        let project = PathEntry {
+            path: "/tmp/my-test-project".to_string(),
+            sections: vec![],
+            created_at: Some(now),
+            last_opened_at: Some(now),
+        };
+        app.sub_page = Some(SubPage::Projects { list_state, projects: vec![project] });
+        terminal.draw(|frame| app.render_sub_page(frame, frame.area())).expect("draw");
+        // 验证:屏幕 buffer 中包含项目卡片的 emoji,证明内容已渲染
+        let buffer = terminal.backend().buffer().clone();
+        let mut found = false;
+        for row in 0..buffer.area.height {
+            for col in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((col, row)) {
+                    // project_card 第一行是 "📁 {name}"
+                    if cell.symbol().contains("📁") {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found { break; }
+        }
+        assert!(found, "项目卡片的 📁 emoji 应出现在屏幕 buffer 中(卡片内容可见)");
     }
 }
 
