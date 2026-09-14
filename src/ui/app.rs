@@ -6867,6 +6867,35 @@ let left = ratatui::layout::Layout::default()
             "锁定态不应注册 SettingsBindDevice region，但 find_target 返回了 {target:?}"
         );
     }
+
+    /// 解锁态：`account_config` 三字段非空时，第 5 行（绑定设备）坐标必须
+    /// 注册 `SettingsBindDevice` click region —— 与既有
+    /// `clicking_bound_device_row_closes_settings_and_does_not_eagerly_pop_empty_picker`
+    /// 测试的"已配置"前置条件一致，但本测试聚焦 click region 注册本身。
+    #[test]
+    fn bind_device_row_unlocked_after_account_configured() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        app.first_setup_required = false;
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.account_id = "u-1".to_string();
+            guard.account_key = "k-abcdef".to_string();
+            guard.remote_path = "https://oc.isoops.com".to_string();
+        }
+        app.input_mode = InputMode::SettingsAccountId;
+        terminal.draw(|frame| app.render_settings_popup(frame)).expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let bind_y = rect.y + 1 + 5;
+        let bind_x = rect.x + 4;
+        match app.find_target(bind_x, bind_y) {
+            Some(ClickTarget::SettingsBindDevice) => {}
+            other => panic!("expected SettingsBindDevice, got {other:?}"),
+        }
+    }
 }
 
 // 与上方 `mod tests` 配对的辅助实现块 —— 关联方法,只在测试构建时编译。
