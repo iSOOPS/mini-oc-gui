@@ -6986,6 +6986,54 @@ let left = ratatui::layout::Layout::default()
             "解锁态应有 UNDERLINED"
         );
     }
+
+    /// 端到端：锁定态点击第 5 行应**完全静默**——不弹 status_message，
+    /// 不发起 fetch，不弹出设备选择弹框，不修改 trigger 槽。
+    ///
+    /// 这是"完全锁定"语义的最强回归测试：即使未来 register / render 逻辑
+    /// 回归（如忘记加守卫），仍能在此处抓出"点击产生了副作用"。
+    #[tokio::test]
+    async fn locked_bind_device_row_click_is_silent_noop() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 50);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut app = TuiApp::test_stub();
+        // 默认三字段就是空（test_stub）。first_setup_required 由 test_stub 设默认。
+        app.input_mode = InputMode::SettingsAccountId;
+        terminal
+            .draw(|frame| app.render_settings_popup(frame))
+            .expect("draw");
+        let rect = app.last_settings_popup_rect.expect("popup rect");
+        let bind_y = rect.y + 1 + 5;
+        let bind_x = rect.x + 4;
+
+        // 锁定态：find_target 应返回 None（由 Task 1 保证）
+        assert!(
+            app.find_target(bind_x, bind_y).is_none(),
+            "前置：锁定态不应注册该 region"
+        );
+
+        // 直接调用 click_at —— 即便坐标命中不到 region，也不应有任何副作用
+        app.click_at(bind_x, bind_y).await;
+
+        // 不应弹出设备选择弹框
+        assert!(app.device_picker.is_none(), "device_picker 应仍为 None");
+        // 不应写入 trigger 槽
+        assert!(
+            app.device_picker_trigger
+                .lock()
+                .map(|g| g.is_none())
+                .unwrap_or(true),
+            "trigger 槽应仍为 None"
+        );
+        // status_message 不应是绑定设备相关的提示
+        let status = app.status_message.lock().unwrap().clone();
+        assert!(
+            !status.contains("绑定设备") && !status.contains("拉取设备清单"),
+            "锁定态点击不应产生绑定设备相关状态栏消息，实际: {status}"
+        );
+    }
 }
 
 // 与上方 `mod tests` 配对的辅助实现块 —— 关联方法,只在测试构建时编译。
