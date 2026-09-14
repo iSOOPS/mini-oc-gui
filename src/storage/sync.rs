@@ -1048,7 +1048,7 @@ mod tests {
         let after = store.remove_path("/proj/drop").await;
         // 修复后:无 remote 时返回 Err,但本地 cache 仍更新
         assert!(after.is_err(), "无 remote 时必须返回 Err");
-        let after = after.unwrap_err();
+        let _after = after.unwrap_err();
         // 检查本地 cache 已删除
         let on_disk = cache.read().await.expect("read cache");
         assert_eq!(on_disk.len(), 1);
