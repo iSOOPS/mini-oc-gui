@@ -5598,6 +5598,9 @@ let left = ratatui::layout::Layout::default()
     /// DEVICE_NAME 的当前值;缺失时显示「(未绑定)」。**不是**可编辑字段
     /// (不进 SETTINGS_FIELDS),但鼠标点击该行 → 关闭设置弹框 + 打开
     /// 设备选择弹框(重新绑定)。Tab/↑/↓ 不能跳到。
+    ///
+    /// 测试「解锁态 + 设备未绑定」路径：account_config 三字段非空（已配置账户）
+    /// 但 device_name 为空（未绑定设备）。
     #[test]
     fn settings_panel_shows_bound_device_clickable_rebind() {
         let mut app = TuiApp::test_stub();
@@ -5608,6 +5611,14 @@ let left = ratatui::layout::Layout::default()
                 .map(|s| s.content.as_ref())
                 .collect()
         };
+
+        // 解锁态：先填充三字段使 bind_unlocked = true，保持 device_name 为空。
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.account_id = "u-1".to_string();
+            guard.account_key = "k-abcdef".to_string();
+            guard.remote_path = "https://oc.isoops.com".to_string();
+        }
 
         // 未绑定时:行 idx=5 显示「(未绑定)」,并提示「点击选择设备」。
         let unbound = row_text(5);
