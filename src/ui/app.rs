@@ -3829,24 +3829,35 @@ impl TuiApp {
         let account_key_line = render_account_key_line(&self.account_key_input);
 
         // 已绑定设备名 —— 账户登录区域下方的可点击信息行,显示 env 中
-        // DEVICE_NAME 的当前值;缺失时显示「(未绑定)」。**不是**可编辑
-        // 字段,不进 SETTINGS_FIELDS、不参与 Tab/↑/↓ 焦点循环 —— 点击
-        // 该行触发「关闭设置弹框 + 弹出设备选择弹框」的重新绑定流程。
-        // 视觉上:行背景与「字段说明」一致(浅灰 desc_style),但用 cyan
-        // 下划线前景 + 「点击重新绑定」后缀双重传达可点击。
+        // DEVICE_NAME 的当前值;缺失时显示「(未绑定)」。(未绑定) 状态
+        // 时,本行在 Task 1 中不注册 click region,配合本行的灰显+无下划线
+        // 视觉传达「锁定」;解锁时恢复 cyan + 下划线 + 点击提示。
+        let bind_unlocked = self
+            .account_config
+            .read()
+            .map(|a| a.is_configured())
+            .unwrap_or(false);
         let bound_device_name = self
             .account_config
             .read()
             .map(|a| a.device_name.clone())
             .unwrap_or_default();
-        let bound_device_display = if bound_device_name.is_empty() {
-            "  绑定设备: (未绑定)  ▶ 点击选择设备".to_string()
+        let bind_device_text = if bind_unlocked {
+            if bound_device_name.is_empty() {
+                "  绑定设备: (未绑定)  ▶ 点击选择设备".to_string()
+            } else {
+                format!("  绑定设备: {bound_device_name}  ▶ 点击重新绑定")
+            }
         } else {
-            format!("  绑定设备: {bound_device_name}  ▶ 点击重新绑定")
+            "  绑定设备: —  ▶ 未配置账户,需先填写 账户ID/密钥".to_string()
         };
-        let bound_device_clickable_style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED);
+        let bind_device_style = if bind_unlocked {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
 
         vec![
             // --- 账户登录 ---
@@ -3867,7 +3878,7 @@ impl TuiApp {
                 "    作用: 账户鉴权密钥,用于 /api/user/info(env: ACCOUNT_KEY)",
                 desc_style,
             )),
-            Line::from(Span::styled(bound_device_display, bound_device_clickable_style)),
+            Line::from(Span::styled(bind_device_text, bind_device_style)),
             Line::from(Span::styled(
                 "    作用: 当前已绑定的设备服务名(env: DEVICE_NAME,点击行 → 重新选择设备)",
                 desc_style,
@@ -6895,6 +6906,74 @@ let left = ratatui::layout::Layout::default()
             Some(ClickTarget::SettingsBindDevice) => {}
             other => panic!("expected SettingsBindDevice, got {other:?}"),
         }
+    }
+
+    /// 锁定态：`build_settings_lines` 第 5 行（绑定设备）必须：
+    /// - 文本含"未配置账户"前缀；
+    /// - 文本不含"点击重新绑定"或"点击选择设备"（避免误导）；
+    /// - style 颜色为 `Color::DarkGray`；
+    /// - style **不含** `Modifier::UNDERLINED`。
+    #[test]
+    fn bind_device_row_renders_grey_when_locked() {
+        let mut app = TuiApp::test_stub();
+        // 默认 account_config 三字段就是空（test_stub 不填充），无需显式清空
+        let line = &app.build_settings_lines()[5];
+        let text: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("未配置账户"),
+            "锁定态绑定设备行应说明前置条件: {text}"
+        );
+        assert!(
+            !text.contains("点击重新绑定") && !text.contains("点击选择设备"),
+            "锁定态不应包含可点击暗示: {text}"
+        );
+        // 单 Span（我们把整行塞到一个 Span::styled 里）
+        assert_eq!(line.spans.len(), 1, "锁定态绑定设备行应为单一 Span");
+        let style = line.spans[0].style;
+        assert_eq!(
+            style.fg,
+            Some(Color::DarkGray),
+            "锁定态应为 DarkGray，实际: {:?}",
+            style.fg
+        );
+        assert!(
+            !style.add_modifier.contains(Modifier::UNDERLINED),
+            "锁定态**不应**有 UNDERLINED（视觉无下划线）"
+        );
+    }
+
+    /// 解锁态：绑定设备行恢复 cyan + 下划线 + 点击提示。
+    #[test]
+    fn bind_device_row_renders_clickable_when_unlocked() {
+        let mut app = TuiApp::test_stub();
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.account_id = "u-1".to_string();
+            guard.account_key = "k-abcdef".to_string();
+            guard.remote_path = "https://oc.isoops.com".to_string();
+        }
+        let line = &app.build_settings_lines()[5];
+        let text: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("点击选择设备") || text.contains("点击重新绑定"),
+            "解锁态应含点击提示: {text}"
+        );
+        let style = line.spans[0].style;
+        assert_eq!(style.fg, Some(Color::Cyan), "解锁态应为 Cyan");
+        assert!(
+            style.add_modifier.contains(Modifier::UNDERLINED),
+            "解锁态应有 UNDERLINED"
+        );
     }
 }
 
