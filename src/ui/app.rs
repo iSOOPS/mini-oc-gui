@@ -6869,9 +6869,9 @@ let left = ratatui::layout::Layout::default()
     }
 
     /// 解锁态：`account_config` 三字段非空时，第 5 行（绑定设备）坐标必须
-    /// 注册 `SettingsBindDevice` click region —— 与既有
-    /// `clicking_bound_device_row_closes_settings_and_does_not_eagerly_pop_empty_picker`
-    /// 测试的"已配置"前置条件一致，但本测试聚焦 click region 注册本身。
+    /// 注册 `SettingsBindDevice` click region —— 与 Task 1
+    /// `bind_device_row_unregistered_when_account_unconfigured` 形成对偶：
+    /// 该测试验证"三字段全空 → 不注册"，本测试验证"三字段齐全 → 注册"。
     #[test]
     fn bind_device_row_unlocked_after_account_configured() {
         use ratatui::backend::TestBackend;
@@ -6889,7 +6889,7 @@ let left = ratatui::layout::Layout::default()
         app.input_mode = InputMode::SettingsAccountId;
         terminal.draw(|frame| app.render_settings_popup(frame)).expect("draw");
         let rect = app.last_settings_popup_rect.expect("popup rect");
-        let bind_y = rect.y + 1 + 5;
+        let bind_y = rect.y + 1 + 5; // FIELD_LINE_IDX[绑定设备] = 5
         let bind_x = rect.x + 4;
         match app.find_target(bind_x, bind_y) {
             Some(ClickTarget::SettingsBindDevice) => {}
