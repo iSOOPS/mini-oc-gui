@@ -3221,6 +3221,19 @@ impl TuiApp {
         }
     }
 
+    /// 选完新路径后调用：同步推远端 + 状态栏反馈。
+    ///
+    /// 成功 → 返回 Ok(())，调用方决定后续（enter_sessions 等）
+    /// 失败 → 返回 Err(AppError)，调用方决定错误展示
+    ///
+    /// 设计要点：
+    /// - 替代 `upsert_path + create_remote_path` 双调用 —— `create_remote_path`
+    ///   已经幂等包含 upsert 逻辑（sync.rs:280-288）
+    /// - 同步阻塞推送，错误立即可见（push_blocking 无 remote 时返回 Err）
+    /// - 成功后写"✅ 已同步到远端"状态栏；失败留给调用方写（避免重复）
+    /// - **不**主动刷新 Projects 缓存：`pop_sub_page`（line 3060）从
+    ///   Sessions/ManualPath/NewPathChoice 返回时已调 `enter_projects()` 重新
+    ///   从远端拉取最新数据
     async fn create_remote_path_and_refresh(&mut self, path: &str) -> Result<(), AppError> {
         self.store.create_remote_path(path).await?;
         *self.status_message.lock().unwrap() =
