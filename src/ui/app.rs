@@ -1252,6 +1252,13 @@ impl TuiApp {
             ClickTarget::SettingsBindDevice => {
                 // 「绑定设备」只读行被点击 —— 关闭设置弹框,触发设备选择。
                 // 关闭时与 Esc 路径对称(input_mode=Menu + 清 last rect)。
+
+                // 防御纵深：register_settings_click_regions 已按
+                // bind_unlocked 阻止该 region 注册，正常路径下此分支
+                // 不会被触发；此处仍保留 is_configured() 检查，避免
+                // 未来 register 逻辑被改坏时旧实现（点击弹 status_message）
+                // 重新出现。
+
                 self.input_mode = InputMode::Menu;
                 self.last_settings_popup_rect = None;
 
