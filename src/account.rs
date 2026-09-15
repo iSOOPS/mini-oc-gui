@@ -3,8 +3,9 @@
 //! 账户登录包括四个字段：
 //! - account_id: 账户唯一ID（用户从云平台获取）
 //! - account_key: 账户密钥（用于调用 /api/user/info 验证身份）
-//! - remote_path: 远程API基础URL，默认 https://oc.isoops.com
-//!   支持 http:// 或 https://，支持域名或 IP:port
+//! - remote_path: 远程API基础URL，默认 oc.isoops.com
+//!   不带 scheme 时自动补 `https://`，也支持显式 `http://` / `https://`，
+//!   支持域名或 IP:port
 //! - device_name: 已绑定的设备服务名（首次绑定后写入，缺失时需重新触发设备选择）
 
 use std::path::{Path, PathBuf};
@@ -13,10 +14,10 @@ use std::time::Duration;
 
 use crate::error::AppError;
 
-/// 默认远程 API 地址。
-pub const DEFAULT_REMOTE_PATH: &str = "https://oc.isoops.com";
+/// 默认远程 API 地址（不带 scheme，调用时会自动补 `https://`）。
+pub const DEFAULT_REMOTE_PATH: &str = "oc.isoops.com";
 
-/// env key 名常量（与 `.oc-serve-auth.env` 文件共享）。
+/// env key 名常量（与 `.env` 文件共享）。
 pub mod keys {
     /// 账户唯一ID。
     pub const ACCOUNT_ID: &str = "ACCOUNT_ID";
@@ -28,7 +29,7 @@ pub mod keys {
     pub const DEVICE_NAME: &str = "DEVICE_NAME";
 }
 
-/// 账户登录配置（持久化到 `.oc-serve-auth.env`）
+/// 账户登录配置（持久化到 `.env`）
 #[derive(Debug, Clone, Default)]
 pub struct AccountConfig {
     /// 账户唯一ID (env: ACCOUNT_ID)
@@ -169,7 +170,7 @@ impl AccountConfig {
     /// `DEVICE_NAME`）。
     ///
     /// 缺失字段回退到 auth-env 文件（`OC_SERVE_AUTH_ENV` 覆盖路径，默认
-    /// `./.oc-serve-auth.env`，与 [`crate::auth::AuthConfig::from_env`]
+    /// `./.env`，与 [`crate::auth::AuthConfig::from_env`]
     /// 同一约定）；`remote_path` 为空时取 [`DEFAULT_REMOTE_PATH`]。
     #[must_use]
     pub fn load() -> Self {
@@ -184,7 +185,7 @@ impl AccountConfig {
             let path = std::env::var("OC_SERVE_AUTH_ENV")
                 .ok()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".oc-serve-auth.env"));
+                .unwrap_or_else(|| PathBuf::from(".env"));
             let from_file = Self::read_env_file(&path);
             if cfg.account_id.is_empty() {
                 cfg.account_id = from_file.account_id;
@@ -307,16 +308,41 @@ impl AccountConfig {
         cfg
     }
 
-    /// 验证 remote_path 格式：必须以 http:// 或 https:// 开头
+    /// 验证 remote_path 格式：
+    /// - 必须以 `http://` 或 `https://` 开头，或
+    /// - 不带 scheme（自动视为 `https://`，即默认安全）。
+    ///
+    /// 其他 scheme（如 `ftp://`、`file://`）仍被拒绝。
     pub fn validate_remote_path(s: &str) -> Result<(), String> {
         let s = s.trim();
         if s.is_empty() {
             return Err("远程路径不能为空".to_string());
         }
-        if !s.starts_with("http://") && !s.starts_with("https://") {
-            return Err("远程路径必须以 http:// 或 https:// 开头".to_string());
+        let with_scheme =
+            s.starts_with("http://") || s.starts_with("https://");
+        let looks_like_url = with_scheme
+            || s.starts_with("www.")
+            || s.contains("://") && !s.starts_with("http://") && !s.starts_with("https://");
+        if !with_scheme {
+            if looks_like_url {
+                // 含其他 scheme —— 拒绝。
+                return Err("远程路径必须以 http:// 或 https:// 开头".to_string());
+            }
+            // 无 scheme —— 默认按 https:// 处理，由调用方补 scheme。
         }
         Ok(())
+    }
+}
+
+/// 把无 scheme 的 remote_path 规整为带 `https://` 前缀的完整 URL，
+/// 便于直接拼路径（如 `format!("{base}/api/user/info")`）。
+/// 已带 `http://` / `https://` 时原样返回；尾随 `/` 会被去掉。
+pub(crate) fn normalize_remote_path(s: &str) -> String {
+    let trimmed = s.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
     }
 }
 
@@ -442,7 +468,7 @@ struct LoginBody<'a> {
 /// 通过 account_key 调用 `/api/user/info` 接口获取用户信息。
 ///
 /// # Arguments
-/// * `remote_path` - 远程API基础URL（自动去除尾部 `/`）
+/// * `remote_path` - 远程API基础URL（自动去除尾部 `/`；无 scheme 时自动补 `https://`）
 /// * `account_key` - 账户密钥
 ///
 /// # Returns
@@ -455,7 +481,7 @@ struct LoginBody<'a> {
 /// ```no_run
 /// # async fn demo() -> Result<(), mini_oc_gui_serve::error::AppError> {
 /// let info = mini_oc_gui_serve::account::fetch_user_info(
-///     "https://oc.isoops.com",
+///     "oc.isoops.com",
 ///     "k1234567890123456789012345678901",
 /// ).await?;
 /// # Ok(())
@@ -466,7 +492,7 @@ pub async fn fetch_user_info(
     account_key: &str,
 ) -> Result<RemoteUserInfo, AppError> {
     AccountConfig::validate_remote_path(remote_path).map_err(AppError::BadRequest)?;
-    let base = remote_path.trim().trim_end_matches('/');
+    let base = normalize_remote_path(remote_path);
     let url = format!("{base}/api/user/info");
 
     let resp = http_client()
@@ -618,7 +644,7 @@ pub async fn bind_device(
 ) -> Result<DeviceBindResponse, AppError> {
     AccountConfig::validate_remote_path(remote_path).map_err(AppError::BadRequest)?;
     validate_device_name(client_device_name).map_err(AppError::BadRequest)?;
-    let base = remote_path.trim().trim_end_matches('/');
+    let base = normalize_remote_path(remote_path);
     let url = format!("{base}/api/device-bind");
 
     let resp = http_client()
@@ -697,11 +723,36 @@ mod tests {
     }
 
     #[test]
+    fn validate_remote_path_accepts_scheme_less_hostname() {
+        // 无 scheme 视为 https:// —— 默认远程路径 `oc.isoops.com` 必须合法。
+        assert!(AccountConfig::validate_remote_path("oc.isoops.com").is_ok());
+        assert!(AccountConfig::validate_remote_path("  1.2.3.4:8080  ").is_ok());
+    }
+
+    #[test]
     fn validate_remote_path_rejects_empty_and_wrong_scheme() {
         assert!(AccountConfig::validate_remote_path("").is_err());
         assert!(AccountConfig::validate_remote_path("   ").is_err());
-        assert!(AccountConfig::validate_remote_path("oc.isoops.com").is_err());
         assert!(AccountConfig::validate_remote_path("ftp://oc.isoops.com").is_err());
+        assert!(AccountConfig::validate_remote_path("file:///tmp/x").is_err());
+    }
+
+    #[test]
+    fn normalize_remote_path_adds_https_for_bare_host() {
+        assert_eq!(normalize_remote_path("oc.isoops.com"), "https://oc.isoops.com");
+        assert_eq!(
+            normalize_remote_path("  oc.isoops.com/  "),
+            "https://oc.isoops.com"
+        );
+        // 已带 scheme 时原样返回（去掉尾随 /）。
+        assert_eq!(
+            normalize_remote_path("https://oc.isoops.com/"),
+            "https://oc.isoops.com"
+        );
+        assert_eq!(
+            normalize_remote_path("http://1.2.3.4:8080"),
+            "http://1.2.3.4:8080"
+        );
     }
 
     #[test]
@@ -1246,5 +1297,43 @@ mod tests {
         let dev = resp.device.expect("device present");
         assert_eq!(dev.name, "pc-1");
         assert!(dev.bound);
+    }
+
+    /// 设置 `OC_SERVE_AUTH_ENV` 指向 temp 路径后,`AccountConfig::load()`
+    /// 应优先从该路径读取 `.env`,忽略 exe_dir 与 cwd 下的同名文件。
+    ///
+    /// 当前实现(`load()` 内联两段式)已正确处理此优先级 —— 此测试为回归保护。
+    /// 它必须**始终通过**;实施 Task 4 改动后不应被破坏。
+    #[test]
+    fn load_respects_oc_serve_auth_env_priority() {
+        use std::sync::Mutex;
+        // 全局 env var 修改需要串行,避免与其他测试干扰。
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_env_path = tmp.path().join("auth.env");
+        std::fs::write(
+            &auth_env_path,
+            "ACCOUNT_ID=user-from-auth-env\nACCOUNT_KEY=key-from-auth-env\n",
+        )
+        .unwrap();
+
+        // 在 tempdir 上下文下保存旧值并切换到新值。
+        let saved = std::env::var("OC_SERVE_AUTH_ENV").ok();
+        // SAFETY: 持有 ENV_LOCK 串行化,本测试内对进程 env 的修改不会与其它测试重叠。
+        unsafe {
+            std::env::set_var("OC_SERVE_AUTH_ENV", &auth_env_path);
+        }
+
+        let cfg = AccountConfig::load();
+        assert_eq!(cfg.account_id, "user-from-auth-env");
+        assert_eq!(cfg.account_key, "key-from-auth-env");
+
+        // 还原 env var,防止污染后续测试。
+        match saved {
+            Some(v) => unsafe { std::env::set_var("OC_SERVE_AUTH_ENV", v) },
+            None => unsafe { std::env::remove_var("OC_SERVE_AUTH_ENV") },
+        }
     }
 }
