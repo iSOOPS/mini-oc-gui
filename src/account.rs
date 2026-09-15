@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::config;
 use crate::error::AppError;
 
 /// 默认远程 API 地址（不带 scheme，调用时会自动补 `https://`）。
@@ -182,10 +183,7 @@ impl AccountConfig {
         };
 
         if !cfg.is_configured() {
-            let path = std::env::var("OC_SERVE_AUTH_ENV")
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".env"));
+            let path = config::unified_env_path();
             let from_file = Self::read_env_file(&path);
             if cfg.account_id.is_empty() {
                 cfg.account_id = from_file.account_id;
