@@ -170,9 +170,11 @@ impl AccountConfig {
     /// 从环境变量加载（`ACCOUNT_ID` / `ACCOUNT_KEY` / `REMOTE_PATH` /
     /// `DEVICE_NAME`）。
     ///
-    /// 缺失字段回退到 auth-env 文件（`OC_SERVE_AUTH_ENV` 覆盖路径，默认
-    /// `./.env`，与 [`crate::auth::AuthConfig::from_env`]
-    /// 同一约定）；`remote_path` 为空时取 [`DEFAULT_REMOTE_PATH`]。
+    /// 缺失字段回退到 auth-env 文件 —— 路径由
+    /// [`crate::config::unified_env_path`] 决定（`OC_SERVE_AUTH_ENV`
+    /// → `exe_dir/.env` → `cwd/.env` → `./.oc-serve-auth.env`，与
+    /// [`crate::auth::AuthConfig::from_env`] 同一约定）；
+    /// `remote_path` 为空时取 [`DEFAULT_REMOTE_PATH`]。
     #[must_use]
     pub fn load() -> Self {
         let mut cfg = Self {
