@@ -634,7 +634,7 @@ pub struct TuiApp {
     account_id_input: String,
     /// 设置：账户密钥输入缓冲（打开面板时留空，掩码回显已保存位数）。
     account_key_input: String,
-    /// 设置：账户中心远程路径输入缓冲（默认 `https://oc.isoops.com`）。
+    /// 设置：账户中心远程路径输入缓冲（默认 `oc.isoops.com`，无 scheme 自动补 `https://`）。
     remote_path_input: String,
     /// 当前帧的可点击区域（渲染时填充，鼠标事件查询）。
     click_regions: Vec<ClickRegion>,
@@ -1877,18 +1877,19 @@ impl TuiApp {
             self.input_mode = InputMode::SettingsAccountKey;
             return;
         }
-        // 远程路径：空 → 默认 https://oc.isoops.com；必须 http(s):// 开头。
+        // 远程路径：空 → 默认 `oc.isoops.com`；可显式带 http(s):// 或不带 scheme
+        // （不带 scheme 由服务端代码自动补 `https://`）。
         let remote_path = {
             let raw = self.remote_path_input.trim().trim_end_matches('/');
             if raw.is_empty() {
-                DEFAULT_REMOTE_PATH.trim_end_matches('/').to_string()
+                DEFAULT_REMOTE_PATH.to_string()
             } else {
                 raw.to_string()
             }
         };
         if AccountConfig::validate_remote_path(&remote_path).is_err() {
             *self.status_message.lock().unwrap() =
-                "❌ 远程路径必须以 http:// 或 https:// 开头".to_string();
+                "❌ 远程路径必须以 http:// 或 https:// 开头（其他 scheme 不支持）".to_string();
             self.input_mode = InputMode::SettingsRemotePath;
             return;
         }
@@ -2648,12 +2649,40 @@ impl TuiApp {
     /// 每次进入 OC 项目入口都直接调 `remote.get()`,确保数据为最新;
     /// 不走 `store.refresh()`(refresh 会先读本地 cache 并回写)。
     /// 失败返回 Err(AppError::Internal)。
+    ///
+    /// 进入 OC 项目时,如果 store 还没拿到 RemoteClient(例如后台
+    /// `fetch_user_info` 还没跑完),且 `cached_user_info` 中已缓存
+    /// 最近一次成功 fetch 的用户信息,会用该缓存 **立即重建**
+    /// RemoteClient —— 依据是缓存里的 sb.base_url / sb.password /
+    /// user_id,确保 path-list 同步走 sb 服务而非账户中心。
     async fn fetch_remote_projects_only(&self) -> Result<Vec<PathEntry>, AppError> {
-        let Some(mut remote) = self.store.remote_client().await else {
-            return Err(AppError::Internal(
-                "远程存储未配置（需要先完成账户登录 + fetch_user_info）".to_string(),
-            ));
-        };
+        // 1. 尝试从 store 直接拿 RemoteClient(main.rs 后台 fetch_user_info
+        //    完成时会写入)。若拿不到,见第 2 步回退。
+        let mut remote = self.store.remote_client().await;
+
+        // 2. store 没有 RemoteClient —— 用缓存里的用户信息(success fetch 的)
+        //    重建一个:RemoteClient 用 sb.base_url 作 base_url、sb.password 作
+        //    cookie 登录密码、user_id/device_name 构造新格式路径段。
+        if remote.is_none() {
+            let Some(info) = self.cached_user_info.clone() else {
+                return Err(AppError::Internal(
+                    "远程存储未配置（需要先完成账户登录 + fetch_user_info）".to_string(),
+                ));
+            };
+            let device_name = self
+                .account_config
+                .read()
+                .map(|c| c.device_name.clone())
+                .unwrap_or_default();
+            let new_remote = RemoteClient::from_user_info_v2(
+                &info,
+                device_name,
+                info.sb.password.clone(),
+            );
+            self.store.with_remote(new_remote.clone()).await;
+            remote = Some(new_remote);
+        }
+        let mut remote = remote.expect("remote ensured above");
 
         // 路径与推送侧保持一致：RemoteClient 携带 user_id 时走新格式
         // serv/opencode/{user_id}/{pctype}/{device_name}/path-list，

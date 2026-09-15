@@ -35,13 +35,13 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     /// Resolve credentials from environment variables, with optional
-    /// fallback to a `.oc-serve-auth.env` file (the same convention used
+    /// fallback to a `.env` file (the same convention used
     /// by the original `oc-serve-start.sh`).
     ///
     /// Resolution order for `OPENCODE_SERVER_PASSWORD`:
     /// 1. `$OPENCODE_SERVER_PASSWORD` in the process environment.
     /// 2. `${auth_env}` file (defaults to `OC_SERVE_AUTH_ENV` env var or
-    ///    `./.oc-serve-auth.env` next to the binary).
+    ///    `./.env` next to the binary).
     ///
     /// `OPENCODE_SERVER_USERNAME` 缺省时留空，由首次配置表单引导填写。
     ///
@@ -52,7 +52,7 @@ impl AuthConfig {
         let auth_env_path = std::env::var("OC_SERVE_AUTH_ENV")
             .ok()
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(".oc-serve-auth.env"));
+            .unwrap_or_else(|| std::path::PathBuf::from(".env"));
 
         Self::from_env_with_file(&auth_env_path)
     }
@@ -68,7 +68,7 @@ impl AuthConfig {
         let mut user = std::env::var("OPENCODE_SERVER_USERNAME").ok();
         let mut password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
 
-        // Layer 2: fall back to `.oc-serve-auth.env` for any missing value.
+        // Layer 2: fall back to `.env` for any missing value.
         if (user.is_none() || password.is_none()) && auth_env.is_file() {
             let contents = std::fs::read_to_string(auth_env).map_err(|e| {
                 AppError::Internal(format!(

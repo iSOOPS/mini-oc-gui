@@ -46,7 +46,7 @@ struct Cli {
     no_http: bool,
 
     /// (Deprecated) Generate a random HTTP Basic password, write it to
-    /// `.oc-serve-auth.env` (chmod 600 on Unix) and exit.
+    /// `.env` (chmod 600 on Unix) and exit.
     ///
     /// Kept for backward compatibility; account login (ACCOUNT_KEY) is
     /// now the preferred way to provision credentials.
@@ -54,7 +54,7 @@ struct Cli {
     generate_auth: bool,
 
     /// Override the auth-env file location (defaults to
-    /// `$OC_SERVE_AUTH_ENV` or `./.oc-serve-auth.env`).
+    /// `$OC_SERVE_AUTH_ENV` or `./.env`).
     #[arg(long, env = "OC_SERVE_AUTH_ENV")]
     auth_env: Option<PathBuf>,
 }
@@ -93,22 +93,31 @@ async fn main() -> Result<()> {
         .or_else(|| Some(mini_oc_gui_serve::config::unified_env_path()))
         .expect("unified_env_path always returns Some");
 
-    // 一次性迁移:cwd 下的旧 .oc-serve-auth.env → 新位置(可执行文件同目录)
-    // 旧位置(通常 ./)有文件 + 新位置没有 → 复制内容过去 + 删除旧文件。
+    // 一次性迁移:
+    //   1) cwd 下的旧 .env → 新位置(可执行文件同目录)
+    //   2) cwd 下的旧 .oc-serve-auth.env → 新位置(可执行文件同目录) ——
+    //      兼容旧版本命名,完成后删除旧文件。
+    // 满足「旧位置有文件 + 新位置没有」时才执行。
     // 这一步只在用户没设 OC_SERVE_AUTH_ENV / --auth-env 时生效。
     // 该文件承载 ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH 账户登录信息。
     if cli.auth_env.is_none() && std::env::var("OC_SERVE_AUTH_ENV").is_err() {
-        let legacy_cwd_path = PathBuf::from(mini_oc_gui_serve::config::UNIFIED_ENV_FILE);
-        if legacy_cwd_path.exists() && !unified_env_path.exists() {
-            match std::fs::copy(&legacy_cwd_path, &unified_env_path) {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&legacy_cwd_path);
-                    tracing::info!(
-                        "已将旧 env 从 cwd 迁移到 {}",
-                        unified_env_path.display()
-                    );
+        for legacy_filename in [
+            ".env",
+            ".oc-serve-auth.env",
+        ] {
+            let legacy_cwd_path = PathBuf::from(legacy_filename);
+            if legacy_cwd_path.exists() && !unified_env_path.exists() {
+                match std::fs::copy(&legacy_cwd_path, &unified_env_path) {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&legacy_cwd_path);
+                        tracing::info!(
+                            "已将旧 env 从 cwd 迁移到 {}",
+                            unified_env_path.display()
+                        );
+                    }
+                    Err(e) => tracing::warn!("迁移 env 到新位置失败: {e}"),
                 }
-                Err(e) => tracing::warn!("迁移 env 到新位置失败: {e}"),
+                break;
             }
         }
     }
@@ -360,13 +369,13 @@ async fn main() -> Result<()> {
 }
 
 /// Generate a random 20-char HTTP Basic password and write it to
-/// `.oc-serve-auth.env` with mode 600.
+/// `.env` with mode 600.
 fn generate_auth_and_exit(path: Option<&Path>) -> Result<()> {
     use rand::Rng;
 
     let target = path
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".oc-serve-auth.env"));
+        .unwrap_or_else(|| PathBuf::from(".env"));
     let user = std::env::var("OPENCODE_SERVER_USERNAME").unwrap_or_else(|_| "opencode".to_string());
     let password: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)

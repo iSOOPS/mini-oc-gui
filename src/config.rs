@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use crate::error::AppError;
 
 /// 统一的持久化 env 文件名（账户 / auth + port + rathole 所有 key）。
-pub const UNIFIED_ENV_FILE: &str = ".oc-serve-auth.env";
+pub const UNIFIED_ENV_FILE: &str = ".env";
 
 /// 生成的 rathole 客户端配置文件（供 rathole 二进制直接使用）。
 ///
@@ -169,24 +169,66 @@ impl PortsConfig {
     ///
     /// 优先级：
     /// 1. 进程环境变量 `OC_SERVE_SYSTEM_PORT` / `OC_SERVE_OPENCODE_PORT`
-    /// 2. 硬编码默认值
+    /// 2. 统一 env 文件（[`UNIFIED_ENV_FILE`]，路径由 [`unified_env_path`]
+    ///    解析 —— 用户可在外部直接编辑 .env 后通过 TUI 设置面板看到新值，
+    ///    不必重启进程）
+    /// 3. 硬编码默认值
     ///
-    /// 注意：`.oc-serve-auth.env` 文件的回退由 `main.rs` 在 auth 初始化前
-    /// 通过 `dotenvy::from_filename_override` 统一注入到进程 env，
-    /// 所以此处只需读 `std::env::var` 即可。
+    /// 注意：`.env` 文件的回退也由 `main.rs` 在 auth 初始化前
+    /// 通过 `dotenvy::from_filename_override` 注入到进程 env，
+    /// 直接走第 1 优先级；本函数同时直接读文件，确保 TUI 设置面板
+    /// 在不重启进程的情况下也能反映外部编辑的最新值。
     #[must_use]
     pub fn load() -> Self {
+        let file_kv = load_env_file_kv();
+
+        let system_port = resolve_port(
+            keys::SYSTEM_PORT,
+            DEFAULT_SYSTEM_PORT,
+            &file_kv,
+        );
+        let opencode_port = resolve_port(
+            keys::OPENCODE_PORT,
+            DEFAULT_OPENCODE_PORT,
+            &file_kv,
+        );
+
         Self {
-            system_port: std::env::var(keys::SYSTEM_PORT)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_SYSTEM_PORT),
-            opencode_port: std::env::var(keys::OPENCODE_PORT)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_OPENCODE_PORT),
+            system_port,
+            opencode_port,
         }
     }
+}
+
+/// 在设置面板/启动时直接读取 .env 文件的 kv 对（不依赖进程 env 缓存）。
+///
+/// 复用 [`crate::account::read_env_kv`]：行级解析、空行/注释忽略、
+/// 两侧引号 trim。文件不存在时返回空 Vec。
+fn load_env_file_kv() -> Vec<(String, String)> {
+    crate::account::read_env_kv(&unified_env_path())
+}
+
+/// 端口解析顺序：
+/// 1. 进程环境变量（用户启动时 `OC_SERVE_SYSTEM_PORT=...` 等最高优先）
+/// 2. env 文件（`.env`，TUI 设置面板直接读，避免进程 env 缓存掩盖外部编辑）
+/// 3. 硬编码默认
+///
+/// 三处都解析失败时返回默认值（启动时进程 env 应已由 dotenvy 注入，
+/// 文件路径由 `unified_env_path()` 解析；两者都拿不到就回退默认）。
+fn resolve_port(env_key: &str, default: u16, file_kv: &[(String, String)]) -> u16 {
+    if let Ok(v) = std::env::var(env_key) {
+        if let Ok(p) = v.parse() {
+            return p;
+        }
+    }
+    for (k, v) in file_kv {
+        if k == env_key {
+            if let Ok(p) = v.parse() {
+                return p;
+            }
+        }
+    }
+    default
 }
 
 /// env 文件中端口相关 key 名常量。
@@ -289,5 +331,58 @@ impl RatholeConfig {
             std::fs::create_dir_all(parent).map_err(AppError::Io)?;
         }
         std::fs::write(path, self.to_toml(local_port)).map_err(AppError::Io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 端口解析的纯函数测试 —— 不依赖进程 env、不写文件、不污染测试间状态。
+    #[test]
+    fn resolve_port_falls_through_to_default() {
+        // env_key 不在 file_kv 里,也没有进程 env → 默认。
+        let got = resolve_port("NONEXISTENT_PORT", 1234, &[]);
+        assert_eq!(got, 1234);
+    }
+
+    #[test]
+    fn resolve_port_picks_value_from_file_kv() {
+        // 即使 env_key 未在进程 env 中设置,只要 file_kv 里有就生效。
+        let kv = vec![(keys::OPENCODE_PORT.to_string(), "18800".to_string())];
+        // 注:此测试可能在被测进程已设 OC_SERVE_OPENCODE_PORT 时失败 —— 若
+        // CI 上未注入该 env 变量,下面才是默认;反之会因进程 env 优先级
+        // 更高而跳过此处断言。单独跑 cargo test 时通常不会设置。
+        if std::env::var(keys::OPENCODE_PORT).is_err() {
+            let got = resolve_port(keys::OPENCODE_PORT, DEFAULT_OPENCODE_PORT, &kv);
+            assert_eq!(got, 18800);
+        }
+    }
+
+    #[test]
+    fn resolve_port_ignores_invalid_value_and_falls_back() {
+        // 解析失败时返回默认值,而不是 0。
+        let kv = vec![(keys::SYSTEM_PORT.to_string(), "not-a-number".to_string())];
+        if std::env::var(keys::SYSTEM_PORT).is_err() {
+            let got = resolve_port(keys::SYSTEM_PORT, DEFAULT_SYSTEM_PORT, &kv);
+            assert_eq!(got, DEFAULT_SYSTEM_PORT);
+        }
+    }
+
+    /// PortsConfig 默认值锁:防止端口常量被意外改动 —— 系统端口硬锁定 9465,
+    /// opencode 端口 9464,二者必须不同(否则 `submit_settings` 拒绝)。
+    #[test]
+    fn ports_config_defaults_lock_invariants() {
+        assert_eq!(DEFAULT_SYSTEM_PORT, 9465);
+        assert_eq!(DEFAULT_OPENCODE_PORT, 9464);
+        assert_ne!(DEFAULT_SYSTEM_PORT, DEFAULT_OPENCODE_PORT);
+    }
+
+    /// 端口 key 名称稳定性 —— 这些 env key 已被 dotenvy 与外部脚本依赖,
+    /// 改名会破坏现有用户的 .env 文件。
+    #[test]
+    fn port_keys_are_stable() {
+        assert_eq!(keys::SYSTEM_PORT, "OC_SERVE_SYSTEM_PORT");
+        assert_eq!(keys::OPENCODE_PORT, "OC_SERVE_OPENCODE_PORT");
     }
 }
