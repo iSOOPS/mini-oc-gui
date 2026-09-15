@@ -1342,6 +1342,10 @@ mod tests {
     /// **核心回归测试** —— 模拟用户安装场景:进程 exe_dir 下存在 `.env`
     /// (无 `OC_SERVE_AUTH_ENV` 覆盖)。当前 `AccountConfig::load()`
     /// 只检查 cwd 而不查 exe_dir,**此测试在改动前必失败**。
+    ///
+    /// 串行化约束:本测试写 `current_exe().parent()/.env` —— 与 Task 1 的
+    /// `OC_SERVE_AUTH_ENV` 写互不干扰,但两者都改进程 env,必须用
+    /// `cargo test -- --test-threads=1` 串行执行。
     #[test]
     fn load_reads_env_from_exe_dir_when_no_override() {
         use std::sync::Mutex;
@@ -1350,25 +1354,13 @@ mod tests {
 
         // 必须清除 `OC_SERVE_AUTH_ENV` 才能走到 `unified_env_path()` 的 exe_dir 兜底。
         let saved_env = std::env::var("OC_SERVE_AUTH_ENV").ok();
-        // SAFETY: ENV_LOCK 仅串行化本测试体内的 env 写入。
-        // 其它并行测试若也改 OC_SERVE_AUTH_ENV 仍可能冲突 —— 见测试顶部
-        // docstring 关于 `--test-threads=1` 的约定。
+        // SAFETY: `std::env::remove_var` 在 Rust 1.74+ 是 unsafe(进程全局
+        // 状态)。本测试体内 ENV_LOCK 保证串行,测试结束前会 restore。
+        // 跨测试串行化由 `--test-threads=1` 兜底,见 docstring。
         unsafe {
             std::env::remove_var("OC_SERVE_AUTH_ENV");
         }
 
-        // 用 `std::env::current_exe()` 拿真实 exe 路径 —— 它总是返回 binary 自身。
-        // 构造一个临时目录,把 binary 的副本(或 hardlink)放进该目录,
-        // 让 `exe_dir/.env` 落在我们控制的路径下。
-        //
-        // 注意:`tempfile::tempdir()` 不会被 `current_exe()` 解析 —— 我们要的是
-        // binary 旁的 .env,所以最简方案是直接拿 `current_exe().parent()`,
-        // 在那里临时写 `.env`(测试结束后清理)。
-        //
-        // 风险:把 .env 写到真 exe 旁会污染生产环境,但 binary 目录通常受
-        // 用户写权限保护且 .env 是用户级配置,测试结束后立即删除。
-        // 若生产环境的 `.env` 存在,test helper 会会覆盖它;作为 mitigation,
-        // 备份 -> 写 -> 测试 -> 恢复。
         let exe_path = std::env::current_exe().expect("current_exe");
         let exe_dir = exe_path.parent().expect("exe parent");
         let env_path = exe_dir.join(".env");
@@ -1383,28 +1375,22 @@ mod tests {
             &env_path,
             "ACCOUNT_ID=user-from-exe-dir\nACCOUNT_KEY=key-from-exe-dir\n",
         )
-        .expect("write .env");
+        .expect("write .env at exe_dir");
 
         let cfg = AccountConfig::load();
         assert_eq!(cfg.account_id, "user-from-exe-dir");
         assert_eq!(cfg.account_key, "key-from-exe-dir");
 
-        // 清理:恢复原 .env 内容(如有)或删除。
         match backup {
-            Some(bytes) => std::fs::write(&env_path, bytes).expect("restore"),
+            Some(bytes) => std::fs::write(&env_path, bytes).expect("restore .env"),
             None => {
                 let _ = std::fs::remove_file(&env_path);
             }
         }
 
-        // 还原 env var。
         if let Some(v) = saved_env {
-            // SAFETY: 同上,ENV_LOCK 保证串行。
+            // SAFETY: 同上 `remove_var` 注释。
             unsafe { std::env::set_var("OC_SERVE_AUTH_ENV", v) }
         }
-
-        // 此测试**不设辅助变量** —— 用 cfg 自带的字段验证;若泄漏 ENV_LOCK,
-        // cargo test 的并行 runner 可能争抢,但 ENV_LOCK 互斥保证串行。
-        let _ = cfg;
     }
 }
