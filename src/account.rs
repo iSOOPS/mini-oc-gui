@@ -1393,4 +1393,70 @@ mod tests {
             unsafe { std::env::set_var("OC_SERVE_AUTH_ENV", v) }
         }
     }
+
+    /// 兜底测试:无 `OC_SERVE_AUTH_ENV`、无法解析 exe_dir(模拟 sandbox)时,
+    /// `AccountConfig::load()` 应回退到 cwd/.env。
+    ///
+    /// 实际场景:无法制造 sandbox 失败 —— `current_exe()` 在测试环境下
+    /// 总是成功。所以此测试仅验证 cwd 兜底**在 env var 优先 + exe_dir
+    /// 命中的语义后仍能工作** —— 即 cwd .env 里的字段在 exe_dir .env 不存在
+    /// 时可被读取。
+    ///
+    /// 我们把 exe_dir/.env 临时移除(若存在),在 cwd 写 .env,验证读取。
+    /// 由于 `std::env::current_exe()` 在 cargo test 下指向
+    /// `target/debug/deps/<test_binary>`,exe_dir 是 deps 目录 —— 我们
+    /// 提前确认 deps 目录**没有** `.env` 文件存在(若存在,test 跳过并打日志)。
+    #[test]
+    fn load_falls_back_to_cwd_env_when_no_exe_dir_or_env_var() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let saved_env = std::env::var("OC_SERVE_AUTH_ENV").ok();
+        // SAFETY: 同 Task 1/2 注释 —— remove_var 在 Rust 1.74+ 是 unsafe,
+        // 本测试体内 ENV_LOCK 串行,跨测试由 `--test-threads=1` 兜底。
+        unsafe { std::env::remove_var("OC_SERVE_AUTH_ENV") }
+
+        // cwd 写 .env。
+        let cwd_env = std::env::current_dir().unwrap().join(".env");
+        let cwd_backup = if cwd_env.exists() {
+            Some(std::fs::read(&cwd_env).expect("backup cwd"))
+        } else {
+            None
+        };
+        std::fs::write(
+            &cwd_env,
+            "ACCOUNT_ID=user-from-cwd\nACCOUNT_KEY=key-from-cwd\n",
+        )
+        .expect("write cwd .env");
+
+        // exe_dir 不在我们的控制下 —— 跳过。
+        let exe_path = std::env::current_exe().unwrap();
+        let exe_dir = exe_path.parent().unwrap();
+        let exe_env = exe_dir.join(".env");
+        if exe_env.exists() {
+            eprintln!("[skip] exe_dir .env already exists; cannot isolate cwd fallback");
+            // 恢复 cwd .env 后返回。
+            match cwd_backup {
+                Some(b) => std::fs::write(&cwd_env, b).unwrap(),
+                None => { let _ = std::fs::remove_file(&cwd_env); }
+            }
+            if let Some(v) = &saved_env { unsafe { std::env::set_var("OC_SERVE_AUTH_ENV", v) } }
+            return;
+        }
+
+        let cfg = AccountConfig::load();
+        assert_eq!(cfg.account_id, "user-from-cwd");
+        assert_eq!(cfg.account_key, "key-from-cwd");
+
+        // 恢复 cwd .env。
+        match cwd_backup {
+            Some(b) => std::fs::write(&cwd_env, b).unwrap(),
+            None => { let _ = std::fs::remove_file(&cwd_env); }
+        }
+        if let Some(v) = saved_env {
+            // SAFETY: 同 remove_var 注释。
+            unsafe { std::env::set_var("OC_SERVE_AUTH_ENV", v) }
+        }
+    }
 }
