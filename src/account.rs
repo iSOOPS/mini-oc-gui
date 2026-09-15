@@ -1321,7 +1321,9 @@ mod tests {
 
         // 在 tempdir 上下文下保存旧值并切换到新值。
         let saved = std::env::var("OC_SERVE_AUTH_ENV").ok();
-        // SAFETY: 持有 ENV_LOCK 串行化,本测试内对进程 env 的修改不会与其它测试重叠。
+        // SAFETY: ENV_LOCK 仅串行化本测试体内的 env 写入。
+        // 其它并行测试若也改 OC_SERVE_AUTH_ENV 仍可能冲突 —— 见测试顶部
+        // docstring 关于 `--test-threads=1` 的约定。
         unsafe {
             std::env::set_var("OC_SERVE_AUTH_ENV", &auth_env_path);
         }
