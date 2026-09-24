@@ -1,34 +1,36 @@
-//! 路径解析 + 端口配置 + rathole 客户端配置。
+//! 路径解析 + 运行期端口配置 + rathole 客户端配置。
 //!
-//! ## 持久化结构（重构后）
+//! ## 持久化结构（v3：env 文件仅账户登录）
 //!
 //! 本模块只负责「放在哪、监听哪个端口」：
 //! - 统一 env 文件与 rathole 配置文件的路径解析（[`unified_env_path`] /
 //!   [`rathole_config_path`] / [`rathole_settings_dir`]）；
-//! - 系统端口 + opencode 服务端口（[`PortsConfig`]）；
+//! - 运行期端口（[`RuntimePorts`]）——**不再本地持久化**，每次启动由
+//!   `/api/user/info` 设备清单中当前绑定设备的 `port`（系统端口）与
+//!   `oc-port`（opencode 端口）下发；拉取失败时回退
+//!   [`DEFAULT_SYSTEM_PORT`] / [`DEFAULT_OPENCODE_PORT`]；
 //! - rathole 客户端配置（[`RatholeConfig`]，**已标记 deprecated**，
 //!   后续将被云服务下发的新方案替代/移除）。
 //!
-//! 各类数据的持久化归属：
+//! 各类数据的归属：
 //!
-//! | 数据                                   | 归属                                        | 持久化方式                                            |
+//! | 数据                                   | 归属                                        | 来源                                                  |
 //! |----------------------------------------|---------------------------------------------|-------------------------------------------------------|
-//! | 账户（account_id / key / remote_path） | [`crate::account::AccountConfig`]           | `AccountConfig::write_env_file`（增量更新账户 key）    |
-//! | HTTP Basic（用户名 / 密码 / Cookie 名） | env 文件对应 key（经由 `crate::account` 的 kv 工具增量更新） | 同一 env 文件                          |
-//! | 端口                                   | 本模块 [`PortsConfig`]                      | env 文件 `OC_SERVE_*_PORT` key                        |
-//! | 远程存储（SilverBullet）凭据            | [`crate::account::RemoteSbConfig`]（`/api/user/info` 动态下发） | 不再本地持久化（旧 `SB_*` key 仅作过渡读取） |
-//! | rathole                                | [`RatholeConfig`]（deprecated）             | env 文件 `RATHOLE_*` key + `global.toml`              |
+//! | 账户（account_id / key / remote_path / device_name） | [`crate::account::AccountConfig`] | env 文件 `# --- account login ---` 区块（唯一持久化项） |
+//! | 端口（系统 / opencode）                 | 本模块 [`RuntimePorts`]                     | `/api/user/info` 设备清单（内存，不落盘）              |
+//! | HTTP Basic（用户名 / 密码）             | [`crate::auth::AuthConfig`]                 | `/api/user/info` 用户信息映射（内存，不落盘）          |
+//! | 远程存储（SilverBullet）凭据            | [`crate::account::RemoteSbConfig`]          | `/api/user/info` 动态下发（内存，不落盘）              |
+//! | rathole                                | [`RatholeConfig`]（deprecated）             | 随 bundle 的 `global.toml`（过渡期）                   |
 //!
-//! 旧版的 `PersistedSettings` / `SbConfig` / `write_persisted_env` /
-//! `read_persisted_env` / `migrate_legacy_env` 已删除：账户信息统一走
-//! [`crate::account`]，其余 section 通过增量 upsert 写入统一 env 文件，
-//! 不再整文件覆盖。
+//! 启动时 [`crate::account::prune_env_file_to_account_only`] 会把 env 文件
+//! 清理为仅账户登录区块 —— 端口 / auth / rathole / sb 的旧持久化行全部删除。
 
 use std::path::{Path, PathBuf};
 
+use crate::account::RemoteUserInfo;
 use crate::error::AppError;
 
-/// 统一的持久化 env 文件名（账户 / auth + port + rathole 所有 key）。
+/// 统一的持久化 env 文件名（仅承载账户登录信息）。
 pub const UNIFIED_ENV_FILE: &str = ".env";
 
 /// 生成的 rathole 客户端配置文件（供 rathole 二进制直接使用）。
@@ -138,108 +140,90 @@ pub fn unified_env_path() -> PathBuf {
     PathBuf::from(UNIFIED_ENV_FILE)
 }
 
-/// 默认系统端口（axum path-list 管理接口）。
+/// 默认系统端口（axum path-list 管理接口）——设备清单不可用时的回退值。
 pub const DEFAULT_SYSTEM_PORT: u16 = 9465;
 
-/// 默认 opencode 服务端口。
+/// 默认 opencode 服务端口——设备清单不可用 / 绑定设备缺 `oc-port` 时的回退值。
 pub const DEFAULT_OPENCODE_PORT: u16 = 9464;
 
-/// 端口配置（系统端口 + opencode 服务端口）。
+/// 运行期端口状态（从设备清单解析；`main.rs` 启动时创建，`TuiApp` 共享读写）。
 ///
-/// 两个端口相互独立，避免同时监听同一端口。
-#[derive(Debug, Clone, Copy)]
-pub struct PortsConfig {
+/// - `system_port`：本程序 axum 监听端口，**启动时定死**——运行期云端下发
+///   变化仅提示重启生效（监听套接字无法热迁移）；
+/// - `opencode_port`：`opencode serve` 启动端口，**即时生效**——设置面板
+///   保存 / 重新绑定设备后更新，后续启动 serve / 云服务用新值；
+/// - `device_found`：当前绑定设备（`DEVICE_NAME`）是否在最近一次成功拉取
+///   的设备清单中。`false`（未绑定 / 清单中不存在）期间**禁止启动
+///   serve 与云服务**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimePorts {
     /// axum 系统监听端口。
     pub system_port: u16,
-    /// opencode 服务端口。
+    /// opencode serve 端口。
     pub opencode_port: u16,
+    /// 绑定设备是否已在设备清单中找到。
+    pub device_found: bool,
 }
 
-impl Default for PortsConfig {
+impl Default for RuntimePorts {
     fn default() -> Self {
         Self {
             system_port: DEFAULT_SYSTEM_PORT,
             opencode_port: DEFAULT_OPENCODE_PORT,
+            device_found: false,
         }
     }
 }
 
-impl PortsConfig {
-    /// 从环境变量加载，缺失字段走各自默认值。
-    ///
-    /// 优先级：
-    /// 1. 进程环境变量 `OC_SERVE_SYSTEM_PORT` / `OC_SERVE_OPENCODE_PORT`
-    /// 2. 统一 env 文件（[`UNIFIED_ENV_FILE`]，路径由 [`unified_env_path`]
-    ///    解析 —— 用户可在外部直接编辑 .env 后通过 TUI 设置面板看到新值，
-    ///    不必重启进程）
-    /// 3. 硬编码默认值
-    ///
-    /// 注意：`.env` 文件的回退也由 `main.rs` 在 auth 初始化前
-    /// 通过 `dotenvy::from_filename_override` 注入到进程 env，
-    /// 直接走第 1 优先级；本函数同时直接读文件，确保 TUI 设置面板
-    /// 在不重启进程的情况下也能反映外部编辑的最新值。
-    #[must_use]
-    pub fn load() -> Self {
-        let file_kv = load_env_file_kv();
-
-        let system_port = resolve_port(
-            keys::SYSTEM_PORT,
-            DEFAULT_SYSTEM_PORT,
-            &file_kv,
+/// 从 `/api/user/info` 的设备清单解析当前绑定设备的端口。
+///
+/// 规则（按用户确认的业务流程）：
+/// - 取**当前绑定设备**（`device_name` 与清单中 `devices[].name` 精确匹配）
+///   的 `port` → 系统端口、`oc-port` → opencode 端口；
+/// - `device_name` 为空（未绑定）或清单中无匹配 → 回退默认端口，
+///   `device_found = false`（调用方据此禁止启动 serve / 云服务）；
+/// - 绑定设备缺 `oc-port`（老数据）或值为 0 → opencode 端口回退默认并
+///   记警告；`port` 为 0 同理。
+///
+/// fetch 失败（断网等）场景由调用方直接用 [`RuntimePorts::default()` 回退，
+/// 并以 `DEVICE_NAME` 非空作乐观的 `device_found` 判定（见 `main.rs`）。
+#[must_use]
+pub fn ports_from_user_info(info: &RemoteUserInfo, device_name: &str) -> RuntimePorts {
+    let wanted = device_name.trim();
+    if wanted.is_empty() {
+        tracing::warn!("未绑定设备（DEVICE_NAME 为空）——端口回退默认值");
+        return RuntimePorts::default();
+    }
+    let Some(dev) = info.devices.iter().find(|d| d.name == wanted) else {
+        tracing::warn!(
+            "设备清单中未找到绑定设备 {wanted:?} —— 端口回退默认值（请在设置中重新绑定设备）"
         );
-        let opencode_port = resolve_port(
-            keys::OPENCODE_PORT,
-            DEFAULT_OPENCODE_PORT,
-            &file_kv,
-        );
+        return RuntimePorts::default();
+    };
 
-        Self {
-            system_port,
-            opencode_port,
+    let system_port = if dev.port == 0 {
+        tracing::warn!("设备 {wanted} 的 port 为 0 —— 系统端口回退默认 {DEFAULT_SYSTEM_PORT}");
+        DEFAULT_SYSTEM_PORT
+    } else {
+        dev.port
+    };
+    let opencode_port = match dev.oc_port {
+        Some(p) if p != 0 => p,
+        _ => {
+            tracing::warn!(
+                "设备 {wanted} 缺少有效 oc-port —— opencode 端口回退默认 {DEFAULT_OPENCODE_PORT}"
+            );
+            DEFAULT_OPENCODE_PORT
         }
+    };
+    tracing::info!(
+        "绑定设备 {wanted} 下发端口：系统={system_port} opencode={opencode_port}"
+    );
+    RuntimePorts {
+        system_port,
+        opencode_port,
+        device_found: true,
     }
-}
-
-/// 在设置面板/启动时直接读取 .env 文件的 kv 对（不依赖进程 env 缓存）。
-///
-/// 复用 [`crate::account::read_env_kv`]：行级解析、空行/注释忽略、
-/// 两侧引号 trim。文件不存在时返回空 Vec。
-fn load_env_file_kv() -> Vec<(String, String)> {
-    crate::account::read_env_kv(&unified_env_path())
-}
-
-/// 端口解析顺序：
-/// 1. 进程环境变量（用户启动时 `OC_SERVE_SYSTEM_PORT=...` 等最高优先）
-/// 2. env 文件（`.env`，TUI 设置面板直接读，避免进程 env 缓存掩盖外部编辑）
-/// 3. 硬编码默认
-///
-/// 三处都解析失败时返回默认值（启动时进程 env 应已由 dotenvy 注入，
-/// 文件路径由 `unified_env_path()` 解析；两者都拿不到就回退默认）。
-fn resolve_port(env_key: &str, default: u16, file_kv: &[(String, String)]) -> u16 {
-    if let Ok(v) = std::env::var(env_key) {
-        if let Ok(p) = v.parse() {
-            return p;
-        }
-    }
-    for (k, v) in file_kv {
-        if k == env_key {
-            if let Ok(p) = v.parse() {
-                return p;
-            }
-        }
-    }
-    default
-}
-
-/// env 文件中端口相关 key 名常量。
-///
-/// 账户 / auth / rathole 等 key 已迁至各自归属模块
-/// （[`crate::account::keys`] 等），此处只保留端口。
-pub mod keys {
-    /// 系统监听端口。
-    pub const SYSTEM_PORT: &str = "OC_SERVE_SYSTEM_PORT";
-    /// opencode 服务端口。
-    pub const OPENCODE_PORT: &str = "OC_SERVE_OPENCODE_PORT";
 }
 
 /// rathole 内网穿透的客户端配置（设置面板热更新）。
@@ -337,52 +321,112 @@ impl RatholeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::{RemoteDevice, RemoteSbConfig};
 
-    /// 端口解析的纯函数测试 —— 不依赖进程 env、不写文件、不污染测试间状态。
-    #[test]
-    fn resolve_port_falls_through_to_default() {
-        // env_key 不在 file_kv 里,也没有进程 env → 默认。
-        let got = resolve_port("NONEXISTENT_PORT", 1234, &[]);
-        assert_eq!(got, 1234);
+    fn mk_info(devices: Vec<RemoteDevice>) -> RemoteUserInfo {
+        RemoteUserInfo {
+            id: "u-1".to_string(),
+            name: "alice".to_string(),
+            key: "k".to_string(),
+            cloud_ip: None,
+            last_used_at: None,
+            devices,
+            sb: RemoteSbConfig {
+                base_url: "https://md".to_string(),
+                username: "u".to_string(),
+                password: "p".to_string(),
+            },
+            created_at: None,
+            updated_at: None,
+        }
     }
 
-    #[test]
-    fn resolve_port_picks_value_from_file_kv() {
-        // 即使 env_key 未在进程 env 中设置,只要 file_kv 里有就生效。
-        let kv = vec![(keys::OPENCODE_PORT.to_string(), "18800".to_string())];
-        // 注:此测试可能在被测进程已设 OC_SERVE_OPENCODE_PORT 时失败 —— 若
-        // CI 上未注入该 env 变量,下面才是默认;反之会因进程 env 优先级
-        // 更高而跳过此处断言。单独跑 cargo test 时通常不会设置。
-        if std::env::var(keys::OPENCODE_PORT).is_err() {
-            let got = resolve_port(keys::OPENCODE_PORT, DEFAULT_OPENCODE_PORT, &kv);
-            assert_eq!(got, 18800);
+    fn mk_dev(name: &str, port: u16, oc_port: Option<u16>) -> RemoteDevice {
+        RemoteDevice {
+            name: name.to_string(),
+            port,
+            oc_port,
+            bound: false,
+            pctype: "macos".to_string(),
+            device_name: None,
+            desc: None,
         }
     }
 
     #[test]
-    fn resolve_port_ignores_invalid_value_and_falls_back() {
-        // 解析失败时返回默认值,而不是 0。
-        let kv = vec![(keys::SYSTEM_PORT.to_string(), "not-a-number".to_string())];
-        if std::env::var(keys::SYSTEM_PORT).is_err() {
-            let got = resolve_port(keys::SYSTEM_PORT, DEFAULT_SYSTEM_PORT, &kv);
-            assert_eq!(got, DEFAULT_SYSTEM_PORT);
-        }
+    fn ports_from_bound_device_port_and_oc_port() {
+        let info = mk_info(vec![
+            mk_dev("other-pc", 18000, Some(19000)),
+            mk_dev("my-pc", 20001, Some(20002)),
+        ]);
+        let got = ports_from_user_info(&info, "my-pc");
+        assert_eq!(
+            got,
+            RuntimePorts {
+                system_port: 20001,
+                opencode_port: 20002,
+                device_found: true,
+            }
+        );
     }
 
-    /// PortsConfig 默认值锁:防止端口常量被意外改动 —— 系统端口硬锁定 9465,
-    /// opencode 端口 9464,二者必须不同(否则 `submit_settings` 拒绝)。
+    #[test]
+    fn ports_fall_back_when_device_not_bound() {
+        let info = mk_info(vec![mk_dev("my-pc", 20001, Some(20002))]);
+        // DEVICE_NAME 为空（未绑定）。
+        let got = ports_from_user_info(&info, "");
+        assert_eq!(got, RuntimePorts::default());
+        assert!(!got.device_found);
+    }
+
+    #[test]
+    fn ports_fall_back_when_bound_device_missing_from_list() {
+        let info = mk_info(vec![mk_dev("my-pc", 20001, Some(20002))]);
+        let got = ports_from_user_info(&info, "ghost-pc");
+        assert_eq!(got, RuntimePorts::default());
+        assert!(!got.device_found);
+    }
+
+    #[test]
+    fn ports_fall_back_when_oc_port_missing_or_zero() {
+        let info = mk_info(vec![
+            mk_dev("no-oc", 21001, None),
+            mk_dev("zero-oc", 21002, Some(0)),
+        ]);
+        assert_eq!(
+            ports_from_user_info(&info, "no-oc").opencode_port,
+            DEFAULT_OPENCODE_PORT
+        );
+        assert_eq!(
+            ports_from_user_info(&info, "zero-oc").opencode_port,
+            DEFAULT_OPENCODE_PORT
+        );
+        // 系统端口仍取设备下发值。
+        assert_eq!(ports_from_user_info(&info, "no-oc").system_port, 21001);
+    }
+
+    #[test]
+    fn ports_fall_back_when_port_zero() {
+        let info = mk_info(vec![mk_dev("zero-port", 0, Some(7777))]);
+        let got = ports_from_user_info(&info, "zero-port");
+        assert_eq!(got.system_port, DEFAULT_SYSTEM_PORT);
+        assert_eq!(got.opencode_port, 7777);
+        assert!(got.device_found);
+    }
+
+    /// 默认值锁：防止端口常量被意外改动（回退场景的稳定契约）。
     #[test]
     fn ports_config_defaults_lock_invariants() {
         assert_eq!(DEFAULT_SYSTEM_PORT, 9465);
         assert_eq!(DEFAULT_OPENCODE_PORT, 9464);
         assert_ne!(DEFAULT_SYSTEM_PORT, DEFAULT_OPENCODE_PORT);
-    }
-
-    /// 端口 key 名称稳定性 —— 这些 env key 已被 dotenvy 与外部脚本依赖,
-    /// 改名会破坏现有用户的 .env 文件。
-    #[test]
-    fn port_keys_are_stable() {
-        assert_eq!(keys::SYSTEM_PORT, "OC_SERVE_SYSTEM_PORT");
-        assert_eq!(keys::OPENCODE_PORT, "OC_SERVE_OPENCODE_PORT");
+        assert_eq!(
+            RuntimePorts::default(),
+            RuntimePorts {
+                system_port: DEFAULT_SYSTEM_PORT,
+                opencode_port: DEFAULT_OPENCODE_PORT,
+                device_found: false,
+            }
+        );
     }
 }

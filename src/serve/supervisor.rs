@@ -12,6 +12,54 @@ use tokio::sync::{Mutex, broadcast};
 use crate::error::AppError;
 use crate::serve::process::{ChildProcess, ProcessSpec, spawn_traced};
 
+/// `opencode serve` 的 HTTP Basic 鉴权凭据（账户 id + 密钥）。
+///
+/// ## 机制（依据 opencode 官方文档 + 源码核实）
+///
+/// `opencode serve` **没有** `--usr` / `--username` / `--password` 之类的
+/// CLI 鉴权标志；鉴权完全由子进程环境变量控制：
+///
+/// - `OPENCODE_SERVER_PASSWORD` —— 非空即启用 HTTP Basic Auth（hono
+///   `basic-auth` 中间件）；
+/// - `OPENCODE_SERVER_USERNAME` —— 用户名，缺省为 `opencode`。
+///
+/// 来源：
+/// - <https://opencode.ai/docs/server/#authentication>
+/// - <https://github.com/sst/opencode/blob/dev/packages/opencode/src/server/middleware.ts>
+///   （`AuthMiddleware` 直接读取 `Flag.OPENCODE_SERVER_PASSWORD` /
+///   `Flag.OPENCODE_SERVER_USERNAME`，即 `process.env` 透传）
+///
+/// ## 纯数字账户 id 可用性
+///
+/// 用户名从环境变量读取后**不经任何格式校验**直接传给 basic-auth 比较，
+/// Basic Auth 本身只要求 `username:password` 的 base64 编码——因此
+/// **纯数字账户 id（如 `123456`）完全可用**。
+///
+/// ## 与父进程 env 的关系
+///
+/// 本进程自身也可能持有 `OPENCODE_SERVER_*`（统一 env 文件经 dotenvy 注入，
+/// 用于本应用 axum 服务器的鉴权）。[`ProcessSpec::env`] 通过
+/// `Command::env` 显式设置的键会**覆盖**子进程继承到的同名键，因此把
+/// 账户凭据注入到 serve 子进程后不会与本应用自身的鉴权串味。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeAuth {
+    /// Basic Auth 用户名（设置中的账户 id；纯数字亦可）。
+    pub username: String,
+    /// Basic Auth 密码（设置中的账户密钥）。
+    pub password: String,
+}
+
+impl ServeAuth {
+    /// 用账户 id + 密钥构造鉴权凭据。
+    #[must_use]
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+}
+
 /// Snapshot of supervisor state, suitable for the TUI status panel.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ServeStatus {
@@ -153,12 +201,17 @@ impl ServeSupervisor {
         all_killed
     }
 
-    /// Launch `opencode serve --port <port>`. Returns the PID.
+    /// Launch `opencode serve --port <port>`, optionally with HTTP Basic
+    /// auth injected via child-process env vars (see [`ServeAuth`]).
     ///
     /// # Errors
     /// Returns [`AppError::Conflict`] if the port is busy or
     /// [`AppError::Io`] if the binary cannot be spawned.
-    pub async fn launch_opencode(&self, port: u16) -> Result<u32, AppError> {
+    pub async fn launch_opencode(
+        &self,
+        port: u16,
+        auth: Option<&ServeAuth>,
+    ) -> Result<u32, AppError> {
         // mutex guard: rathole 在跑时拒绝启动单体（云服务依赖单体,
         // 反向启单体无意义,且会破坏既有 rathole 监听）
         if self.status.lock().await.rathole_pid.is_some() {
@@ -170,7 +223,7 @@ impl ServeSupervisor {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
-        let spec = build_opencode_serve_spec(port, cwd);
+        let spec = build_opencode_serve_spec(port, cwd, auth);
         let child = spawn_traced(spec).await?;
         let pid = child.pid;
         self.children.lock().await.insert("opencode".to_string(), child);
@@ -231,12 +284,15 @@ impl ServeSupervisor {
     /// - single not running -> launch single first; if that fails, the whole combo fails
     /// - single already running -> skip single launch, just add rathole
     ///
+    /// `auth` 透传给单体 opencode serve（`Some` 时注入 Basic Auth 环境变量）。
+    ///
     /// Returns `(opencode_pid, rathole_pid)`.
     pub async fn launch_cloud_service(
         &self,
         port: u16,
         bin: &str,
         config: &str,
+        auth: Option<&ServeAuth>,
     ) -> Result<(u32, u32), AppError> {
         // 先决条件:云服务已启则拒绝（与 mutex 表保持一致）
         if self.status.lock().await.rathole_pid.is_some() {
@@ -248,7 +304,7 @@ impl ServeSupervisor {
         let oc_pid = if self.status.lock().await.opencode_pid.is_some() {
             self.status.lock().await.opencode_pid.unwrap()
         } else {
-            self.launch_opencode(port).await.map_err(|e| {
+            self.launch_opencode(port, auth).await.map_err(|e| {
                 AppError::Conflict(format!(
                     "云服务启动失败:单体 OpenCode 未启动:{e}"
                 ))
@@ -332,6 +388,11 @@ impl Default for ServeSupervisor {
 
 /// 构造 `opencode serve --port <port>` 的 [`ProcessSpec`]（跨平台统一）。
 ///
+/// `auth` 为 `Some` 时注入 `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`
+/// 两个子进程环境变量 —— 这是 opencode serve 启用 HTTP Basic Auth 的**唯一**
+/// 官方机制（无 CLI 标志；见 [`ServeAuth`] 文档）。`Command::env` 显式设置的键
+/// 覆盖子进程继承到的同名键，因此父进程 env 中的旧值不会泄漏进 serve。
+///
 /// 解析路径的优先级：
 /// 1. 环境变量 `OPENCODE_BIN`（绝对路径，跳过任何解析）。
 /// 2. `crate::upgrade::resolve_command("opencode")`：Windows 上调用
@@ -354,17 +415,23 @@ impl Default for ServeSupervisor {
 /// 若用户希望走 PowerShell 包装以获得最严格的 shell quoting 兼容，可显式
 /// 设置 `OPENCODE_BIN` 指向 `powershell.exe` 并自己组织参数 —— 本函数不
 /// 再提供 PowerShell 默认行为。
-fn build_opencode_serve_spec(port: u16, cwd: String) -> ProcessSpec {
+fn build_opencode_serve_spec(port: u16, cwd: String, auth: Option<&ServeAuth>) -> ProcessSpec {
     let bin = std::env::var("OPENCODE_BIN")
         .ok()
         .map(PathBuf::from)
         .or_else(|| crate::upgrade::resolve_command("opencode").ok())
         .unwrap_or_else(|| PathBuf::from("opencode"));
-    ProcessSpec::new(bin.to_string_lossy().into_owned())
+    let mut spec = ProcessSpec::new(bin.to_string_lossy().into_owned())
         .arg("serve")
         .arg("--port")
         .arg(port.to_string())
-        .cwd(cwd)
+        .cwd(cwd);
+    if let Some(auth) = auth {
+        spec = spec
+            .env("OPENCODE_SERVER_USERNAME", auth.username.clone())
+            .env("OPENCODE_SERVER_PASSWORD", auth.password.clone());
+    }
+    spec
 }
 
 async fn wait_alive(
@@ -627,7 +694,7 @@ mod tests {
         s.rathole_pid = Some(9999);
         sup.set_status_for_test(s).await;
 
-        let result = sup.launch_opencode(9464).await;
+        let result = sup.launch_opencode(9464, None).await;
         assert!(matches!(result, Err(AppError::Conflict(_))));
     }
 
@@ -649,7 +716,7 @@ mod tests {
         s.rathole_pid = Some(7777);
         sup.set_status_for_test(s).await;
 
-        let result = sup.launch_cloud_service(9464, "nonexistent-bin", "nonexistent.toml").await;
+        let result = sup.launch_cloud_service(9464, "nonexistent-bin", "nonexistent.toml", None).await;
         assert!(matches!(result, Err(AppError::Conflict(_))));
     }
 
@@ -664,7 +731,7 @@ mod tests {
         s.opencode_pid = Some(5555);
         sup.set_status_for_test(s).await;
 
-        let result = sup.launch_cloud_service(9464, "nonexistent-bin", "nonexistent.toml").await;
+        let result = sup.launch_cloud_service(9464, "nonexistent-bin", "nonexistent.toml", None).await;
         // combo wrapper maps rathole sub-failure to Conflict with
         // "云服务启动失败:单体已启" prefix. So we DO get Conflict —
         // but the message must indicate the rathole sub-failure, not the
@@ -682,5 +749,34 @@ mod tests {
             }
             other => panic!("expected Conflict with rathole sub-failure msg, got: {other:?}"),
         }
+    }
+
+    // --- build_opencode_serve_spec 的鉴权环境变量注入 ---
+
+    fn spec_env(spec: &ProcessSpec, key: &str) -> Option<&str> {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn build_opencode_serve_spec_injects_auth_env_vars() {
+        let auth = ServeAuth::new("123456", "k789");
+        let spec = build_opencode_serve_spec(9464, ".".to_string(), Some(&auth));
+        // 账户 id 为纯数字时也必须原样注入（opencode serve 对用户名无格式校验）。
+        assert_eq!(spec_env(&spec, "OPENCODE_SERVER_USERNAME"), Some("123456"));
+        assert_eq!(spec_env(&spec, "OPENCODE_SERVER_PASSWORD"), Some("k789"));
+        // 基本参数不受影响。
+        assert_eq!(spec.args, vec!["serve", "--port", "9464"]);
+    }
+
+    #[test]
+    fn build_opencode_serve_spec_without_auth_has_no_env_vars() {
+        // auth=None（账户未配置）时不注入 —— serve 行为退回继承父进程 env，
+        // 与旧版本完全一致。
+        let spec = build_opencode_serve_spec(9464, ".".to_string(), None);
+        assert!(spec_env(&spec, "OPENCODE_SERVER_USERNAME").is_none());
+        assert!(spec_env(&spec, "OPENCODE_SERVER_PASSWORD").is_none());
     }
 }

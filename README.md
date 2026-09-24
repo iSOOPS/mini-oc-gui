@@ -86,6 +86,20 @@ DEFAULT_PORT=9464 ./target/release/mini-oc-gui-serve
 
 If nothing is found, the program prints a clear error pointing to the expected file path.
 
+### `opencode serve` child auth (account credentials)
+
+`opencode serve` has **no CLI auth flag**; per the official docs
+(<https://opencode.ai/docs/server/#authentication>) it enables HTTP Basic Auth
+purely via the child-process env vars `OPENCODE_SERVER_USERNAME` /
+`OPENCODE_SERVER_PASSWORD` (username defaults to `opencode`; **pure-numeric
+account ids are valid** — the value is passed through without format
+validation). When launching the standalone serve or the cloud service
+(serve + rathole), mini-oc-gui injects the account id + account key from the
+settings panel as these two env vars, so both local attach
+(`OpencodeClient` / `opencode attach -u/-p`) and the cloud tunnel see the same
+credentials. Stopping the cloud service tears down **both** rathole and
+`opencode serve`.
+
 ## HTTP API
 
 | Method | Path                       | Description                          | Auth |
@@ -100,19 +114,40 @@ If nothing is found, the program prints a clear error pointing to the expected f
 
 | Env Var                | Default                       | Description |
 |------------------------|-------------------------------|-------------|
-| `DEFAULT_PORT`         | `9464`                        | opencode serve port |
-| `ATTACH_URL`           | `http://127.0.0.1:9464`       | URL used by `opencode attach` |
+| `DEFAULT_PORT`         | `9464`                        | (legacy, unused) |
+| `ATTACH_URL`           | `http://127.0.0.1:<oc-port>`  | URL used by `opencode attach` |
 | `OC_DEFAULT_DIR`       | `$HOME/.config/opencode`      | Default fallback path |
-| `OPENCODE_SERVER_USERNAME` | `opencode`                 | HTTP Basic username |
-| `OPENCODE_SERVER_PASSWORD` | (auto-generated, in `.oc-serve-auth.env`) | HTTP Basic password |
-| `SB_URL`               | `https://md.isoops.com`       | SilverBullet remote URL |
-| `SB_USER` / `SB_PASSWORD` | —                          | SilverBullet credentials |
+| `SB_URL`               | `https://md.isoops.com`       | (legacy fallback) SilverBullet remote URL |
 | `OC_CONFIG_DIR`        | `$HOME/.config/opencode`      | opencode config dir |
 | `OC_CACHE_DIR`         | `$HOME/.cache/opencode`       | opencode cache dir |
-| `RATHOLE_BIN`          | `rathole/bin/macos/rathole` (macOS) / `rathole/bin/windows/rathole.exe` (Windows) | rathole binary path (platform-aware) |
-| `RATHOLE_CONFIG`       | `rathole/settings/global.toml` | rathole tunnel config（由设置面板生成） |
+| `RATHOLE_BIN`          | `rathole/bin/<os>-<arch>/rathole[.exe]` | rathole binary path (platform-aware) |
+| `RATHOLE_CONFIG`       | `rathole/settings/global.toml` | rathole tunnel config |
 | `OC_OMO_SKIP_VERIFY`   | `0`                           | Skip omo upgrade verification |
 | `RUST_LOG`             | `info`                        | tracing-subscriber filter |
+
+### Ports & persisted data (v3)
+
+Ports are **no longer configured locally** — the settings panel has no port
+section. On startup (and after saving settings / rebinding a device) the app
+calls `/api/user/info` and resolves the ports from the **currently bound
+device** entry in the device list:
+
+- `devices[].port` → system port (this app's axum listener; fixed at startup,
+  changes prompt a restart)
+- `devices[].oc-port` → `opencode serve` port (hot-applied: subsequent
+  serve / cloud-service launches use the new value)
+
+Fallbacks: if the user info cannot be fetched (offline / invalid key) the
+defaults `9465` / `9464` apply and binding is assumed from the local
+`DEVICE_NAME`; if the fetch succeeds but no device is bound, launching serve /
+the cloud service is refused until a device is bound. A bound device missing
+`oc-port` (old server data) falls back to `9464` with a warning.
+
+The unified `.env` file persists **only** the `# --- account login ---`
+section (`ACCOUNT_ID` / `ACCOUNT_KEY` / `REMOTE_PATH` / `DEVICE_NAME`).
+Everything else (HTTP Basic credentials, ports, rathole keys, sb keys) is
+built in memory from `/api/user/info` on every start; stale legacy lines are
+pruned from the file at startup.
 
 ## Design notes
 
@@ -131,32 +166,30 @@ The MOT mark is generated at build time from [`assets/icon.svg`](assets/icon.svg
 - `target/<profile>/assets/icon.ico` — Windows multi-resolution, embedded into `.exe` via `winresource`
 - `target/<profile>/assets/icon.icns` — macOS multi-resolution
 
-### macOS `.app` bundle integration
+The icon bytes are additionally **embedded into the executable** (`include_bytes!`
+via `$OUT_DIR`, see `src/icons.rs`): on every startup the binary re-extracts any
+missing icon file to `<exe_dir>/assets/`. Shipping the bare executable alone is
+therefore enough — the icon files reappear next to it on first run (existing
+files are never overwritten, so a custom icon survives upgrades).
 
-`cargo build --release` produces a bare Mach-O binary; to make Finder / Dock
-honor the icon, wrap it in a minimal `.app`:
+### macOS `.app` bundle (auto-generated)
+
+`cargo build --release` also produces `target/release/MiniOC.app` — Finder /
+Dock honor its icon out of the box. `Contents/MacOS/mini-oc-gui-serve` is a
+relative symlink to the sibling artifact (cargo links the binary *after*
+`build.rs` runs, so a real copy is impossible at that point); rebuilding the
+executable automatically refreshes the bundle. To distribute the `.app`,
+resolve the link into a real copy:
 
 ```sh
-cargo build --release
-mkdir -p MiniOC.app/Contents/{MacOS,Resources}
-cp target/release/mini-oc-gui-serve MiniOC.app/Contents/MacOS/
-cp target/release/assets/icon.icns MiniOC.app/Contents/Resources/
-
-cat > MiniOC.app/Contents/Info.plist <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key><string>mini-oc-gui-serve</string>
-  <key>CFBundleIconFile</key><string>icon</string>
-  <key>CFBundleIdentifier</key><string>local.mini-oc-gui-serve</string>
-  <key>CFBundleName</key><string>mini-oc-gui-serve</string>
-</dict>
-</plist>
-EOF
+cp -L target/release/MiniOC.app/Contents/MacOS/mini-oc-gui-serve /tmp/exe-copy \
+  && cp /tmp/exe-copy target/release/MiniOC.app/Contents/MacOS/mini-oc-gui-serve
+# or archive preserving links: ditto -c -k --keepParent target/release/MiniOC.app MiniOC.zip
 ```
 
-To change the icon, edit `assets/icon.svg` and rebuild — all platform artifacts regenerate from this single source.
+To change the icon, edit `assets/icon.svg` and rebuild — all platform artifacts
+regenerate from this single source, and a content hash forces rustc to
+re-embed the new bytes into the binary.
 
 ## License
 

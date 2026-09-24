@@ -6,10 +6,18 @@
 //!   by `/api/user/info` (see [`RemotePaths::from_sb_config`]) and `pcname` is
 //!   the local OS username.
 //! - **New** (`path_list_new_format`):
-//!   `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`, where
+//!   `serv/opencode/{user_id}/{pctype}/{device_name}/path-list.md`, where
 //!   `user_id` is `info.id` from `/api/user/info` and `device_name` is the
 //!   bound device name (`DEVICE_NAME`). The new layout is preferred whenever
 //!   `user_id` is set (see [`RemotePaths::with_user_info`]).
+//!
+//! **历史布局变更（suffix 修复）**：新格式曾一度使用无 `.md` 后缀的
+//! `path-list` 路径。文件在远端磁盘上真实存在且 `.fs` API 可读写，但
+//! SilverBullet 只把 `.md` 文件索引为 page，导致无后缀文件在任何
+//! 服务商界面不可见（被误判为"未存储"）。现已恢复 `.md` 后缀；旧
+//! 无后缀路径仅保留构造器 [`RemotePaths::path_list_new_format_nosuffix`]
+//! 供 [`crate::storage::sync::PathListStore::migrate_v3_suffix`] 一次性
+//! 迁移读取，勿用于写入。
 
 use whoami::username;
 
@@ -99,9 +107,26 @@ impl RemotePaths {
     }
 
     /// New-format path (no leading slash):
-    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`.
+    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list.md`.
+    ///
+    /// 必须带 `.md` 后缀 —— SilverBullet 只把 `.md` 文件索引为 page，
+    /// 无后缀文件虽可通过 `.fs` API 读写，但在服务商界面不可见。
     #[must_use]
     pub fn path_list_new_format(&self) -> String {
+        format!(
+            "serv/opencode/{}/{}/{}/path-list.md",
+            self.user_id, self.pctype, self.device_name
+        )
+    }
+
+    /// v3 过渡期的旧布局（无 `.md` 后缀）：
+    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`。
+    ///
+    /// 仅供 [`crate::storage::sync::PathListStore::migrate_v3_suffix`]
+    /// 读取历史数据，**勿用于写入**（写无后缀路径的文件在服务商界面
+    /// 不可见）。
+    #[must_use]
+    pub fn path_list_new_format_nosuffix(&self) -> String {
         format!(
             "serv/opencode/{}/{}/{}/path-list",
             self.user_id, self.pctype, self.device_name
@@ -188,7 +213,22 @@ mod tests {
         let rp = RemotePaths::with_user_info("u-123", "my-dev-pc");
         assert_eq!(
             rp.path_list_new_format(),
+            format!("serv/opencode/u-123/{}/my-dev-pc/path-list.md", pctype())
+        );
+    }
+
+    #[test]
+    fn nosuffix_variant_is_migration_only_layout() {
+        let rp = RemotePaths::with_user_info("u-123", "my-dev-pc");
+        let nosuffix = rp.path_list_new_format_nosuffix();
+        assert_eq!(
+            nosuffix,
             format!("serv/opencode/u-123/{}/my-dev-pc/path-list", pctype())
+        );
+        assert_eq!(
+            format!("{nosuffix}.md"),
+            rp.path_list_new_format(),
+            "nosuffix + \".md\" 必须与新格式路径一致（迁移搬运的源/目标对齐）"
         );
     }
 
@@ -206,7 +246,6 @@ mod tests {
         let rp = RemotePaths::with_user_info("u-1", "dev-a");
         assert_eq!(rp.path_list(), rp.path_list_new_format());
         assert!(rp.path_list_with_slash().starts_with('/'));
-        assert!(rp.path_list().ends_with("/path-list"));
-        assert!(!rp.path_list().contains(".md"));
+        assert!(rp.path_list().ends_with("/path-list.md"));
     }
 }

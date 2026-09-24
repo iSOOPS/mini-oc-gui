@@ -9,7 +9,7 @@ use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, ListState, Padding, Paragraph, Wrap},
@@ -17,17 +17,17 @@ use ratatui::{
 
 use crate::account::{
     AccountConfig, DevicePickerTrigger, DevicePickerTriggerSlot, RemoteUserInfo,
-    DEFAULT_REMOTE_PATH, bind_device, fetch_user_info, upsert_env_keys,
+    DEFAULT_REMOTE_PATH, bind_device, fetch_user_info,
 };
 #[cfg(test)]
 use crate::account::RemoteDevice;
 use crate::attach::{AttachedSession, OcSession, OpencodeClient, choose_folder, kill_process};
 use crate::auth::AuthConfig;
-use crate::config::PortsConfig;
+use crate::config::RuntimePorts;
 use crate::domain::{PathEntry, PathValidator};
 use crate::error::AppError;
 use crate::serve::{
-    ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
+    ServeAuth, ServeStatus, ServeSupervisor, rathole_default_bin, rathole_default_config,
 };
 use crate::storage::PathListStore;
 use crate::storage::remote::RemoteClient;
@@ -239,18 +239,13 @@ fn render_account_key_line(input: &str) -> String {
 
 /// 把粘贴文本按字段规则追加到对应 buffer,返回追加后的新 buffer。
 ///
-/// 设计意图:**抽成纯函数**以便单测覆盖所有可编辑字段 + 端口过滤 +
-/// 5 位上限。TuiApp 的可编辑 buffer 都是 String,字段路由通过
-/// `InputMode` 决定,函数不持有任何 self 之外的引用,易测易推。
-///
-/// 注:系统端口(`SettingsHttpPort`)不在可编辑字段中,该分支 no-op。
+/// 设计意图:**抽成纯函数**以便单测覆盖所有可编辑字段。TuiApp 的可编辑
+/// buffer 都是 String,字段路由通过 `InputMode` 决定,函数不持有任何
+/// self 之外的引用,易测易推。
 ///
 /// 行为细节:
-/// - 普通文本字段(账户ID / 密钥 / 远程路径):整段追加,保留所有字符
+/// - 文本字段(账户ID / 密钥 / 远程路径):整段追加,保留所有字符
 ///   (含中文 / 空格 / 标点)。
-/// - OpenCode 端口(`SettingsServePort`):只保留 ASCII 数字,且总长度
-///   ≤ 5。`SettingsHttpPort` 系统端口已锁定为 9465,该分支 no-op
-///   (见上方 match arm 注释)。
 /// - `Menu` 模式:粘贴不生效(防御性,正常路径不会传进来)。
 fn apply_paste_to_buffer(field: InputMode, current: &str, text: &str) -> String {
     let mut buf = current.to_string();
@@ -258,18 +253,6 @@ fn apply_paste_to_buffer(field: InputMode, current: &str, text: &str) -> String 
         return buf;
     }
     match field {
-        InputMode::SettingsHttpPort => {
-            // 硬锁定:系统端口固定为 9465。即便上游未做 early return,
-            // 此分支也不修改 buf,保持防御纵深。
-        }
-        InputMode::SettingsServePort => {
-            for c in text.chars().filter(|c| c.is_ascii_digit()) {
-                if buf.len() >= 5 {
-                    break;
-                }
-                buf.push(c);
-            }
-        }
         InputMode::SettingsAccountId
         | InputMode::SettingsAccountKey
         | InputMode::SettingsRemotePath => buf.push_str(text),
@@ -303,10 +286,6 @@ const SYS_PICKER_DESC: &str = "打开系统文件管理器选择项目目录";
 enum InputMode {
     /// 主菜单导航。
     Menu,
-    /// 设置：系统端口（锁定为 9465，不可编辑，仅用于"弹框已打开"判定）。
-    SettingsHttpPort,
-    /// 设置：OpenCode 服务端口。
-    SettingsServePort,
     /// 设置：账户ID（`ACCOUNT_ID`）。
     SettingsAccountId,
     /// 设置：账户密钥（`ACCOUNT_KEY`）。
@@ -316,13 +295,11 @@ enum InputMode {
 }
 
 impl InputMode {
-    /// 是否为设置面板的某个字段（账户 / 端口）。
+    /// 是否为设置面板的某个字段。
     fn is_settings_field(self) -> bool {
         matches!(
             self,
-            InputMode::SettingsHttpPort
-                | InputMode::SettingsServePort
-                | InputMode::SettingsAccountId
+            InputMode::SettingsAccountId
                 | InputMode::SettingsAccountKey
                 | InputMode::SettingsRemotePath
         )
@@ -473,16 +450,18 @@ enum ClickTarget {
 }
 
 /// 设置弹框内可编辑字段的有序列表（决定 ↑/↓ / Tab / 点击的循环顺序）。
-const SETTINGS_FIELDS: [InputMode; 4] = [
+///
+/// 端口不再本地设置 —— 系统端口 / opencode 端口由设备清单下发
+/// （见 [`crate::config::ports_from_user_info`]），设置面板只保留账户字段。
+const SETTINGS_FIELDS: [InputMode; 3] = [
     InputMode::SettingsAccountId,
     InputMode::SettingsAccountKey,
     InputMode::SettingsRemotePath,
-    InputMode::SettingsServePort,
 ];
 
 /// 字段值所在行 idx（`build_settings_lines` 布局内，0-based，不含上边框）。
 ///
-/// 布局（17 行）：
+/// 布局（10 行）：
 /// - 0:  "账户登录" 标题
 /// - 1:  账户ID 值         ← field 0
 /// - 2:  账户ID 说明
@@ -492,18 +471,11 @@ const SETTINGS_FIELDS: [InputMode; 4] = [
 /// - 6:  绑定设备 说明
 /// - 7:  远程路径 值       ← field 2
 /// - 8:  远程路径 说明
-/// - 9:  (空)
-/// - 10: "端口设置" 标题
-/// - 11: 系统端口 值（锁定 9465，只渲染不进本表）
-/// - 12: 系统端口 说明
-/// - 13: OpenCode 端口 值  ← field 3
-/// - 14: OpenCode 端口 说明
-/// - 15: (空)
-/// - 16: 帮助行
+/// - 9:  帮助行
 ///
 /// `settings_field_at_row` 与 `register_settings_click_regions` 共用本表，
 /// 避免多处 hardcode 漂移。
-const FIELD_LINE_IDX: [u16; 4] = [1, 3, 7, 13];
+const FIELD_LINE_IDX: [u16; 3] = [1, 3, 7];
 
 /// 可点击区域（每帧渲染时记录）。
 ///
@@ -553,6 +525,10 @@ struct DevicePickerState {
     /// 底部确认 / 取消按钮的当前选中态（左右键切换 / 鼠标 hover 切换）。
     /// 默认 Confirm（与确认按钮 Enter / 点击行为对齐）。
     button_focus: ConfirmChoice,
+    /// 本地 `account_config.device_name` 的快照 —— 用于在弹窗中标记
+    /// 「当前绑定」并实现 toggle off（再次选择同一条 = 解绑）。
+    /// 空字符串表示本地尚未绑定任何设备。
+    current_bound_device: String,
 }
 
 /// Main TUI application state.
@@ -624,12 +600,13 @@ pub struct TuiApp {
     confirm_choice: ConfirmChoice,
     /// 账户登录配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH，设置面板热更新）.
     account_config: Arc<RwLock<AccountConfig>>,
+    /// 运行期端口状态（设备清单下发：系统端口 + opencode 端口 + 绑定确认）。
+    ///
+    /// `main.rs` 启动时从 `/api/user/info` 解析并注入；设置面板保存 /
+    /// 重新绑定设备后热更新（opencode 端口即时生效，系统端口提示重启）。
+    runtime_ports: Arc<RwLock<RuntimePorts>>,
     /// 程序启动时刻（状态框展示运行时长）.
     program_started_at: chrono::DateTime<chrono::Local>,
-    /// 设置：系统端口输入缓冲。
-    system_port_input: String,
-    /// 设置：OpenCode 服务端口输入缓冲。
-    opencode_port_input: String,
     /// 设置：账户ID 输入缓冲。
     account_id_input: String,
     /// 设置：账户密钥输入缓冲（打开面板时留空，掩码回显已保存位数）。
@@ -689,12 +666,20 @@ pub struct TuiApp {
     /// `DevicePickerState`（避免再次网络请求）。后台 fetch 完成后会更新。
     /// `None` 表示从未成功拉取过 / 缓存已过期 —— 点击会触发重新拉取。
     cached_user_info: Option<RemoteUserInfo>,
+    /// 当前登录用户的显示名（`/api/user/info` 的 `name` 字段）。
+    ///
+    /// `Some(name)` 仅当字段 trim 后非空；启动拉取失败 / name 为空时为
+    /// `None`，Header 的用户名区显示「未登录」占位。设置面板保存成功
+    /// （重新拉取）后热更新。
+    user_display_name: Option<String>,
 }
 
 impl TuiApp {
     /// Construct a new TUI app bound to a supervisor + shared auth + log
-    /// buffer + store + account config + device-picker trigger slot.
+    /// buffer + store + account config + device-picker trigger slot +
+    /// runtime ports (device-assigned) + startup user display name.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         supervisor: ServeSupervisor,
         auth: Arc<RwLock<AuthConfig>>,
@@ -702,6 +687,8 @@ impl TuiApp {
         store: Arc<PathListStore>,
         account_config: Arc<RwLock<AccountConfig>>,
         device_picker_trigger: DevicePickerTriggerSlot,
+        runtime_ports: Arc<RwLock<RuntimePorts>>,
+        startup_user_name: Option<String>,
     ) -> Self {
         let mut main_state = ListState::default();
         main_state.select(Some(0));
@@ -726,6 +713,11 @@ impl TuiApp {
             )
         };
 
+        let oc_port = runtime_ports
+            .read()
+            .map(|p| p.opencode_port)
+            .unwrap_or(crate::config::DEFAULT_OPENCODE_PORT);
+
         Self {
             supervisor,
             auth,
@@ -742,7 +734,7 @@ impl TuiApp {
             sub_page: None,
             attached_sessions: Arc::new(Mutex::new(Vec::new())),
             attach_url: std::env::var("ATTACH_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:9464".to_string()),
+                .unwrap_or_else(|_| format!("http://127.0.0.1:{oc_port}")),
             // username / password 不再由用户手填:submit_settings 从账户
             // 信息自动填充并写入 auth,这里从空开始。
             username_input: String::new(),
@@ -757,9 +749,8 @@ impl TuiApp {
             confirm: None,
             confirm_choice: ConfirmChoice::Confirm,
             account_config,
+            runtime_ports,
             program_started_at: chrono::Local::now(),
-            system_port_input: PortsConfig::load().system_port.to_string(),
-            opencode_port_input: PortsConfig::load().opencode_port.to_string(),
             account_id_input: String::new(),
             // 启动时若账户已配置,把已保存密钥长度作为「密钥」行回显占位
             // 记录下来,用户首次打开设置面板即可看到对应位数的 *
@@ -777,6 +768,18 @@ impl TuiApp {
             device_picker: None,
             device_picker_trigger,
             cached_user_info: None,
+            user_display_name: startup_user_name,
+        }
+    }
+
+    /// 根据 `RefreshReport` 字段推断 refresh 走了哪个分支(A/B/C/empty)。
+    /// 仅用于状态栏摘要。
+    fn refresh_branch_label(r: &crate::storage::RefreshReport) -> &'static str {
+        match (r.seeded_remote, r.from_remote > 0 && r.from_local > 0) {
+            (true, _) => "C(seed 远端)",
+            (_, true) => "B(merge)",
+            (false, false) if r.merged == 0 => "empty",
+            _ => "A(从远端 seed 本地)",
         }
     }
 
@@ -1062,7 +1065,16 @@ impl TuiApp {
                     ClickTarget::DevicePickerRow(i) => {
                         if let Some(p) = self.device_picker.as_mut() {
                             if i < p.user_info.devices.len() {
-                                p.selected = i;
+                                // 跨平台设备不可点击选中 —— 静默忽略，
+                                // 弹框仍打开，但 selected 不变。
+                                let dev = &p.user_info.devices[i];
+                                let local = crate::account::pctype();
+                                let compatible = dev.pctype.is_empty()
+                                    || dev.pctype == "unknown"
+                                    || dev.pctype == local;
+                                if compatible {
+                                    p.selected = i;
+                                }
                             }
                         }
                     }
@@ -1463,12 +1475,28 @@ impl TuiApp {
             device_count,
             trigger.force
         );
+        // 默认选中第一个平台兼容的设备（跨平台设备灰显不可选）；
+        // 没有兼容设备时回落到 0（用户按键无法移动，confirm 也会被拒）。
+        let local_pctype = crate::account::pctype();
+        let initial_selected = trigger
+            .user_info
+            .devices
+            .iter()
+            .position(|d| {
+                d.pctype.is_empty() || d.pctype == "unknown" || d.pctype == local_pctype
+            })
+            .unwrap_or(0);
         self.device_picker = Some(DevicePickerState {
             user_info: trigger.user_info,
             account_key: trigger.account_key,
             remote_path: trigger.remote_path,
-            selected: 0,
+            selected: initial_selected,
             button_focus: ConfirmChoice::Confirm,
+            current_bound_device: self
+                .account_config
+                .read()
+                .map(|a| a.device_name.clone())
+                .unwrap_or_default(),
         });
         *self.status_message.lock().unwrap() = if already_bound {
             "📱 请选择要绑定的设备（重新绑定）".to_string()
@@ -1483,14 +1511,51 @@ impl TuiApp {
         match event {
             InputEvent::Up | InputEvent::Char('k') => {
                 if let Some(p) = self.device_picker.as_mut() {
-                    p.selected = p.selected.saturating_sub(1);
+                    let local = crate::account::pctype();
+                    // 跨平台设备灰显不可选 —— ↑/k 反向跳过它们。
+                    let len = p.user_info.devices.len();
+                    if len == 0 {
+                        p.selected = 0;
+                    } else {
+                        let mut next = p.selected;
+                        for _ in 0..len {
+                            next = next.saturating_sub(1);
+                            let dev = &p.user_info.devices[next];
+                            let compatible = dev.pctype.is_empty()
+                                || dev.pctype == "unknown"
+                                || dev.pctype == local;
+                            if compatible {
+                                break;
+                            }
+                        }
+                        p.selected = next;
+                    }
                 }
             }
             InputEvent::Down | InputEvent::Char('j') => {
                 if let Some(p) = self.device_picker.as_mut() {
-                    let max = p.user_info.devices.len().saturating_sub(1);
-                    if p.selected < max {
-                        p.selected += 1;
+                    let local = crate::account::pctype();
+                    let len = p.user_info.devices.len();
+                    if len == 0 {
+                        p.selected = 0;
+                    } else {
+                        let max = len - 1;
+                        let mut next = p.selected;
+                        for _ in 0..len {
+                            if next < max {
+                                next += 1;
+                            } else {
+                                break;
+                            }
+                            let dev = &p.user_info.devices[next];
+                            let compatible = dev.pctype.is_empty()
+                                || dev.pctype == "unknown"
+                                || dev.pctype == local;
+                            if compatible {
+                                break;
+                            }
+                        }
+                        p.selected = next;
                     }
                 }
             }
@@ -1549,6 +1614,21 @@ impl TuiApp {
         // (`pcname()`)，与服务端注册清单的设备名对齐。
         let client_device_name = crate::storage::paths::pcname();
 
+        // 跨平台防拒守：弹窗渲染层会过滤跨平台设备（灰显不可选），
+        // 这里再做一次校验 —— 防止键盘/鼠标快速连按或竞态让 UI 校验
+        // 被绕过。unknown / 缺失 pctype 视为兼容（向后兼容老数据）。
+        let local_pctype = crate::account::pctype();
+        let target_pctype = dev.pctype.as_str();
+        let target_compatible =
+            target_pctype.is_empty() || target_pctype == "unknown" || target_pctype == local_pctype;
+        if !target_compatible {
+            *self.status_message.lock().unwrap() = format!(
+                "⚠️ {target_device} 是 {target_pctype} 设备，本机是 {local_pctype}，跨平台不可绑定"
+            );
+            self.device_picker = Some(picker);
+            return;
+        }
+
         // 读取本地当前绑定的设备名 —— 若与目标不同，需先解绑原设备
         let previous_device_name = self
             .account_config
@@ -1558,8 +1638,33 @@ impl TuiApp {
             .clone();
         let need_unbind_first =
             !previous_device_name.is_empty() && previous_device_name != target_device;
+        // 选择与本地当前绑定相同的设备 → 视为 toggle off（取消绑定）。
+        let is_toggle_off =
+            !previous_device_name.is_empty() && previous_device_name == target_device;
 
+        // 解绑原设备时同样校验：若 `previous_device_name` 在服务端
+        // 清单中能查到，且其 pctype 与本机不一致，也拒绝（不允许跨平台
+        // 借操作 —— "mac 帮 win 解绑" 会污染服务端绑定状态）。
+        // 若原设备已不在清单（404 会跳过解绑），这里不阻断。
         if need_unbind_first {
+            if let Some(prev_dev) = picker
+                .user_info
+                .devices
+                .iter()
+                .find(|d| d.name == previous_device_name)
+            {
+                let prev_pctype = prev_dev.pctype.as_str();
+                let prev_compatible = prev_pctype.is_empty()
+                    || prev_pctype == "unknown"
+                    || prev_pctype == local_pctype;
+                if !prev_compatible {
+                    *self.status_message.lock().unwrap() = format!(
+                        "⚠️ 本地记录的原设备 {previous_device_name} 是 {prev_pctype} 设备，与本机 {local_pctype} 跨平台，无法解绑"
+                    );
+                    self.device_picker = Some(picker);
+                    return;
+                }
+            }
             // 先解绑原设备
             *self.status_message.lock().unwrap() = format!(
                 "⏳ 正在解绑原设备 {previous_device_name}…"
@@ -1610,9 +1715,14 @@ impl TuiApp {
 
         // 绑定目标设备（bound=true）。若目标设备已绑（dev.bound=true 且），
         // 等价于保持绑定 —— 仍是 true。
-        *self.status_message.lock().unwrap() = format!(
-            "⏳ 正在绑定设备 {target_device}…"
-        );
+        // toggle off：再次选择本地已绑定的同一条设备 → 走解绑分支（bound=false），
+        // 成功后清空本地 device_name。
+        let want_bind = !is_toggle_off;
+        *self.status_message.lock().unwrap() = if want_bind {
+            format!("⏳ 正在绑定设备 {target_device}…")
+        } else {
+            format!("⏳ 正在解绑设备 {target_device}…")
+        };
         match bind_device(
             &picker.remote_path,
             &picker.account_key,
@@ -1620,7 +1730,7 @@ impl TuiApp {
             &target_device,
             &client_device_name,
             crate::account::pctype(),
-            true,
+            want_bind,
         )
         .await
         {
@@ -1630,19 +1740,60 @@ impl TuiApp {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                cfg.device_name = target_device.clone();
+                if want_bind {
+                    cfg.device_name = target_device.clone();
+                } else {
+                    cfg.device_name.clear();
+                }
                 let write_result = cfg.write_env_file(&crate::config::unified_env_path());
                 *self.account_config.write().unwrap_or_else(|e| e.into_inner()) = cfg;
-                // 用绑定后的设备名重建远端客户端，让后续 path-list
+                // 端口随绑定状态热更新：绑定 → 新设备的 port / oc-port
+                // （opencode 端口即时生效；系统端口若变化，重启后生效）；
+                // 解绑 → 回退默认端口且禁止启动 serve。
+                {
+                    let mut p = self
+                        .runtime_ports
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let fresh = if want_bind {
+                        crate::config::ports_from_user_info(
+                            &picker.user_info,
+                            &target_device,
+                        )
+                    } else {
+                        crate::config::RuntimePorts::default()
+                    };
+                    let system_changed = fresh.system_port != p.system_port;
+                    p.opencode_port = fresh.opencode_port;
+                    p.device_found = fresh.device_found;
+                    if system_changed {
+                        tracing::info!(
+                            "绑定设备下发新系统端口 {} → {}（重启生效）",
+                            p.system_port,
+                            fresh.system_port
+                        );
+                    }
+                }
+                // 用绑定后的设备段重建远端客户端，让后续 path-list
                 // 推送立即切换到新格式路径
-                // serv/opencode/{user_id}/{pctype}/{device_name}/path-list。
-                if picker.user_info.sb.is_configured() {
+                // serv/opencode/{user_id}/{pctype}/{device段}/path-list。
+                // 此处必须用**本地 pcname()**：本次绑定刚把它上报为设备
+                // 条目的 device-name；而 picker.user_info 是绑定前的快照，
+                // 其 device-name 可能还是旧机器的值。
+                if want_bind && picker.user_info.sb.is_configured() {
                     let remote = RemoteClient::from_user_info_v2(
                         &picker.user_info,
-                        target_device.clone(),
+                        crate::storage::paths::pcname(),
                         picker.user_info.sb.password.clone(),
                     );
                     self.store.with_remote(remote).await;
+                    // 新身份的 v3 后缀迁移放后台，不阻塞绑定反馈。
+                    let store = self.store.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = store.migrate_v3_suffix().await {
+                            tracing::warn!(target: "sync", "v3 suffix migration after device bind failed: {e}");
+                        }
+                    });
                 }
                 // 同步刷新 cached_user_info —— 让下次点击重新绑定时
                 // 显示的设备列表包含最新的 bound 状态（bug 4 修复）。
@@ -1652,31 +1803,39 @@ impl TuiApp {
                         d.bound = false;
                     }
                     if d.name == target_device {
-                        d.bound = true;
+                        d.bound = want_bind;
                     }
                 }
                 self.cached_user_info = Some(updated_info);
 
-                *self.status_message.lock().unwrap() = match write_result {
-                    Ok(()) => format!(
+                *self.status_message.lock().unwrap() = match (want_bind, write_result) {
+                    (true, Ok(())) => format!(
                         "✅ 设备绑定已切换到 {target_device}（DEVICE_NAME 已保存）"
                     ),
-                    Err(e) => format!(
+                    (true, Err(e)) => format!(
                         "⚠️ 已绑定设备 {target_device}，但写入配置失败：{e}"
+                    ),
+                    (false, Ok(())) => format!(
+                        "✅ 已解绑设备 {target_device}（DEVICE_NAME 已清空）"
+                    ),
+                    (false, Err(e)) => format!(
+                        "⚠️ 已解绑设备 {target_device}，但写入配置失败：{e}"
                     ),
                 };
             }
             Ok(_) => {
                 // 服务端 2xx 但 ok=false —— 视为失败，恢复弹框供重试。
+                let verb = if want_bind { "绑定" } else { "解绑" };
                 *self.status_message.lock().unwrap() = format!(
-                    "⚠️ 绑定设备 {target_device} 失败：服务端返回 ok=false"
+                    "⚠️ {verb}设备 {target_device} 失败：服务端返回 ok=false"
                 );
                 self.device_picker = Some(picker);
             }
             Err(e) => {
                 tracing::warn!("device-bind failed: {e}");
+                let verb = if want_bind { "绑定" } else { "解绑" };
                 *self.status_message.lock().unwrap() =
-                    format!("⚠️ 绑定设备 {target_device} 失败：{e}");
+                    format!("⚠️ {verb}设备 {target_device} 失败：{e}");
                 self.device_picker = Some(picker);
             }
         }
@@ -1703,7 +1862,6 @@ impl TuiApp {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let needs_first_setup = !ac.is_configured();
         self.account_id_input = ac.account_id;
         self.account_key_input = ac.account_key;
         self.remote_path_input = if ac.remote_path.trim().is_empty() {
@@ -1711,18 +1869,9 @@ impl TuiApp {
         } else {
             ac.remote_path.trim().trim_end_matches('/').to_string()
         };
-        let ports = PortsConfig::load();
-        self.system_port_input = ports.system_port.to_string();
-        self.opencode_port_input = ports.opencode_port.to_string();
-        // 首启自动聚焦账户ID,后续打开聚焦系统端口(锁定行,等价"无焦点")。
-        self.input_mode = if needs_first_setup {
-            InputMode::SettingsAccountId
-        } else {
-            InputMode::SettingsHttpPort
-        };
+        // 端口不再可编辑（设备清单下发）—— 面板打开即聚焦账户ID。
+        self.input_mode = InputMode::SettingsAccountId;
         // 每次重开设置面板都从顶部开始;上次的滚动位置在重新打开时无意义。
-        // 否则:用户上次滚到 OpenCode 端口,关掉再开 → 仍滚到底部 →
-        // 但账户ID 隐藏在屏幕外,首次鼠标移动不会自动聚焦到顶部字段。
         self.settings_scroll_offset = 0;
     }
 
@@ -1745,30 +1894,15 @@ impl TuiApp {
                 InputMode::SettingsRemotePath => {
                     self.remote_path_input.pop();
                 }
-                InputMode::SettingsHttpPort => {
-                    // 硬锁定:系统端口固定为 9465,即便 input_mode 被
-                    // 外部设到这里,Backspace 也不能修改 buffer。
-                }
-                InputMode::SettingsServePort => {
-                    self.opencode_port_input.pop();
-                }
                 _ => {}
             },
             InputEvent::Char(c) => match self.input_mode {
-                // 硬锁定:系统端口固定为 9465,即便是 digit 也丢弃。
-                InputMode::SettingsHttpPort if c.is_ascii_digit() => {}
-                InputMode::SettingsServePort if c.is_ascii_digit() => {
-                    if self.opencode_port_input.len() < 5 {
-                        self.opencode_port_input.push(c);
-                    }
-                }
                 InputMode::SettingsAccountId => self.account_id_input.push(c),
                 InputMode::SettingsAccountKey => self.account_key_input.push(c),
                 InputMode::SettingsRemotePath => self.remote_path_input.push(c),
                 _ => {}
             },
-            // 粘贴:把 payload 追加到当前字段 buffer。端口字段只接受数字,
-            // payload 中的非数字字符会被静默丢弃。
+            // 粘贴:把 payload 追加到当前字段 buffer。
             //
             // 这里不直接吞 arboard —— 因为 Ctrl+V 已经由 events.rs
             // 转成 Paste(String::new()) 而非真实文本。空 payload 时
@@ -1797,23 +1931,11 @@ impl TuiApp {
 
     /// 把粘贴文本按字段规则追加到当前编辑焦点的 buffer。
     ///
-    /// - 普通文本字段(账户ID / 密钥 / 远程路径):整段追加。
-    /// - OpenCode 端口字段(`SettingsServePort`):只接受 ASCII 数字,
-    ///   其它字符丢弃,并把总长度限制在 5 位以内(避免 `65535000` 这类
-    ///   越界输入)。系统端口(`SettingsHttpPort`)已强制锁定为 9465,
-    ///   本函数对其 early return,不接受任何粘贴。
-    ///
-    /// 真正的过滤/截断逻辑放在自由函数 [`apply_paste_to_buffer`] 里,
-    /// 以便单测;本方法只负责把对应 buffer 拿出来 / 写回去。
+    /// 文本字段(账户ID / 密钥 / 远程路径)整段追加。真正的过滤逻辑放在
+    /// 自由函数 [`apply_paste_to_buffer`] 里,以便单测;本方法只负责把
+    /// 对应 buffer 拿出来 / 写回去。
     fn apply_settings_paste(&mut self, text: &str) {
         if text.is_empty() {
-            return;
-        }
-        // 系统端口(`SettingsHttpPort`)强制锁定为 9465 —— 即使
-        // `input_mode` 被外部设到该值,粘贴也不能修改 `system_port_input`。
-        // 这是"硬锁定"的输入路径防御:UI 已经不让用户进入该字段,
-        // 但万一有遗留状态/未来代码走到这里,粘贴也无效。
-        if self.input_mode == InputMode::SettingsHttpPort {
             return;
         }
         match self.input_mode {
@@ -1829,22 +1951,14 @@ impl TuiApp {
                 self.remote_path_input =
                     apply_paste_to_buffer(self.input_mode, &self.remote_path_input, text);
             }
-            InputMode::SettingsServePort => {
-                self.opencode_port_input =
-                    apply_paste_to_buffer(self.input_mode, &self.opencode_port_input, text);
-            }
-            InputMode::SettingsHttpPort | InputMode::Menu => {
-                // 不可达:上面 early return 已处理 HttpPort;Menu 为
-                // 防御性分支。保留以让 match 覆盖全部 InputMode。
-            }
+            InputMode::Menu => {}
         }
     }
 
     /// 在设置字段之间循环切换（delta = +1 下移 / -1 上移）。
     ///
     /// 找不到当前位置时（理论上不会发生，因为 `open_settings` 总是从
-    /// `SETTINGS_FIELDS[0]` 或锁定的 `SettingsHttpPort` 开始），兜底回到
-    /// 第一个字段。
+    /// `SETTINGS_FIELDS[0]` 开始），兜底回到第一个字段。
     fn move_settings_field(&mut self, delta: i32) {
         let len = SETTINGS_FIELDS.len() as i32;
         let cur = SETTINGS_FIELDS
@@ -1855,8 +1969,9 @@ impl TuiApp {
         self.input_mode = SETTINGS_FIELDS[next as usize];
     }
 
-    /// 提交设置：账户字段校验 → 端口校验 → `/api/user/info` 拉取账户信息 →
-    /// 热更新 auth / storage remote → 写 AccountConfig + 端口到 env 文件。
+    /// 提交设置：账户字段校验 → `/api/user/info` 拉取账户信息 →
+    /// 热更新 auth / storage remote / 运行期端口（设备清单下发）→
+    /// 写 AccountConfig 到 env 文件（唯一持久化项）。
     ///
     /// 任一步失败都保持弹框打开并把焦点切回对应字段，与旧版语义一致。
     async fn submit_settings(&mut self) {
@@ -1894,29 +2009,6 @@ impl TuiApp {
             return;
         }
 
-        // ---- 1. 端口校验 ----
-        // 系统端口(`OC_SERVE_SYSTEM_PORT`)由产品需求强制锁定为 9465:
-        // 不接受用户 buffer(`system_port_input`),即便调用方绕过 UI 写入
-        // 任何值,最终落盘的也必须是 9465。这是"硬锁定"的最终防线。
-        let system_port_str = crate::config::DEFAULT_SYSTEM_PORT.to_string();
-        let system_port: u16 = crate::config::DEFAULT_SYSTEM_PORT;
-        let opencode_port_str = self.opencode_port_input.trim().to_string();
-        let opencode_port = match opencode_port_str.parse::<u16>() {
-            Ok(p) if p > 0 => p,
-            _ => {
-                *self.status_message.lock().unwrap() =
-                    "❌ OpenCode 服务端口无效（1-65535）".to_string();
-                self.input_mode = InputMode::SettingsServePort;
-                return;
-            }
-        };
-        if system_port == opencode_port {
-            *self.status_message.lock().unwrap() = format!(
-                "❌ 系统端口 与 OpenCode 服务端口 不能相同（都是 {system_port}）"
-            );
-            return;
-        }
-
         // ---- 2. 调 /api/user/info 获取用户信息 ----
         // account_key 即身份凭证：接口成功 = 密钥有效；失败（网络 / 401 /
         // 4xx）都不落盘，弹框保留。
@@ -1928,38 +2020,67 @@ impl TuiApp {
                 return;
             }
         };
+        // Header 用户名区热更新（name 字段 trim 后非空才算已登录展示）。
+        let trimmed_name = user_info.name.trim();
+        self.user_display_name = if trimmed_name.is_empty() {
+            None
+        } else {
+            Some(trimmed_name.to_string())
+        };
 
         // ---- 3. 从用户信息提取 sb config → 更新 storage 的 RemoteClient ----
-        // sb 凭据(base_url / username / password)后台热更新 store 并刷新
-        // path-list;结果写日志面板,不阻塞提交流程。sb 凭据不再本地
-        // 持久化 —— 每次启动由 main.rs 调 /api/user/info 重新下发。
+        // sb 凭据(base_url / username / password)同步构造 RemoteClient 并刷新
+        // path-list;refresh 结果拼到状态栏消息(异步 spawn 无法 await 结果)。
+        // sb 凭据不再本地持久化 —— 每次启动由 main.rs 调 /api/user/info 重新下发。
         let sb_filled = !user_info.sb.base_url.trim().is_empty()
             && !user_info.sb.username.trim().is_empty()
             && !user_info.sb.password.is_empty();
-        let mut sb_msg = String::new();
-        if sb_filled {
-            let store = self.store.clone();
-            let info_for_sb = user_info.clone();
-            // 设备名取当前 AccountConfig（未绑定时为空 —— RemotePaths
-            // 构造阶段回退 OS 用户名，路径仍然良构）。
-            let device_name = self
-                .account_config
-                .read()
-                .map(|c| c.device_name.clone())
-                .unwrap_or_default();
-            tokio::spawn(async move {
-                let remote = RemoteClient::from_user_info_v2(
-                    &info_for_sb,
-                    device_name,
-                    info_for_sb.sb.password.clone(),
-                );
-                store.with_remote(remote).await;
-                if let Err(e) = store.refresh().await {
-                    tracing::warn!("settings refresh failed: {e}");
+        // 设备名取当前 AccountConfig（未绑定时为空 —— RemotePaths 构造阶段
+        // 回退 OS 用户名，路径仍然良构）。
+        let device_name = self
+            .account_config
+            .read()
+            .map(|c| c.device_name.clone())
+            .unwrap_or_default();
+        let (sb_msg, refresh_msg) = if sb_filled {
+            // 路径设备段：绑定设备条目在服务端记录的 `device-name`
+            // （缺失/未绑定回退本地 pcname）—— 不是设备服务名。
+            let path_segment =
+                crate::account::remote_path_device_segment(&user_info, &device_name);
+            let remote = RemoteClient::from_user_info_v2(
+                &user_info,
+                path_segment,
+                user_info.sb.password.clone(),
+            );
+            self.store.with_remote(remote).await;
+            if let Err(e) = self.store.migrate_v3_suffix().await {
+                tracing::warn!(target: "sync", "v3 suffix migration in settings failed: {e}");
+            }
+            let refresh_msg = match self.store.refresh().await {
+                Ok(report) => format!(
+                    "refresh=✅ branch={} local={} remote={} merged={} seeded={}",
+                    Self::refresh_branch_label(&report),
+                    report.from_local,
+                    report.from_remote,
+                    report.merged,
+                    report.seeded_remote
+                ),
+                Err(e) => {
+                    tracing::warn!(target: "sync", "settings refresh failed: {e}");
+                    format!("refresh=❌ {e}")
                 }
-            });
-            sb_msg = format!("SB → {}", user_info.sb.base_url);
-        }
+            };
+            let sb_summary = format!(
+                "SB={}(user={} pw={}) device={}",
+                user_info.sb.base_url,
+                user_info.sb.username,
+                if user_info.sb.password.is_empty() { "no" } else { "yes" },
+                if device_name.is_empty() { "<none>" } else { &device_name },
+            );
+            (Some(sb_summary), refresh_msg)
+        } else {
+            (None, "refresh=skipped(SB 凭据缺失,远程同步不生效)".to_string())
+        };
 
         // ---- 4. 更新 auth（basic_user = user.name，缺失回退 user.id，
         //      再回退账户ID；密码取 sb.password，sb 未下发时回退账户密钥）
@@ -1990,12 +2111,10 @@ impl TuiApp {
             guard.basic_password = basic_password.clone();
         }
 
-        // ---- 5. 持久化（增量 upsert，不再整文件覆盖）----
-        // - 账户：ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH / DEVICE_NAME（write_env_file）；
-        // - auth：OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD（账户信息自动填充）；
-        // - 端口：OC_SERVE_SYSTEM_PORT（硬锁定 9465）/ OC_SERVE_OPENCODE_PORT。
-        // rathole 配置由账户信息中的 sb config 替代,面板不再收集;
-        // env 中已有的其他 section 原样保留(增量写入互不覆盖)。
+        // ---- 5. 持久化（env 文件仅账户登录区块）+ 运行期端口热更新 ----
+        // 设备清单下发 port / oc-port：opencode 端口即时生效（后续启动
+        // serve / 云服务用新值）；系统端口保持启动值（axum 已绑定无法
+        // 热迁移），云端有变化时提示重启生效。
         let env_path = crate::config::unified_env_path();
         let device_name = self
             .account_config
@@ -2009,24 +2128,28 @@ impl TuiApp {
             remote_path: remote_path.clone(),
             device_name,
         };
-        let mut write_result = account_cfg.write_env_file(&env_path);
-        if write_result.is_ok() {
-            write_result = upsert_env_keys(
-                &env_path,
-                &[
-                    ("OPENCODE_SERVER_USERNAME".to_string(), Some(basic_user.clone())),
-                    ("OPENCODE_SERVER_PASSWORD".to_string(), Some(basic_password.clone())),
-                    (
-                        crate::config::keys::SYSTEM_PORT.to_string(),
-                        Some(system_port_str.clone()),
-                    ),
-                    (
-                        crate::config::keys::OPENCODE_PORT.to_string(),
-                        Some(opencode_port_str.clone()),
-                    ),
-                ],
-            );
-        }
+        let write_result = account_cfg.write_env_file(&env_path);
+
+        let port_msg = {
+            let fresh = crate::config::ports_from_user_info(&user_info, &account_cfg.device_name);
+            let mut p = self
+                .runtime_ports
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let system_changed = fresh.system_port != p.system_port;
+            let oc_port = fresh.opencode_port;
+            let bound = fresh.device_found;
+            p.opencode_port = oc_port;
+            p.device_found = bound;
+            if system_changed {
+                format!(
+                    "系统端口 {} → {}（重启生效）OpenCode={oc_port}",
+                    p.system_port, fresh.system_port
+                )
+            } else {
+                format!("OpenCode={oc_port}{}", if bound { "" } else { "（未绑定设备，暂不能启动 serve）" })
+            }
+        };
 
         // ---- 6. 更新内存 AccountConfig + 关闭弹框 + 状态消息 ----
         *self.account_config.write().unwrap_or_else(|e| e.into_inner()) = account_cfg;
@@ -2035,15 +2158,13 @@ impl TuiApp {
         // 之前 submit_settings 只切 input_mode,忘记清 rect,导致下一帧
         // click_at 仍按 "弹框已开" 走 should_dismiss_settings_on_click 判定。
         self.last_settings_popup_rect = None;
-        let port_msg = format!(
-            "系统={system_port} OpenCode={opencode_port}（重启生效）"
-        );
         let account_msg = format!("账户 → {account_id}@{remote_path}");
-        let final_msg = if sb_msg.is_empty() {
-            format!("{port_msg}；{account_msg}")
-        } else {
-            format!("{port_msg}；{account_msg}；{sb_msg}")
-        };
+        let sb_or_warn = sb_msg
+            .clone()
+            .unwrap_or_else(|| "⚠️ SB 凭据未下发".to_string());
+        let final_msg = format!(
+            "{account_msg}；{port_msg}；{sb_or_warn}；{refresh_msg}"
+        );
         *self.status_message.lock().unwrap() = match write_result {
             Ok(()) => format!("✅ {final_msg}"),
             Err(e) => format!("⚠️ {final_msg}（写文件失败：{e}）"),
@@ -2140,9 +2261,43 @@ impl TuiApp {
         self.cached_status.lock().unwrap().clone()
     }
 
+    /// 从设置中的账户配置构造 serve 启动鉴权（账户 id = 用户名，账户密钥 = 密码）。
+    ///
+    /// 账户 id 或密钥任一为空时返回 `None` —— serve 子进程不注入鉴权
+    /// 环境变量，行为与旧版一致（继承父进程 env）。
+    fn serve_auth(&self) -> Option<ServeAuth> {
+        let account = self
+            .account_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let id = account.account_id.trim();
+        let key = account.account_key.trim();
+        if id.is_empty() || key.is_empty() {
+            None
+        } else {
+            Some(ServeAuth::new(id.to_string(), key.to_string()))
+        }
+    }
+
+    /// 访问 opencode serve（OpencodeClient / `opencode attach`）用的 Basic 凭据。
+    ///
+    /// serve 启动时注入的鉴权是账户 id + 密钥（见 [`Self::serve_auth`]），
+    /// 客户端必须用同一对凭据，否则 401。账户未配置时回退 `auth`
+    /// （此时 serve 也只是继承父进程 env 中的旧凭据，两边仍一致）。
+    fn serve_credentials(&self) -> (String, String) {
+        match self.serve_auth() {
+            Some(auth) => (auth.username, auth.password),
+            None => {
+                let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
+                (auth.basic_user, auth.basic_password)
+            }
+        }
+    }
+
     fn build_oc_client(&self) -> OpencodeClient {
-        let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
-        OpencodeClient::new(self.attach_url.clone(), auth.basic_user, auth.basic_password)
+        let (user, pass) = self.serve_credentials();
+        OpencodeClient::new(self.attach_url.clone(), user, pass)
     }
 
     // --- 主菜单键盘处理 ---
@@ -2357,7 +2512,7 @@ impl TuiApp {
             }
             MenuAction::ToggleRathole => {
                 if self.status_snapshot().rathole_pid.is_some() {
-                    self.stop_rathole();
+                    self.stop_cloud_service();
                 } else {
                     self.launch_cloud_service();
                 }
@@ -2413,17 +2568,56 @@ impl TuiApp {
         });
     }
 
+    /// 停止 OpenCode 云服务：rathole（隧道）与 opencode serve（单体）**同步**停止。
+    ///
+    /// 云服务的生命周期 = 单体 + rathole 的组合（启动时先单体后 rathole），
+    /// 停止时按相反顺序先拆隧道、再停 serve —— 只停 rathole 会留下一个
+    /// 仍在监听端口的单体进程（「服务面板」单项退出仍可逐个停，走
+    /// [`Self::stop_rathole`] / [`Self::stop_opencode`]）。
+    fn stop_cloud_service(&mut self) {
+        let status = self.status_message.clone();
+        *status.lock().unwrap() =
+            "⏹ 正在停止 OpenCode 云服务（rathole + opencode serve）…".to_string();
+        let supervisor = self.supervisor.clone();
+        tokio::spawn(async move {
+            let msg = match supervisor.stop_rathole().await {
+                Ok(()) => match supervisor.stop_opencode().await {
+                    Ok(()) => "✅ 云服务已停止（rathole + opencode serve）".to_string(),
+                    Err(e) => format!("⚠️ rathole 已停止，但 opencode serve 停止失败：{e}"),
+                },
+                Err(e) => format!("❌ 停止 rathole 失败（opencode serve 未停止）：{e}"),
+            };
+            *status.lock().unwrap() = msg;
+        });
+    }
+
     /// 启动 OpenCode 云服务：自动先启单体，再叠 rathole。
+    /// 单体与云服务共用同一份 serve 鉴权（账户 id + 密钥，见 [`Self::serve_auth`]）。
     /// 三段状态消息：单体失败 / rathole 失败（单体已启不回滚）/ 成功。
     fn launch_cloud_service(&mut self) {
+        let (port, device_found) = {
+            let p = self
+                .runtime_ports
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            (p.opencode_port, p.device_found)
+        };
+        if !device_found {
+            *self.status_message.lock().unwrap() =
+                "❌ 未绑定设备——云服务端口由设备清单下发，请先在设置中绑定设备".to_string();
+            return;
+        }
         let status = self.status_message.clone();
         *status.lock().unwrap() = "🚀 正在启动 OpenCode 云服务…".to_string();
-        let port = crate::config::PortsConfig::load().opencode_port;
         let bin = rathole_default_bin();
         let config = rathole_default_config();
         let supervisor = self.supervisor.clone();
+        let auth = self.serve_auth();
         tokio::spawn(async move {
-            let msg = match supervisor.launch_cloud_service(port, &bin, &config).await {
+            let msg = match supervisor
+                .launch_cloud_service(port, &bin, &config, auth.as_ref())
+                .await
+            {
                 Ok((oc_pid, rt_pid)) => format!(
                     "✅ 云服务已启动：单体 PID={oc_pid}, rathole PID={rt_pid}"
                 ),
@@ -2468,7 +2662,18 @@ impl TuiApp {
     // --- 启动 opencode serve（直接读 env 默认端口，无弹框） ---
 
     fn launch_opencode_with_default_port(&mut self) {
-        let port = PortsConfig::load().opencode_port;
+        let (port, device_found) = {
+            let p = self
+                .runtime_ports
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            (p.opencode_port, p.device_found)
+        };
+        if !device_found {
+            *self.status_message.lock().unwrap() =
+                "❌ 未绑定设备——opencode 端口由设备清单下发，请先在设置中绑定设备".to_string();
+            return;
+        }
         *self.status_message.lock().unwrap() =
             format!("🚀 正在启动 OpenCode Serve（port={port}）…");
         let supervisor_for_launch = self.supervisor.clone();
@@ -2477,10 +2682,14 @@ impl TuiApp {
         if self.confirm.is_some() {
             return;
         }
+        let auth = self.serve_auth();
         tokio::spawn(async move {
             match ServeSupervisor::check_port(port).await {
                 Ok(()) => {
-                    let msg = match supervisor_for_launch.launch_opencode(port).await {
+                    let msg = match supervisor_for_launch
+                        .launch_opencode(port, auth.as_ref())
+                        .await
+                    {
                         Ok(pid) => format!("✅ 服务已启动，端口 {port}，PID={pid}"),
                         Err(e) => format!("❌ 启动失败：{e}"),
                     };
@@ -2539,6 +2748,7 @@ impl TuiApp {
             format!("⚙️ 正在终止占用端口 {port} 的进程…");
         let supervisor = self.supervisor.clone();
         let status = self.status_message.clone();
+        let auth = self.serve_auth();
         tokio::spawn(async move {
             // Step 1: 杀进程（自带重试 + 日志）
             let killed = ServeSupervisor::kill_port_listener(port).await;
@@ -2600,7 +2810,7 @@ impl TuiApp {
             }
 
             // Step 5: 启动 opencode serve
-            let msg = match supervisor.launch_opencode(port).await {
+            let msg = match supervisor.launch_opencode(port, auth.as_ref()).await {
                 Ok(pid) => {
                     tracing::info!(
                         target: "tui",
@@ -2674,13 +2884,24 @@ impl TuiApp {
                 .read()
                 .map(|c| c.device_name.clone())
                 .unwrap_or_default();
+            // 路径设备段与其他调用点同源：服务端记录的 device-name 优先，
+            // 回退本地 pcname（不是设备服务名）。
+            let path_segment =
+                crate::account::remote_path_device_segment(&info, &device_name);
             let new_remote = RemoteClient::from_user_info_v2(
                 &info,
-                device_name,
+                path_segment,
                 info.sb.password.clone(),
             );
             self.store.with_remote(new_remote.clone()).await;
             remote = Some(new_remote);
+            // 兜底重建后的 v3 后缀迁移放后台，不阻塞项目列表加载。
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.migrate_v3_suffix().await {
+                    tracing::warn!(target: "sync", "v3 suffix migration after remote rebuild failed: {e}");
+                }
+            });
         }
         let mut remote = remote.expect("remote ensured above");
 
@@ -2922,7 +3143,7 @@ impl TuiApp {
     }
 
     fn trigger_attach(&mut self, directory: String, session: String) {
-        let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let (user, password) = self.serve_credentials();
         // 不再调 `spawn_in_new_terminal` 弹新窗口 —— 用户从 explorer 双击启动
         // 时没有"当前 PowerShell"可开新 tab，最干净的方案是让 attach 接管
         // mini-oc-gui 自己的 conhost 控制台（同窗口、不弹新、TUI 短暂冻结后
@@ -2932,8 +3153,8 @@ impl TuiApp {
             url: self.attach_url.clone(),
             directory: directory.clone(),
             session: session.clone(),
-            user: auth.basic_user,
-            password: auth.basic_password,
+            user,
+            password,
         });
         self.sub_page = None;
         *self.status_message.lock().unwrap() =
@@ -2954,14 +3175,14 @@ impl TuiApp {
     /// 失败不自动回退同窗口模式 —— 状态栏提示用户可按 T 用本窗口模式，
     /// 避免掩盖新窗口路径的问题。
     async fn trigger_attach_window(&mut self, directory: String, session: String) {
-        let auth = self.auth.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let (user, password) = self.serve_credentials();
         let base = std::env::temp_dir().join(format!("oc-attach-{session}"));
         let spec = crate::attach::AttachWindowSpec {
             url: self.attach_url.clone(),
             directory: directory.clone(),
             session: session.clone(),
-            user: auth.basic_user,
-            password: auth.basic_password,
+            user,
+            password,
             pid_file: base.with_extension("pid").to_string_lossy().into_owned(),
             launcher_script: base
                 .with_extension(if cfg!(target_os = "macos") { "launcher.sh" } else { "launcher.ps1" })
@@ -3454,9 +3675,10 @@ impl TuiApp {
         let header_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green));
         let header_inner = header_block.inner(chunks[0]);
         frame.render_widget(header_block, chunks[0]);
+        // 三列:标题(弹性) | 用户名(设置按钮左侧,右对齐) | 设置按钮(固定 12 列)。
         let header_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(12)])
+            .constraints([Constraint::Min(0), Constraint::Length(24), Constraint::Length(12)])
             .split(header_inner);
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
@@ -3465,10 +3687,25 @@ impl TuiApp {
             )])),
             header_cols[0],
         );
+        // 用户名区:启动拉取的 `name` 字段;未拉取成功时显示灰色「未登录」。
+        let user_line = match self.user_display_name.as_deref() {
+            Some(name) => Line::from(Span::styled(
+                format!("👤 {name} "),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            None => Line::from(Span::styled(
+                "👤 未登录 ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        };
+        frame.render_widget(
+            Paragraph::new(user_line).alignment(Alignment::Right),
+            header_cols[1],
+        );
         let settings_hovered = matches!(
             self.mouse_pos,
-            Some((c, r)) if c >= header_cols[1].x && c < header_cols[1].x + header_cols[1].width
-                && r >= header_cols[1].y && r < header_cols[1].y + header_cols[1].height
+            Some((c, r)) if c >= header_cols[2].x && c < header_cols[2].x + header_cols[2].width
+                && r >= header_cols[2].y && r < header_cols[2].y + header_cols[2].height
         );
         let settings_style = if settings_hovered {
             Style::default()
@@ -3480,10 +3717,10 @@ impl TuiApp {
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled("设置 [s]", settings_style)])),
-            header_cols[1],
+            header_cols[2],
         );
         self.click_regions.push(ClickRegion {
-            rect: header_cols[1],
+            rect: header_cols[2],
             target: ClickTarget::Settings,
         });
 
@@ -3548,8 +3785,8 @@ impl TuiApp {
         let top_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(30), // 服务与系统
-                Constraint::Percentage(60), // OC 项目
+                Constraint::Percentage(30), // 服务与系统 — 固定 30%,与原布局一致
+                Constraint::Percentage(70), // OC 项目 — 拿剩余 70%,达成"铺满空间"
             ])
             .split(left[0]);
 
@@ -3847,10 +4084,10 @@ impl TuiApp {
 
     /// 生成设置弹框的所有行内容,同时为每个字段决定高亮样式。
     ///
-    /// 布局（15 行,两个分区）:
+    /// 布局（10 行,单账户分区）:
     /// - 每个字段占两行:第一行是字段值(高亮由当前 input_mode 决定),
     ///   第二行是浅灰色「用途」说明(说明 env key、字段作用)。
-    /// - 分区之间留一个空行分隔。
+    /// - 端口不再本地设置（设备清单 port / oc-port 下发）。
     ///
     /// 行索引表(对应 [`settings_field_at_row`] 与
     /// [`register_settings_click_regions`] 使用的 [`FIELD_LINE_IDX`]):
@@ -3859,16 +4096,11 @@ impl TuiApp {
     /// - 2:  账户ID 说明
     /// - 3:  密钥 值(掩码)   ← field 1
     /// - 4:  密钥 说明
-    /// - 5:  远程路径 值     ← field 2
-    /// - 6:  远程路径 说明
-    /// - 7:  (空)
-    /// - 8:  "端口设置"
-    /// - 9:  系统端口 值（锁定 9465,只渲染不进 FIELD_LINE_IDX）
-    /// - 10: 系统端口 说明
-    /// - 11: OpenCode 端口 值 ← field 3
-    /// - 12: OpenCode 端口 说明
-    /// - 13: (空)
-    /// - 14: 帮助行
+    /// - 5:  绑定设备 值(只读,点击重新绑定)
+    /// - 6:  绑定设备 说明
+    /// - 7:  远程路径 值     ← field 2
+    /// - 8:  远程路径 说明
+    /// - 9:  帮助行
     fn build_settings_lines(&self) -> Vec<Line<'static>> {
         let active = Style::default()
             .bg(Color::Green)
@@ -3958,33 +4190,6 @@ impl TuiApp {
                 ),
                 desc_style,
             )),
-            Line::from(""),
-            // --- 端口设置 ---
-            Line::from(Span::styled("端口设置", title_style)),
-            Line::from(Span::styled(
-                // 系统端口强制锁定为 9465 —— 完全不读 buffer,
-                // 提示"[锁定]"让用户一眼看到该字段不可编辑。
-                format!(
-                    "  系统端口:   {} [锁定,不可修改]",
-                    crate::config::DEFAULT_SYSTEM_PORT
-                ),
-                // 不可编辑字段不再用 style_for(active 高亮),改用 desc_style
-                // (浅灰)以视觉传达"不可交互"。
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                "    作用: 本程序 axum 监听端口(env: OC_SERVE_SYSTEM_PORT)",
-                desc_style,
-            )),
-            Line::from(Span::styled(
-                format!("  OpenCode 端口: {}", self.opencode_port_input),
-                style_for(InputMode::SettingsServePort),
-            )),
-            Line::from(Span::styled(
-                "    作用: opencode serve 端口(env: OC_SERVE_OPENCODE_PORT)",
-                desc_style,
-            )),
-            Line::from(""),
             Line::from(Span::styled(
                 "  Tab/↑/↓ 切换  Ctrl+V 粘贴  Enter 保存  Esc 取消  (点击字段行直接跳到该输入)",
                 help_style,
@@ -3999,8 +4204,7 @@ impl TuiApp {
     /// [`settings_field_at_row`] 共用同一张表):
     /// - 0: 账户ID        (line idx 1)
     /// - 1: 密钥          (line idx 3)
-    /// - 2: 远程路径      (line idx 5)
-    /// - 3: OpenCode 端口 (line idx 11)
+    /// - 2: 远程路径      (line idx 7)
     ///
     /// `scroll_offset` 是当前滚动偏移;屏幕行 `r` 对应 `build_settings_lines`
     /// 的第 `r + scroll_offset` 行。被滚动到屏幕外的字段(屏幕行 < 0 或 ≥ 内容区)
@@ -4237,22 +4441,57 @@ fn register_settings_click_regions(
             )),
             Line::from(""),
         ];
+        let local_pctype = crate::account::pctype();
         for (i, dev) in picker.user_info.devices.iter().enumerate() {
-            let bound_tag = if dev.bound { "（已绑定）" } else { "" };
+            let is_current = !picker.current_bound_device.is_empty()
+                && dev.name == picker.current_bound_device;
+            // 跨平台过滤：缺失 / unknown 视为兼容（向后兼容老数据）。
+            let is_compatible =
+                dev.pctype.is_empty() || dev.pctype == "unknown" || dev.pctype == local_pctype;
+            let platform_tag = if dev.pctype.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", dev.pctype)
+            };
+            let bound_tag = if !is_compatible {
+                "  ⚠ 跨平台不可绑定".to_string()
+            } else if is_current {
+                "  ★ ← 当前绑定".to_string()
+            } else if dev.bound {
+                "（已绑定）".to_string()
+            } else {
+                String::new()
+            };
             let selected = i == picker.selected;
-            let style = if selected {
+            let style = if !is_compatible {
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+            } else if selected {
                 Style::default()
                     .bg(Color::Cyan)
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let prefix = if selected { "▶ " } else { "  " };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}{}  端口 {}{}", dev.name, dev.port, bound_tag),
-                style,
-            )));
+            let prefix = if !is_compatible {
+                "  "
+            } else if is_current && !selected {
+                "★ "
+            } else if selected {
+                "▶ "
+            } else {
+                "  "
+            };
+            let name_part = if is_compatible {
+                format!("{prefix}{}  端口 {}{}", dev.name, dev.port, bound_tag)
+            } else {
+                format!("{prefix}{}  端口 {}{}{}", dev.name, dev.port, platform_tag, bound_tag)
+            };
+            lines.push(Line::from(Span::styled(name_part, style)));
         }
         lines.push(Line::from(""));
 
@@ -4738,7 +4977,7 @@ fn register_settings_click_regions(
             title_area,
         );
 
-        let card_h = 7u16;
+        let card_h = 5u16;
         let visible_h = area.height.saturating_sub(1);
         let visible_count = (visible_h / card_h).max(1) as usize;
         let selected = state.selected().unwrap_or(0);
@@ -4764,7 +5003,7 @@ fn register_settings_click_regions(
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .padding(Padding::uniform(1));
+                .padding(Padding::ZERO);
             let para = Paragraph::new(cards[idx].clone()).block(block);
             frame.render_widget(para, card_area);
             y += card_h;
@@ -5341,27 +5580,6 @@ let left = ratatui::layout::Layout::default()
 
     // ---- 设置面板:粘贴 / 关闭不保存 / 新布局 ----
 
-    /// 端口字段粘贴时,非数字字符必须被丢弃,5 位上限必须生效。
-    #[test]
-    fn paste_into_http_port_is_locked_noop() {
-        // 系统端口 (`SettingsHttpPort`) 已强制锁定为 9465,粘贴
-        // 不能修改 buf —— 无论传入什么数字 / 字符,buffer 保持不变。
-        // 这是 `apply_paste_to_buffer` 层的硬锁定;
-        // `apply_settings_paste` 还会在外层 early return 做一次防御。
-        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "", "9a465#9");
-        assert_eq!(got, "", "空 buf + 数字粘贴应保持空");
-        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9465", "12345");
-        assert_eq!(got, "9465", "非空 buf + 数字粘贴应保持原样");
-        let got = apply_paste_to_buffer(InputMode::SettingsHttpPort, "9465", "abc");
-        assert_eq!(got, "9465", "非数字粘贴应保持原样");
-    }
-
-    #[test]
-    fn paste_into_opencode_port_follows_same_rules() {
-        let got = apply_paste_to_buffer(InputMode::SettingsServePort, "", "94x64");
-        assert_eq!(got, "9464");
-    }
-
     /// 普通文本字段粘贴时,整段追加,保留所有字符(含中文 / 空格)。
     #[test]
     fn paste_into_text_field_appends_verbatim() {
@@ -5538,15 +5756,13 @@ let left = ratatui::layout::Layout::default()
 
     /// 行 idx → InputMode 映射:必须与 build_settings_lines 的布局
     /// 保持一致。每多一个字段,这里就要多一个 case;少一个就会失败。
-    /// 索引顺序 = SETTINGS_FIELDS 顺序 = [账户ID, 密钥, 远程路径,
-    /// OpenCode 端口]。
+    /// 索引顺序 = SETTINGS_FIELDS 顺序 = [账户ID, 密钥, 远程路径]。
     #[test]
     fn settings_field_at_row_maps_every_field_to_correct_input_mode() {
         let cases = [
             (1, InputMode::SettingsAccountId),
             (3, InputMode::SettingsAccountKey),
             (7, InputMode::SettingsRemotePath),
-            (13, InputMode::SettingsServePort),
         ];
         // `settings_field_at_row` 是 &self 方法但完全不用 self(只读
         // 模块级常量表),我们走 helper 镜像逻辑,避免构造 TuiApp 的
@@ -5555,20 +5771,14 @@ let left = ratatui::layout::Layout::default()
             let got = helper_settings_field_at_row(row);
             assert_eq!(got, Some(expected), "row={row}");
         }
-        // 标题 / 空行 / 帮助 / 描述行 / 锁定端口行 / 越界 → None
+        // 标题 / 帮助 / 描述行 / 只读行 / 越界 → None
         assert_eq!(helper_settings_field_at_row(0), None);
         assert_eq!(helper_settings_field_at_row(2), None); // 账户ID 说明
         assert_eq!(helper_settings_field_at_row(4), None); // 密钥 说明
         assert_eq!(helper_settings_field_at_row(5), None); // 绑定设备 值(只读)
         assert_eq!(helper_settings_field_at_row(6), None); // 绑定设备 说明
         assert_eq!(helper_settings_field_at_row(8), None); // 远程路径 说明
-        assert_eq!(helper_settings_field_at_row(9), None); // 空
-        assert_eq!(helper_settings_field_at_row(10), None); // 端口设置 标题
-        assert_eq!(helper_settings_field_at_row(11), None); // 系统端口(锁定)
-        assert_eq!(helper_settings_field_at_row(12), None); // 系统端口 说明
-        assert_eq!(helper_settings_field_at_row(14), None); // OpenCode 端口 说明
-        assert_eq!(helper_settings_field_at_row(15), None); // 空
-        assert_eq!(helper_settings_field_at_row(16), None); // 帮助
+        assert_eq!(helper_settings_field_at_row(9), None); // 帮助
         assert_eq!(helper_settings_field_at_row(999), None);
     }
 
@@ -5586,8 +5796,6 @@ let left = ratatui::layout::Layout::default()
 
     /// 行表大小必须严格 = SETTINGS_FIELDS.len(),且与 SETTINGS_FIELDS
     /// 一一对应。任何不一致(增减字段、改分区顺序)都会让这个测试失败。
-    /// 注意:系统端口行(row 9)不在 FIELD_LINE_IDX 中 —— 该字段
-    /// 锁定为 9465,不可点击/Tab;见 `settings_fields_excludes_locked_system_port`。
     #[test]
     fn settings_field_at_row_table_matches_settings_fields() {
         assert_eq!(FIELD_LINE_IDX.len(), SETTINGS_FIELDS.len());
@@ -5608,22 +5816,15 @@ let left = ratatui::layout::Layout::default()
     /// `build_settings_lines` 必须为每个可编辑字段都给出 env key 提示
     /// —— 这是"在每个配置旁显示作用说明"需求的可测版本。每个字段
     /// 下一行(说明行)必须含 "ACCOUNT_ID" / "ACCOUNT_KEY" /
-    /// "REMOTE_PATH" / "OC_SERVE_OPENCODE_PORT" 等明显的 env key,
-    /// 否则用户看不到字段作用。
-    /// 注:系统端口 (`OC_SERVE_SYSTEM_PORT`) 已锁定为 9465,不可编辑;
-    /// 但其只读行的描述里仍提到该 env key(用户在文件里能找到这个常量)。
+    /// "REMOTE_PATH" 等明显的 env key,否则用户看不到字段作用。
+    /// 端口由设备清单下发,不再出现在设置面板中。
     #[test]
     fn build_settings_lines_documents_every_field() {
         let app = TuiApp::test_stub();
         let lines = app.build_settings_lines();
-        // 期望的 4 个可编辑字段 env key,顺序与 FIELD_LINE_IDX 同步:
-        // 账户ID → 密钥 → 远程路径 → OpenCode 端口。
-        const EXPECTED_KEYS: [&str; 4] = [
-            "ACCOUNT_ID",
-            "ACCOUNT_KEY",
-            "REMOTE_PATH",
-            "OC_SERVE_OPENCODE_PORT",
-        ];
+        // 期望的 3 个可编辑字段 env key,顺序与 FIELD_LINE_IDX 同步:
+        // 账户ID → 密钥 → 远程路径。
+        const EXPECTED_KEYS: [&str; 3] = ["ACCOUNT_ID", "ACCOUNT_KEY", "REMOTE_PATH"];
         assert_eq!(FIELD_LINE_IDX.len(), EXPECTED_KEYS.len());
         let row_text = |idx: usize| -> String {
             lines[idx]
@@ -5649,13 +5850,14 @@ let left = ratatui::layout::Layout::default()
                 "field {i} (line {idx}) desc should start with 用途说明: {desc}"
             );
         }
-        // 系统端口锁定行(row 11)+ 说明(row 12)仍渲染并提到 env key。
-        let sys_line = row_text(11);
-        assert!(
-            sys_line.contains("9465") && sys_line.contains("锁定"),
-            "locked system port row should show 9465 [锁定]: {sys_line}"
-        );
-        assert!(row_text(12).contains("OC_SERVE_SYSTEM_PORT"));
+        // 端口区块整体不再渲染：任何行都不应再出现端口 env key 或「端口设置」。
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !text.contains("OC_SERVE_SYSTEM_PORT") && !text.contains("OC_SERVE_OPENCODE_PORT"),
+                "端口不应出现在设置面板: {text}"
+            );
+        }
     }
 
     /// 「绑定设备」是设置面板中账户登录区的可点击信息行 —— 显示 env 中
@@ -5813,7 +6015,11 @@ let left = ratatui::layout::Layout::default()
             devices: vec![RemoteDevice {
                 name: "dev-pc-1".to_string(),
                 port: 9464,
+                oc_port: None,
                 bound: false,
+                pctype: "macos".to_string(),
+                device_name: None,
+                desc: None,
             }],
             sb: crate::account::RemoteSbConfig {
                 base_url: "https://md.isoops.com".to_string(),
@@ -5866,10 +6072,9 @@ let left = ratatui::layout::Layout::default()
         // 回归:设置弹框按钮行之前被裁掉,因为 `desired_h` 只算了上下边框,
         // 漏算了 push 进去的空行和按钮行(`render_settings_popup`)。
         // 锁住两个不变性,防止任何人不小心改坏:
-        // 1. build_settings_lines() 的输出行数 = 15(2 段标题 + 4 可编辑
-        //    字段 + 4 字段说明 + 1 系统端口只读行 + 1 系统端口说明 +
-        //    2 段间空行 + 1 help 行)。系统端口虽不进入 SETTINGS_FIELDS,
-        //    但行仍渲染 + 仍有描述行(写明 env key 给用户在 .env 中找)。
+        // 1. build_settings_lines() 的输出行数 = 10(1 段标题 + 3 可编辑
+        //    字段 + 3 字段说明 + 1 绑定设备只读行 + 1 绑定设备说明 +
+        //    1 help 行)。端口区块已删除(设备清单下发)。
         // 2. desired_h 必须 ≥ lines.len() + 4(空行 + 按钮 + 上下边框),
         //    这样 Paragraph 渲染区能装下完整内容,按钮行不被裁,
         //    click region 与视觉位置一致。
@@ -5886,13 +6091,13 @@ let left = ratatui::layout::Layout::default()
             .expect("draw");
 
         let lines = app.build_settings_lines();
-        // 不变性 1:build_settings_lines 返回固定 17 行。改 build_settings_lines
+        // 不变性 1:build_settings_lines 返回固定 10 行。改 build_settings_lines
         // 时必须同步改这里,否则说明弹框内容布局发生重大变化,需要重新审视
         // 滚动逻辑 + click region + desired_h 公式。
         assert_eq!(
             lines.len(),
-            17,
-            "build_settings_lines must produce exactly 17 rows; \
+            10,
+            "build_settings_lines must produce exactly 10 rows; \
              if you intentionally added/removed a row, also re-derive \
              desired_h, FIELD_LINE_IDX, and max_offset"
         );
@@ -6014,7 +6219,7 @@ let left = ratatui::layout::Layout::default()
             // 不变性 4:scroll 后最后一行内容(应落在可视区底) ≤ total_content - 1
             // 即 max_offset 不会越界。
             assert!(
-                app.settings_scroll_offset <= 17,
+                app.settings_scroll_offset <= 10,
                 "scroll offset out of range"
             );
         }
@@ -6064,7 +6269,7 @@ let left = ratatui::layout::Layout::default()
             (99, 23, "右下角边框"),                   // 弹框最右下
             (22, 7, "账户ID 字段行(首字段)"),        // 账户ID 在 line_idx=1
             (50, 8, "账户ID 字段说明行"),             // line_idx=2 是说明
-            (50, 10, "远程路径字段行(line=5)"),      // line_idx=5 范围
+            (50, 10, "字段/说明行(弹框中部)"),    // 密钥/绑定设备区
             (40, 22, "按钮行(底部)"),                 // 弹框底部按钮行
         ];
         for (col, row, label) in cases {
@@ -6302,7 +6507,8 @@ let left = ratatui::layout::Layout::default()
         "sb": { "base_url": "", "username": "", "password": "" }
     }"#;
 
-    /// 带完整 sb 凭据的 mock 用户信息(触发 store.with_remote 后台任务)。
+    /// 带完整 sb 凭据的 mock 用户信息(触发 store.with_remote 后台任务),
+    /// 并携带设备清单(含 port / oc-port)供端口热更新断言。
     const FULL_USER_INFO_JSON: &str = r#"{
         "id": "tester",
         "name": "Tester",
@@ -6311,7 +6517,10 @@ let left = ratatui::layout::Layout::default()
             "base_url": "http://127.0.0.1:1",
             "username": "sb-user",
             "password": "sb-pass"
-        }
+        },
+        "devices": [
+            { "name": "dev-a", "port": 20001, "oc-port": 20002, "bound": true, "pctype": "macos" }
+        ]
     }"#;
 
     /// submit 类测试都写同一个 `unified_env_path()` 文件(测试 bin 目录),
@@ -6462,12 +6671,10 @@ let left = ratatui::layout::Layout::default()
         // first_setup_required = false:让 SettingsCancel 点完能正常关闭
         // 弹框(否则首启规则会阻止关闭)。
         app.first_setup_required = false;
-        // 填必填账户字段 + 端口,让 submit_settings 通过校验关闭弹框。
+        // 填必填账户字段,让 submit_settings 通过校验关闭弹框。
         app.account_id_input = "tester".to_string();
         app.account_key_input = "test-key-0123456789abcdef".to_string();
         app.remote_path_input = remote;
-        app.system_port_input = "9465".to_string();
-        app.opencode_port_input = "9464".to_string();
         app.input_mode = InputMode::SettingsAccountId;
         // 清掉历史 env,避免残留干扰断言(测试结束再次清理)。
         let env_path = crate::config::unified_env_path();
@@ -6686,10 +6893,10 @@ let left = ratatui::layout::Layout::default()
     fn settings_click_regions_shift_with_scroll_offset() {
         let mut app = TuiApp::test_stub();
         let rect = ratatui::layout::Rect::new(10, 5, 80, 8);
-        // scroll_offset=10:屏幕行 0..3(内容区 4 行)对应 build_settings_lines
-        // 行 10..14。FIELD_LINE_IDX [1, 3, 7, 13] 中只有 13 在 [10,14) 可见;
-        // 1, 3, 7 都不在范围,不可见 → 不应注册。
-        app.register_settings_click_regions(rect, 99, 10, 8);
+        // scroll_offset=4:屏幕行 0..3(内容区 4 行)对应 build_settings_lines
+        // 行 4..8。FIELD_LINE_IDX [1, 3, 7] 中只有 7 在 [4,8) 可见;
+        // 1, 3 不在范围,不可见 → 不应注册。
+        app.register_settings_click_regions(rect, 99, 4, 8);
 
         let visible_y_min = rect.y + 1;
         let visible_y_max = rect.y + rect.height.saturating_sub(1);
@@ -6710,14 +6917,14 @@ let left = ratatui::layout::Layout::default()
                 r.target,
                 ClickTarget::SettingsField(InputMode::SettingsAccountId)
             )),
-            "scroll_offset=10 时 账户ID (line 1) 不可见,不应注册 click region"
+            "scroll_offset=4 时 账户ID (line 1) 不可见,不应注册 click region"
         );
         assert!(
             app.click_regions.iter().any(|r| matches!(
                 r.target,
-                ClickTarget::SettingsField(InputMode::SettingsServePort)
+                ClickTarget::SettingsField(InputMode::SettingsRemotePath)
             )),
-            "scroll_offset=10 时 OpenCode 端口 (line 13) 可见,必须注册"
+            "scroll_offset=4 时 远程路径 (line 7) 可见,必须注册"
         );
     }
 
@@ -6731,21 +6938,15 @@ let left = ratatui::layout::Layout::default()
             TuiApp::helper_settings_field_at_row_with_offset(1, 0),
             Some(InputMode::SettingsAccountId)
         );
-        // offset=10:屏幕 row 1 对应原始行 11 → 系统端口(锁定行,不在表中 → None)。
-        // 改为 offset=12 → 屏幕 row 1 对应原始行 13 → OpenCode 端口。
+        // offset=6:屏幕 row 1 对应原始行 7 → 远程路径。
         assert_eq!(
-            TuiApp::helper_settings_field_at_row_with_offset(1, 12),
-            Some(InputMode::SettingsServePort)
+            TuiApp::helper_settings_field_at_row_with_offset(1, 6),
+            Some(InputMode::SettingsRemotePath)
         );
-        // offset=10:屏幕 row 3 对应原始行 13 → OpenCode 端口(内容区底行)。
-        assert_eq!(
-            TuiApp::helper_settings_field_at_row_with_offset(3, 10),
-            Some(InputMode::SettingsServePort)
-        );
-        // offset=12:屏幕 row 0 是原始行 12(系统端口说明行) → None。
-        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(0, 12), None);
-        // offset=10:屏幕 row 4 是原始行 14(OpenCode 端口说明) → None。
-        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(4, 10), None);
+        // offset=6:屏幕 row 0 对应原始行 6(绑定设备说明) → None。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(0, 6), None);
+        // offset=6:屏幕 row 2 对应原始行 8(远程路径说明) → None。
+        assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(2, 6), None);
         // offset=0:屏幕 row 7 对应原始行 7 → 远程路径。
         assert_eq!(
             TuiApp::helper_settings_field_at_row_with_offset(7, 0),
@@ -6755,42 +6956,18 @@ let left = ratatui::layout::Layout::default()
         assert_eq!(TuiApp::helper_settings_field_at_row_with_offset(8, 10), None);
     }
 
-    /// 系统端口(`OC_SERVE_SYSTEM_PORT`)在设置面板中**强制锁定为 9465**,
-    /// 用户不可编辑。因此 `SETTINGS_FIELDS` 中必须不包含
-    /// `SettingsHttpPort` —— Tab / ↑ / ↓ / 点击都不会跳到该字段。
-    #[test]
-    fn settings_fields_excludes_locked_system_port() {
-        assert!(
-            !SETTINGS_FIELDS.contains(&InputMode::SettingsHttpPort),
-            "系统端口已强制为 9465,不应出现在 Tab 循环的字段列表中"
-        );
-    }
-
-    /// 系统端口位于 build_settings_lines 的 row 9;该行仍是渲染行
-    /// (展示 "系统端口: 9465 [锁定]" 等),但**点击/Tab 不能进入编辑**——
-    /// `settings_field_at_row(9, _)` 必须返回 `None`。
-    #[test]
-    fn locked_system_port_row_is_not_an_editable_field() {
-        // 锁定字段位置:row 9(在 popup 顶部计数)。
-        assert_eq!(
-            TuiApp::helper_settings_field_at_row_with_offset(9, 0),
-            None,
-            "row 9 是显示用的系统端口行,不应被点击/Tab 选中"
-        );
-    }
-
-    /// 端到端(mock /api/user/info):即使 `system_port_input` 被外部篡改
-    /// 为非 9465,调用 `submit_settings` 后持久化的 env 文件里
-    /// `OC_SERVE_SYSTEM_PORT` 仍是 `9465`。这是"硬锁定"的最终防线 ——
-    /// 即便绕过 UI,内部 buffer 也无法把端口写到非 9465。
-    /// 同时验证 AccountConfig / auth 被正确落盘(增量 upsert,不整文件覆盖)。
+    /// 端到端(mock /api/user/info):`submit_settings` 后持久化的 env 文件
+    /// **仅含账户登录区块** —— OPENCODE_SERVER_* / OC_SERVE_*_PORT 等旧
+    /// key 一律不写(端口与 auth 改为内存态,每次启动由用户信息构建)。
+    /// 同时验证:内存 auth 被账户信息自动填充;runtime_ports 按设备清单
+    /// 下发的 port / oc-port 热更新。
     ///
     /// 注:`submit_settings` 写到 `unified_env_path()`,测试 cargo 跑出的
     /// binary 落在 `target/debug/deps/`,所以写入位置是测试 bin 目录,
     /// 不污染用户真实配置。运行后从该路径读回校验。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // ENV_WRITE_LOCK 必须覆盖 await,见其文档注释
-    async fn submit_settings_always_writes_9465_for_system_port() {
+    async fn submit_settings_persists_account_only_and_updates_ports() {
         use crate::account::read_env_kv;
         use crate::config::unified_env_path;
 
@@ -6798,12 +6975,15 @@ let left = ratatui::layout::Layout::default()
         let (remote, _server) = spawn_user_info_server(FULL_USER_INFO_JSON.to_string());
         let mut app = TuiApp::test_stub();
         app.first_setup_required = false;
-        // 模拟"用户成功绕过 UI 把 system_port_input 改成 9999"。
         app.account_id_input = "tester".to_string();
         app.account_key_input = "test-key-0123456789abcdef".to_string();
         app.remote_path_input = remote.clone();
-        app.system_port_input = "9999".to_string();
-        app.opencode_port_input = "9464".to_string();
+        // 预置已绑定设备 dev-a → submit 后 runtime_ports 应取该设备
+        // 下发的 port=20001 / oc-port=20002。
+        {
+            let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
+            guard.device_name = "dev-a".to_string();
+        }
         app.input_mode = InputMode::SettingsAccountId;
 
         // 先清空目标 env(避免历史残留干扰断言)。
@@ -6819,26 +6999,24 @@ let left = ratatui::layout::Layout::default()
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(
-            get(crate::config::keys::SYSTEM_PORT),
-            "9465",
-            "系统端口被锁定为 9465,即使 buffer 里有别的值也不能写出去"
-        );
-        // 账户配置写盘(ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH)。
+        // 账户配置写盘(ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH / DEVICE_NAME)。
         assert_eq!(get("ACCOUNT_ID"), "tester");
         assert_eq!(get("ACCOUNT_KEY"), "test-key-0123456789abcdef");
         assert_eq!(get("REMOTE_PATH"), remote);
-        // auth 从账户信息自动填充:name 优先做 basic_user,sb.password 做
-        // basic_password。
-        assert_eq!(get("OPENCODE_SERVER_USERNAME"), "Tester");
-        assert_eq!(get("OPENCODE_SERVER_PASSWORD"), "sb-pass");
-        assert_eq!(get(crate::config::keys::OPENCODE_PORT), "9464");
-        // 内存 auth 与 AccountConfig 同步更新。
+        assert_eq!(get("DEVICE_NAME"), "dev-a");
+        // 端口 / auth 不再持久化 —— 旧 key 必须缺席。
+        assert_eq!(get("OPENCODE_SERVER_USERNAME"), "");
+        assert_eq!(get("OPENCODE_SERVER_PASSWORD"), "");
+        assert_eq!(get("OC_SERVE_SYSTEM_PORT"), "");
+        assert_eq!(get("OC_SERVE_OPENCODE_PORT"), "");
+        // 内存 auth 从账户信息自动填充:name 优先做 basic_user,sb.password
+        // 做 basic_password。
         {
             let auth = app.auth.read().unwrap_or_else(|e| e.into_inner());
             assert_eq!(auth.basic_user, "Tester");
             assert_eq!(auth.basic_password, "sb-pass");
         }
+        // 内存 AccountConfig 同步更新。
         {
             let ac = app
                 .account_config
@@ -6846,7 +7024,19 @@ let left = ratatui::layout::Layout::default()
                 .unwrap_or_else(|e| e.into_inner());
             assert_eq!(ac.account_id, "tester");
             assert!(ac.is_configured());
+            assert_eq!(ac.device_name, "dev-a");
         }
+        // runtime_ports 按绑定设备热更新(oc-port 即时生效)。
+        {
+            let p = app
+                .runtime_ports
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(p.opencode_port, 20002, "oc-port 应取设备下发值");
+            assert!(p.device_found, "绑定设备在清单中应被确认");
+        }
+        // Header 用户名区同步热更新为 name 字段。
+        assert_eq!(app.user_display_name.as_deref(), Some("Tester"));
         // 从账户信息填充时记录"已保存密码长度"("sb-pass" = 7 位)。
         assert_eq!(app.auth_password_mask_len, 7);
 
@@ -6865,7 +7055,6 @@ let left = ratatui::layout::Layout::default()
         app.account_id_input = "tester".to_string();
         app.account_key_input = "test-key-0123456789abcdef".to_string();
         app.remote_path_input = "ftp://oc.isoops.com".to_string();
-        app.opencode_port_input = "9464".to_string();
         app.input_mode = InputMode::SettingsAccountId;
 
         let env_path = crate::config::unified_env_path();
@@ -6887,12 +7076,11 @@ let left = ratatui::layout::Layout::default()
         let _ = std::fs::remove_file(&env_path);
     }
 
-    /// 设置弹框分节标题:账户化后只有「账户登录」与「端口设置」两段。
+    /// 设置弹框分节标题:账户化 + 端口设备清单化后只剩「账户登录」一段。
     #[test]
-    fn settings_section_titles_use_account_and_port_labels() {
+    fn settings_section_titles_account_only() {
         let mut app = TuiApp::test_stub();
         app.first_setup_required = false;
-        app.opencode_port_input = "9464".to_string();
         app.input_mode = InputMode::Menu;
 
         let lines = app.build_settings_lines();
@@ -6909,12 +7097,9 @@ let left = ratatui::layout::Layout::default()
             all_text.iter().any(|t| t.contains("账户登录")),
             "expected '账户登录' title, got: {all_text:?}"
         );
-        assert!(
-            all_text.iter().any(|t| t.contains("端口设置")),
-            "expected '端口设置' title, got: {all_text:?}"
-        );
         // 旧标题 / 旧分区不应再出现。
         for banned in [
+            "端口设置",
             "认证设置",
             "SilverBullet",
             "Rathole 内网穿透设置",
@@ -7100,7 +7285,7 @@ let left = ratatui::layout::Layout::default()
     }
 
     /// Bug 1: 修复前 Padding::uniform(5) + card_h=5 → 内容区为负,卡片只显示边框
-    /// 看不到内容。修复后 Padding::uniform(1) + card_h=7 → 内容区 3 行,
+    /// 看不到内容。修复后 Padding::zero() + card_h=5 → 内容区 3 行,
     /// 项目名 Line 应出现在 TestBackend buffer 中（通过 emoji 确认）。
     #[test]
     fn render_card_stack_shows_card_content() {
@@ -7254,8 +7439,7 @@ impl TuiApp {
             confirm_choice: ConfirmChoice::Confirm,
             account_config: Arc::new(RwLock::new(TestAccountConfig::default())),
             program_started_at: chrono::Local::now(),
-            system_port_input: String::new(),
-            opencode_port_input: String::new(),
+            runtime_ports: Arc::new(RwLock::new(RuntimePorts::default())),
             account_id_input: String::new(),
             account_key_input: String::new(),
             remote_path_input: DEFAULT_REMOTE_PATH.to_string(),
@@ -7270,7 +7454,68 @@ impl TuiApp {
             device_picker: None,
             device_picker_trigger: Arc::new(Mutex::new(None)),
             cached_user_info: None,
+            user_display_name: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_branch_label_tests {
+    use super::TuiApp;
+    use crate::storage::RefreshReport;
+
+    /// 回归测试:验证 `refresh_branch_label` 在四种 `RefreshReport`
+    /// 形态下都返回正确分支标签。
+    ///
+    /// 这是 `submit_settings` 状态栏消息中 `refresh=✅ branch={...}`
+    /// 部分的拼接基础。覆盖 A(远端 seed 本地)/ B(merge)/ C(seed 远端)/
+    /// empty(双方都空) 四种分支,确保状态栏语义不会因为字段组合歧义
+    /// 而误导用户。
+    #[test]
+    fn refresh_branch_label_classifies_branches() {
+        // empty: 双方都空,merged = 0
+        let r = RefreshReport::default();
+        assert_eq!(
+            TuiApp::refresh_branch_label(&r),
+            "empty",
+            "双方都空应判为 empty 分支"
+        );
+        // A: 远端有,本地空,seeded_remote = false
+        let r = RefreshReport {
+            from_remote: 3,
+            from_local: 0,
+            merged: 3,
+            seeded_remote: false,
+        };
+        assert_eq!(
+            TuiApp::refresh_branch_label(&r),
+            "A(从远端 seed 本地)",
+            "远端有 + 本地空 → A"
+        );
+        // B: 双边都有
+        let r = RefreshReport {
+            from_remote: 2,
+            from_local: 3,
+            merged: 4,
+            seeded_remote: false,
+        };
+        assert_eq!(
+            TuiApp::refresh_branch_label(&r),
+            "B(merge)",
+            "双边都有 → B"
+        );
+        // C: 本地有,远端空,seeded_remote = true
+        let r = RefreshReport {
+            from_remote: 0,
+            from_local: 5,
+            merged: 5,
+            seeded_remote: true,
+        };
+        assert_eq!(
+            TuiApp::refresh_branch_label(&r),
+            "C(seed 远端)",
+            "本地有 + 远端空 + seeded → C"
+        );
     }
 }
 

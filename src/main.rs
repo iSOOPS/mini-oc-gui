@@ -16,8 +16,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use mini_oc_gui_serve::{
     account::{
-        AccountConfig, DevicePickerTrigger, DevicePickerTriggerSlot, fetch_user_info,
-        validate_user_info_integrity,
+        AccountConfig, DevicePickerTrigger, DevicePickerTriggerSlot, RemoteUserInfo,
+        fetch_user_info, validate_user_info_integrity,
     },
     auth::AuthConfig,
     error::AppError,
@@ -79,14 +79,20 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // 2. Optional: generate-and-exit.
+    // 2. 释放内嵌图标到 <exe_dir>/assets/(缺失才写,允许用户自定义;
+    //    失败仅告警 —— 图标缺失不影响服务可用性)。
+    if let Err(e) = mini_oc_gui_serve::icons::export_default() {
+        tracing::warn!("释放内嵌图标失败: {e}");
+    }
+
+    // 3. Optional: generate-and-exit.
     if cli.generate_auth {
         return generate_auth_and_exit(cli.auth_env.as_deref());
     }
 
-    // 3. 加载统一 env 文件,把 OC_SERVE_SYSTEM_PORT / OC_SERVE_OPENCODE_PORT 等 key
-    // 注入到进程环境（仅在进程 env 尚未设置时生效,from_filename_override
-    // 不会覆盖进程已有值）。
+    // 4. 清理统一 env 文件为**仅账户登录区块**（端口 / auth / rathole /
+    //    sb 等旧持久化行全部删除 —— 这些数据改为每次启动从
+    //    /api/user/info 内存构建），再经 dotenvy 注入进程环境。
     let unified_env_path = cli
         .auth_env
         .clone()
@@ -122,9 +128,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    // v3 清理：env 文件仅保留 `# --- account login ---` 区块。
+    if let Err(e) = mini_oc_gui_serve::account::prune_env_file_to_account_only(&unified_env_path)
+    {
+        tracing::warn!("清理 env 文件失败（继续运行）: {e}");
+    }
+
     let _ = dotenvy::from_filename_override(&unified_env_path);
 
-    // 4. 加载账户配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH）。
+    // 5. 加载账户配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH / DEVICE_NAME）。
     let account_config = AccountConfig::load();
 
     // --no-tui 模式无交互终端，未配置账户时提前退出。
@@ -135,18 +147,94 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 每次启动都验证 device-name：未绑定（DEVICE_NAME 为空）时，等下方
-    // fetch_user_info 后台任务拿到远端设备清单后，由 TUI 弹出设备选择。
-    if account_config.is_configured() && !account_config.has_bound_device() {
-        tracing::info!("本地未配置 DEVICE_NAME —— fetch_user_info 完成后将弹出设备选择");
-    }
+    // 6. 同步拉取用户信息（账户已配置时）：
+    //    端口（设备清单 port / oc-port）与 HTTP Basic 凭据都来自这次
+    //    拉取的结果，axum 监听端口必须在其完成后才能确定，因此不能
+    //    再放在后台任务里。拉取失败按业务规则降级：
+    //    - 端口回退默认 9465 / 9464；
+    //    - 设备绑定状态以本地 DEVICE_NAME 非空作乐观判定；
+    //    - auth 回退进程 env（用户显式 export 时仍可用）。
+    let account_config = Arc::new(std::sync::RwLock::new(account_config));
 
-    // 5. Resolve config from env + auth file.
-    // 系统监听端口(axum path-list 管理接口)。独立于 opencode 服务端口
-    // `OC_SERVE_OPENCODE_PORT`(默认 9464),避免两者同时监听同一端口,
-    // 导致「启动 serv」时报「端口被占用」。
-    let ports = mini_oc_gui_serve::config::PortsConfig::load();
-    let system_port = ports.system_port;
+    // 设备选择触发槽：拉取成功且本地未绑定设备时写入，TUI 主循环
+    // 每帧 render 轮询消费后弹出设备选择弹框。
+    let device_picker_trigger: DevicePickerTriggerSlot =
+        Arc::new(std::sync::Mutex::new(None));
+
+    let mut runtime_ports = mini_oc_gui_serve::config::RuntimePorts::default();
+    let mut fetched_info: Option<RemoteUserInfo> = None;
+
+    let configured = account_config
+        .read()
+        .map(|a| a.is_configured())
+        .unwrap_or(false);
+    if configured {
+        let account = account_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let fetch_fut = fetch_user_info(&account.remote_path, &account.account_key);
+        match tokio::time::timeout(std::time::Duration::from_secs(15), fetch_fut).await {
+            Ok(Ok(info)) => {
+                // 完整性验证 —— 不满足时仅记 warning 日志，不中断流程。
+                if let Err(problems) = validate_user_info_integrity(&info) {
+                    tracing::warn!(
+                        "用户信息完整性问题（设备绑定/sb 配置可能异常）: {problems}"
+                    );
+                }
+
+                // 端口：当前绑定设备的 port / oc-port。
+                runtime_ports = mini_oc_gui_serve::config::ports_from_user_info(
+                    &info,
+                    &account.device_name,
+                );
+
+                // 本地未绑定设备（DEVICE_NAME 为空）且远端清单非空 →
+                // 通知 TUI 弹出设备选择。
+                if account.device_name.trim().is_empty() && !info.devices.is_empty() {
+                    tracing::info!(
+                        "本地未绑定设备，已请求 TUI 弹出设备选择（{} 个设备）",
+                        info.devices.len()
+                    );
+                    *device_picker_trigger.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(DevicePickerTrigger {
+                            user_info: info.clone(),
+                            account_key: account.account_key.clone(),
+                            remote_path: account.remote_path.clone(),
+                            force: false,
+                        });
+                }
+                fetched_info = Some(info);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "获取用户信息失败（端口回退默认值，设备绑定按本地记录乐观判定）: {e}"
+                );
+                // fetch 失败的乐观降级：本地 DEVICE_NAME 非空即视为已绑定，
+                // 允许启动 serve（端口用默认值）。
+                runtime_ports.device_found = !account.device_name.trim().is_empty();
+            }
+            Err(_) => {
+                tracing::warn!("获取用户信息超时（15s）——端口回退默认值，设备绑定按本地记录乐观判定");
+                runtime_ports.device_found = !account.device_name.trim().is_empty();
+            }
+        }
+    }
+    let runtime_ports = Arc::new(std::sync::RwLock::new(runtime_ports));
+    tracing::info!(
+        "运行端口：系统={} opencode={} 绑定设备已确认={}",
+        runtime_ports.read().map(|p| p.system_port).unwrap_or_default(),
+        runtime_ports.read().map(|p| p.opencode_port).unwrap_or_default(),
+        runtime_ports.read().map(|p| p.device_found).unwrap_or_default(),
+    );
+
+    // 6. 其余目录配置。系统监听端口（axum）已从设备清单解析进
+    // `runtime_ports`，独立于 opencode 服务端口，避免两者同时监听
+    // 同一端口导致「启动 serv」时报「端口被占用」。
+    let system_port = runtime_ports
+        .read()
+        .map(|p| p.system_port)
+        .unwrap_or(mini_oc_gui_serve::config::DEFAULT_SYSTEM_PORT);
     let default_dir = std::env::var("OC_DEFAULT_DIR").unwrap_or_else(|_| {
         dirs::home_dir()
             .map(|p| p.join(".config/opencode").to_string_lossy().into_owned())
@@ -189,7 +277,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 4. Build storage.
+    // 7. Build storage.
     if let Some(parent) = path_list_file.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -201,103 +289,86 @@ async fn main() -> Result<()> {
     }
     let store = Arc::new(store);
 
-    // 运行时可共享的账户配置（TUI 设置面板热更新；后台任务读取
-    // has_bound_device 判定是否触发设备选择）。
-    let account_config = Arc::new(std::sync::RwLock::new(account_config));
-
-    // 设备选择触发槽：后台 fetch 任务发现本地未绑定设备（DEVICE_NAME 为空）
-    // 且远端设备清单非空时写入，TUI 主循环每帧 render 轮询消费后弹出
-    // 设备选择弹框。用共享 Option 槽而非 mpsc channel —— TUI 只需要
-    // "最新一条"信号，且渲染线程不便 await。
-    let device_picker_trigger: DevicePickerTriggerSlot =
-        Arc::new(std::sync::Mutex::new(None));
-
-    // 账户已配置时，启动后台任务调用 /api/user/info 获取最新信息；
-    // 成功后：完整性验证（仅记日志）→ 用返回的 sb 配置接管远端 path-list
-    // 同步（含一次性 legacy 远端路径迁移）→ 触发一次远端刷新 → 若本地
-    // 未绑定设备则向 TUI 发出设备选择信号。
-    if account_config
-        .read()
-        .map(|a| a.is_configured())
-        .unwrap_or(false)
-    {
-        let account = account_config
+    // 账户已配置且启动时同步拉取成功：把 sb 配置接管远端 path-list 同步
+    // （含一次性 legacy 迁移）放到后台 —— 网络往返不阻塞启动。
+    // 拉取结果另 clone 一份供下方 auth 映射（spawn 会 move 原值）。
+    let auth_info_for_mapping = fetched_info.clone();
+    if let Some(info) = fetched_info {
+        let device_name = account_config
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .map(|a| a.device_name.clone())
+            .unwrap_or_default();
         let store_for_user_info = store.clone();
-        let account_for_picker = account_config.clone();
-        let trigger_for_task = device_picker_trigger.clone();
         tokio::spawn(async move {
-            match fetch_user_info(&account.remote_path, &account.account_key).await {
-                Ok(info) => {
-                    // 1. 数据完整性验证 —— 不满足时仅记 warning 日志，不中断
-                    //    流程（sb / 设备清单部分可用时后续步骤仍可降级工作）。
-                    if let Err(problems) = validate_user_info_integrity(&info) {
-                        tracing::warn!(
-                            "用户信息完整性问题（设备绑定/sb 配置可能异常）: {problems}"
-                        );
-                    }
-
-                    // 2. 配置 RemoteClient + 一次性 legacy 迁移 + 远端刷新。
-                    //    v2 构造携带 user_id + device_name（未绑定时为空，
-                    //    路径段回退 OS 用户名），path-list 走新格式路径
-                    //    serv/opencode/{user_id}/{pctype}/{device_name}/path-list。
-                    tracing::info!("已获取用户信息: id={}, name={}", info.id, info.name);
-                    let remote = RemoteClient::from_user_info_v2(
-                        &info,
-                        account.device_name.clone(),
-                        info.sb.password.clone(),
-                    );
-                    store_for_user_info.with_remote(remote).await;
-                    // One-shot legacy-path migration (runs only if remote is
-                    // configured). Idempotent: no-op on later restarts.
-                    if let Err(e) = store_for_user_info.migrate_from_legacy_remote().await {
-                        tracing::warn!("legacy migration failed: {e}");
-                    }
-                    if let Err(e) = store_for_user_info.refresh().await {
-                        tracing::warn!("remote refresh failed: {e}");
-                    }
-
-                    // 3. 本地未绑定设备（DEVICE_NAME 为空）且远端清单非空 →
-                    //    通过共享槽通知 TUI 弹出设备选择。std Mutex 临界区内
-                    //    没有 await，不存在跨 await 持锁问题。
-                    let currently_bound = account_for_picker
-                        .read()
-                        .map(|a| a.has_bound_device())
-                        .unwrap_or(false);
-                    if !currently_bound && !info.devices.is_empty() {
-                        tracing::info!(
-                            "本地未绑定设备，已请求 TUI 弹出设备选择（{} 个设备）",
-                            info.devices.len()
-                        );
-                        *trigger_for_task.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(DevicePickerTrigger {
-                                user_info: info,
-                                account_key: account.account_key.clone(),
-                                remote_path: account.remote_path.clone(),
-                                force: false,
-                            });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("获取用户信息失败: {e}");
-                }
+            // v2 构造携带 user_id + 路径设备段：设备段取**绑定设备条目在
+            // 服务端记录的 `device-name`**（绑定时本机上报的 pcname 快照，
+            // 服务端读取也用它组路径），未绑定/缺失时回退本地 pcname。
+            // 注意不是 DEVICE_NAME（设备服务名）—— 那是绑定接口用的。
+            let path_segment =
+                mini_oc_gui_serve::account::remote_path_device_segment(&info, &device_name);
+            tracing::info!("已获取用户信息: id={}, name={}", info.id, info.name);
+            let remote = RemoteClient::from_user_info_v2(
+                &info,
+                path_segment,
+                info.sb.password.clone(),
+            );
+            store_for_user_info.with_remote(remote).await;
+            // One-shot legacy-path migration (runs only if remote is
+            // configured). Idempotent: no-op on later restarts.
+            if let Err(e) = store_for_user_info.migrate_from_legacy_remote().await {
+                tracing::warn!("legacy migration failed: {e}");
+            }
+            // One-shot v3 suffix migration: move the extension-less
+            // remote file (invisible to SilverBullet UI) to the
+            // `.md` path. Per-identity guard; network failures retry.
+            if let Err(e) = store_for_user_info.migrate_v3_suffix().await {
+                tracing::warn!("v3 suffix migration failed: {e}");
+            }
+            if let Err(e) = store_for_user_info.refresh().await {
+                tracing::warn!("remote refresh failed: {e}");
             }
         });
     }
 
-    // 5. Auth.
-    let auth = if let Some(path) = cli.auth_env.as_ref() {
+    // 8. Auth：env 文件不再持久化凭据 —— 拉取成功时从用户信息映射
+    //    （与设置面板同一映射：basic_user = user.name → user.id → 账户ID；
+    //    basic_password = sb.password → 账户密钥）；否则回退进程 env。
+    let mut auth = if let Some(path) = cli.auth_env.as_ref() {
         AuthConfig::from_env_with_file(path)
     } else {
         AuthConfig::from_env()
     }
     .context("auth init")?;
+    if let Some(info) = auth_info_for_mapping.as_ref() {
+        let account_id = account_config
+            .read()
+            .map(|a| a.account_id.clone())
+            .unwrap_or_default();
+        let basic_user = {
+            let display = info.display_name();
+            if !display.is_empty() {
+                display
+            } else if !info.id.trim().is_empty() {
+                info.id.trim().to_string()
+            } else {
+                account_id
+            }
+        };
+        let basic_password = if info.sb.password.is_empty() {
+            account_config
+                .read()
+                .map(|a| a.account_key.clone())
+                .unwrap_or_default()
+        } else {
+            info.sb.password.clone()
+        };
+        auth.basic_user = basic_user;
+        auth.basic_password = basic_password;
+    }
     // 运行时可变：首次配置填写后可立即热更新，无需重启。
     let auth = Arc::new(std::sync::RwLock::new(auth));
 
-    // 6. Supervisor + state.
+    // 9. Supervisor + state.
     let supervisor = ServeSupervisor::new();
     let state = AppState {
         store: store.clone(),
@@ -306,7 +377,7 @@ async fn main() -> Result<()> {
         supervisor: Arc::new(supervisor.clone()),
     };
 
-    // 7. --no-tui 模式无交互终端，未配置凭据时提前安全退出，避免无认证监听。
+    // 10. --no-tui 模式无交互终端，未配置凭据时提前安全退出，避免无认证监听。
     if cli.no_tui && !auth.read().map(|a| a.is_configured()).unwrap_or(false) {
         anyhow::bail!(
             "未配置认证凭据（OPENCODE_SERVER_USERNAME/PASSWORD）。\
@@ -314,7 +385,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 8. Optionally bind the HTTP listener.
+    // 11. Optionally bind the HTTP listener.
     let server_handle = if !cli.no_http {
         let app = router(state);
         let listener = TcpListener::bind(format!("0.0.0.0:{system_port}"))
@@ -344,7 +415,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 9. Run TUI (blocks until user quits).
+    // 12. Run TUI (blocks until user quits).
+    // Header 用户名区：启动拉取的 `name` 字段（trim 后非空才算）。
+    let startup_user_name = auth_info_for_mapping
+        .as_ref()
+        .map(|info| info.name.trim().to_string())
+        .filter(|n| !n.is_empty());
     let terminal = ratatui::init();
     TuiApp::new(
         supervisor.clone(),
@@ -353,6 +429,8 @@ async fn main() -> Result<()> {
         store.clone(),
         account_config.clone(),
         device_picker_trigger,
+        runtime_ports,
+        startup_user_name,
     )
     .run(terminal)
     .await

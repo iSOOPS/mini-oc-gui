@@ -43,7 +43,7 @@ pub struct RemoteClient {
     pub user: Option<String>,
     /// 账户用户ID（`/api/user/info` 返回的 `info.id`）。
     /// 非空时远端 path-list 走新格式路径
-    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`。
+    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list.md`。
     pub user_id: Option<String>,
     /// 已绑定的设备名称（`account_config.device_name`）。
     /// 新格式路径段；为空时回退 OS 用户名（`pcname()`）。
@@ -99,7 +99,7 @@ impl RemoteClient {
 
     /// Construct a client carrying the new-format path identity
     /// (`info.id` + `device_name`), so the remote path-list syncs to
-    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`.
+    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list.md`.
     ///
     /// `device_name` 为空（账户尚未绑定设备）时，路径段由
     /// [`RemotePaths`] 构造阶段回退到 OS 用户名（`pcname()`）。
@@ -109,8 +109,17 @@ impl RemoteClient {
         device_name: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        Self::with_credentials(info.sb.base_url.clone(), info.sb.username.clone(), password.into())
-            .with_user_and_device(info.id.clone(), device_name.into())
+        let c = Self::with_credentials(info.sb.base_url.clone(), info.sb.username.clone(), password.into())
+            .with_user_and_device(info.id.clone(), device_name.into());
+        tracing::info!(
+            target: "sync",
+            "RemoteClient built: base_url={} user_id={:?} device_name={:?} sb_user={:?}",
+            c.base_url,
+            c.user_id.as_deref().unwrap_or(""),
+            c.device_name.as_deref().unwrap_or(""),
+            c.user.as_deref().unwrap_or(""),
+        );
+        c
     }
 
     /// Attach the new-format path identity (`user_id` + `device_name`).
@@ -140,7 +149,13 @@ impl RemoteClient {
         let user_id = self.user_id.as_deref().unwrap_or("");
         if user_id.is_empty() {
             // Legacy layout: no user_id → key off sb username + pcname.
-            return Ok(RemotePaths::new(self.user.as_deref().unwrap_or("unknown")));
+            let rp = RemotePaths::new(self.user.as_deref().unwrap_or("unknown"));
+            tracing::info!(
+                target: "sync",
+                "remote path resolved (legacy): {}",
+                rp.path_list_with_slash()
+            );
+            return Ok(rp);
         }
         // New layout: device_name is REQUIRED. No silent fallback to pcname().
         let device = self
@@ -155,7 +170,13 @@ impl RemoteClient {
                      username — caller must select a bound device first"
                 ))
             })?;
-        Ok(RemotePaths::with_user_info(user_id, device.to_string()))
+        let rp = RemotePaths::with_user_info(user_id, device.to_string());
+        tracing::info!(
+            target: "sync",
+            "remote path resolved (new format): {}",
+            rp.path_list_with_slash()
+        );
+        Ok(rp)
     }
 
     /// Derive the SilverBullet cookie name from a base URL.
@@ -222,6 +243,19 @@ impl RemoteClient {
         let first = self.send_req(reqwest::Method::PUT, &url, Some(owned.clone())).await;
         let (status, _body) = self
             .handle(first, reqwest::Method::PUT, &url, Some(owned))
+            .await?;
+        Ok(status)
+    }
+
+    /// DELETE `/.fs/<path>`. Returns status. Status `0` = network error.
+    ///
+    /// # Errors
+    /// Same convention as [`get`](Self::get).
+    pub async fn delete(&mut self, path: &str) -> Result<Status, AppError> {
+        let url = self.url_for(path);
+        let first = self.send_req(reqwest::Method::DELETE, &url, None).await;
+        let (status, _body) = self
+            .handle(first, reqwest::Method::DELETE, &url, None)
             .await?;
         Ok(status)
     }
@@ -391,7 +425,7 @@ mod tests {
         let rp = c.remote_paths().expect("device_name is non-empty");
         assert_eq!(
             rp.path_list_new_format(),
-            format!("serv/opencode/u-123/{}/my-dev-pc/path-list", crate::storage::paths::pctype())
+            format!("serv/opencode/u-123/{}/my-dev-pc/path-list.md", crate::storage::paths::pctype())
         );
     }
 

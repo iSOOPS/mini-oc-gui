@@ -8,7 +8,7 @@
 //!   支持域名或 IP:port
 //! - device_name: 已绑定的设备服务名（首次绑定后写入，缺失时需重新触发设备选择）
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -66,11 +66,31 @@ pub struct RemoteUserInfo {
 pub struct RemoteDevice {
     /// 设备服务名（^[a-z0-9-]{1,64}$），用于绑定接口
     pub name: String,
-    /// 服务端口（1-65535）
+    /// 系统端口（1-65535）：本程序 axum 监听端口（服务端按设备下发）
     pub port: u16,
+    /// opencode serve 端口（服务端按设备下发，字段名 `oc-port`）。
+    ///
+    /// 老数据可能缺失 —— 缺失时由
+    /// [`crate::config::ports_from_user_info`] 回退默认端口并告警。
+    #[serde(rename = "oc-port", default)]
+    pub oc_port: Option<u16>,
     /// 是否已绑定（用户信息中含此字段）
     #[serde(default)]
     pub bound: bool,
+    /// 设备所属平台（"macos" / "windows" / "linux" / "unknown"）。
+    /// 用于在客户端过滤跨平台绑定：本机平台与设备 pctype 不一致的设备
+    /// 在弹窗中灰显且不可选中。
+    /// 缺失或未知平台（如老数据）按 "unknown" 处理 —— 视为兼容，避免
+    /// 服务端字段缺失时把全部设备都判为不可绑定。
+    #[serde(default)]
+    pub pctype: String,
+    /// 设备真实主机名（服务端 `device-name` 字段，可选）。
+    /// UI 中作为辅助信息展示；不存在时为 None。
+    #[serde(rename = "device-name", default)]
+    pub device_name: Option<String>,
+    /// 设备备注（服务端 `desc` 字段，可选）。
+    #[serde(default)]
+    pub desc: Option<String>,
 }
 
 /// 用户信息中的 silverbullet 配置
@@ -353,6 +373,77 @@ pub(crate) fn normalize_remote_path(s: &str) -> String {
 // 不会抹掉文件里其他 section 的配置（取代旧 `config::write_persisted_env`
 // 的整文件覆盖式写入）。
 
+/// 把 env 文件清理为**仅含** `# --- account login ---` 区块。
+///
+/// 端口 / auth / rathole / sb 等配置不再本地持久化（改为每次启动从
+/// `/api/user/info` 内存构建），因此启动时调用本函数删除遗留旧行：
+/// - 保留 `ACCOUNT_ID` / `ACCOUNT_KEY` / `REMOTE_PATH` / `DEVICE_NAME`
+///   四个 key 的值（含首条 `# --- account login ---` 注释语义）；
+/// - 其余所有行（旧的 `OPENCODE_SERVER_*` / `OC_SERVE_*_PORT` /
+///   `RATHOLE_*` / `SB_*` 与其他注释）全部丢弃。
+///
+/// 文件不存在或本来只剩账户内容时是 no-op。Unix 下（重）写后 chmod 600。
+///
+/// # Errors
+/// 返回 [`AppError::Io`] 当文件读写失败。
+pub fn prune_env_file_to_account_only(path: &Path) -> Result<(), AppError> {
+    let cfg = AccountConfig::read_env_file(path);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        // 文件不存在：无需清理。
+        return Ok(());
+    };
+
+    // 只有当文件里存在账户四键以外的有效行时才需要重写。
+    let account_keys = [
+        keys::ACCOUNT_ID,
+        keys::ACCOUNT_KEY,
+        keys::REMOTE_PATH,
+        keys::DEVICE_NAME,
+    ];
+    let has_foreign_lines = contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        match trimmed.split_once('=') {
+            Some((k, _)) => !account_keys.contains(&k.trim()),
+            None => true,
+        }
+    });
+    if !has_foreign_lines {
+        return Ok(());
+    }
+
+    let mut body = String::from("# --- account login ---\n");
+    for (key, value) in [
+        (keys::ACCOUNT_ID, cfg.account_id.trim()),
+        (keys::ACCOUNT_KEY, cfg.account_key.trim()),
+        (keys::REMOTE_PATH, cfg.remote_path.trim()),
+        (keys::DEVICE_NAME, cfg.device_name.trim()),
+    ] {
+        if !value.is_empty() {
+            body.push_str(&format!("{key}={value}\n"));
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(AppError::Io)?;
+    }
+    std::fs::write(path, body).map_err(AppError::Io)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    tracing::info!(
+        "已清理 env 文件为仅账户登录区块：{}",
+        path.display()
+    );
+    Ok(())
+}
+
 /// 读取 env 文件并解析为 (key, value) 对（忽略空行与注释）。
 ///
 /// 文件不存在或不可读时返回空列表，不报错。
@@ -459,6 +550,38 @@ pub fn upsert_env_keys(path: &Path, updates: &[(String, Option<String>)]) -> Res
     Ok(())
 }
 
+/// 解析远端 path-list 路径的**设备段**（`serv/opencode/{uid}/{pctype}/{段}/path-list.md`）。
+///
+/// 权威值是**服务端设备条目的 `device-name` 字段**——它是绑定时本机上报的
+/// `pcname()` 快照，服务端（mini-oc-web）读取 path-list 时也用它组路径，
+/// 因此客户端推送必须用同一个值，两边才不会错位。
+///
+/// 解析顺序：
+/// 1. 设备清单中 `name == bound_device` 的条目，其 `device-name` 字段非空 → 用它；
+/// 2. 其余情况（未绑定 / 清单无此条目 / 字段缺失）→ 回退本地
+///    [`crate::storage::paths::pcname`]（与绑定时上报值同源，保证
+///    「先同步、后绑定」场景下路径已就位）。
+///
+/// 注意：**设备服务名（`devices[].name`，如 `service-mac`）不是路径段** ——
+/// 它只用于绑定接口与 rathole 服务名。
+#[must_use]
+pub fn remote_path_device_segment(info: &RemoteUserInfo, bound_device: &str) -> String {
+    let wanted = bound_device.trim();
+    if !wanted.is_empty() {
+        if let Some(dev) = info.devices.iter().find(|d| d.name == wanted) {
+            if let Some(dn) = dev
+                .device_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return dn.to_string();
+            }
+        }
+    }
+    crate::storage::paths::pcname()
+}
+
 /// `/api/user/info` 的请求体。
 #[derive(serde::Serialize)]
 struct LoginBody<'a> {
@@ -525,9 +648,20 @@ pub async fn fetch_user_info(
         )));
     }
 
-    resp.json::<RemoteUserInfo>()
+    let info = resp
+        .json::<RemoteUserInfo>()
         .await
-        .map_err(|e| AppError::Internal(format!("user/info response parse error: {e}")))
+        .map_err(|e| AppError::Internal(format!("user/info response parse error: {e}")))?;
+    tracing::info!(
+        target: "sync",
+        "fetch_user_info ok: base_url={} user_id={:?} name={:?} sb_present={} (sb_user={:?} sb_pw_set={}) devices={}",
+        base, info.id, info.name,
+        !info.sb.base_url.is_empty(),
+        info.sb.username,
+        !info.sb.password.is_empty(),
+        info.devices.len()
+    );
+    Ok(info)
 }
 
 /// `/api/device-bind` 请求体
@@ -1047,7 +1181,11 @@ mod tests {
         let devices = vec![RemoteDevice {
             name: "pc-1".to_string(),
             port: 9464,
+            oc_port: None,
             bound: false,
+            pctype: "macos".to_string(),
+            device_name: None,
+            desc: None,
         }];
         let empty_base = sample_info(sample_sb("", "u", "p"), devices.clone());
         assert_eq!(
@@ -1082,7 +1220,11 @@ mod tests {
             vec![RemoteDevice {
                 name: "pc-1".to_string(),
                 port: 9464,
+                oc_port: None,
                 bound: true,
+                pctype: "macos".to_string(),
+                device_name: None,
+                desc: None,
             }],
         );
         assert_eq!(validate_user_info_integrity(&info), Ok(()));
@@ -1105,6 +1247,144 @@ mod tests {
         assert_eq!(dev.name, "pc-1");
         assert_eq!(dev.port, 9464);
         assert!(!dev.bound);
+    }
+
+    #[test]
+    fn remote_device_parses_oc_port_kebab_case() {
+        let dev: RemoteDevice =
+            serde_json::from_str(r#"{"name":"pc-1","port":9465,"oc-port":18800}"#).unwrap();
+        assert_eq!(dev.port, 9465);
+        assert_eq!(dev.oc_port, Some(18800));
+    }
+
+    #[test]
+    fn remote_device_oc_port_missing_defaults_to_none() {
+        let dev: RemoteDevice = serde_json::from_str(r#"{"name":"pc-1","port":9465}"#).unwrap();
+        assert_eq!(dev.oc_port, None);
+    }
+
+    #[test]
+    fn prune_env_file_strips_foreign_keys_and_keeps_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "# --- account login ---\n\
+             ACCOUNT_ID=u1\n\
+             ACCOUNT_KEY=k1\n\
+             REMOTE_PATH=https://oc.example.com\n\
+             DEVICE_NAME=pc-1\n\
+             OPENCODE_SERVER_USERNAME=legacy-user\n\
+             OPENCODE_SERVER_PASSWORD=legacy-pass\n\
+             OC_SERVE_SYSTEM_PORT=9465\n\
+             OC_SERVE_OPENCODE_PORT=9464\n\
+             RATHOLE_HOST=legacy-host\n\
+             # other comment\n",
+        )
+        .unwrap();
+
+        prune_env_file_to_account_only(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("# --- account login ---"));
+        assert!(contents.contains("ACCOUNT_ID=u1"));
+        assert!(contents.contains("ACCOUNT_KEY=k1"));
+        assert!(contents.contains("REMOTE_PATH=https://oc.example.com"));
+        assert!(contents.contains("DEVICE_NAME=pc-1"));
+        assert!(!contents.contains("OPENCODE_SERVER"));
+        assert!(!contents.contains("OC_SERVE"));
+        assert!(!contents.contains("RATHOLE"));
+        assert!(!contents.contains("other comment"));
+    }
+
+    #[test]
+    fn prune_env_file_is_noop_when_only_account_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let original = "# --- account login ---\nACCOUNT_ID=u1\nACCOUNT_KEY=k1\n";
+        std::fs::write(&path, original).unwrap();
+
+        prune_env_file_to_account_only(&path).unwrap();
+
+        // 内容原样保留（未发生重写）。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn prune_env_file_missing_file_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(prune_env_file_to_account_only(&dir.path().join("nope.env")).is_ok());
+    }
+
+    // --- remote_path_device_segment（远端路径设备段解析） ---
+
+    fn seg_info(devices: Vec<RemoteDevice>) -> RemoteUserInfo {
+        RemoteUserInfo {
+            id: "u-1".to_string(),
+            name: "alice".to_string(),
+            key: "k".to_string(),
+            cloud_ip: None,
+            last_used_at: None,
+            devices,
+            sb: RemoteSbConfig {
+                base_url: "https://md".to_string(),
+                username: "u".to_string(),
+                password: "p".to_string(),
+            },
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn device_segment_prefers_server_recorded_device_name() {
+        // 绑定设备的 `device-name` 字段（服务端记录）优先 —— 即便与本地
+        // pcname 不同也跟随服务端（服务端组路径用它）。
+        let info = seg_info(vec![RemoteDevice {
+            name: "service-mac".to_string(),
+            port: 9465,
+            oc_port: None,
+            bound: true,
+            pctype: "macos".to_string(),
+            device_name: Some("recorded-pc".to_string()),
+            desc: None,
+        }]);
+        assert_eq!(
+            remote_path_device_segment(&info, "service-mac"),
+            "recorded-pc"
+        );
+    }
+
+    #[test]
+    fn device_segment_falls_back_to_pcname_when_missing() {
+        // 未绑定 / 清单无此条目 / device-name 缺失 → 本地 pcname()。
+        let info = seg_info(vec![RemoteDevice {
+            name: "service-mac".to_string(),
+            port: 9465,
+            oc_port: None,
+            bound: false,
+            pctype: "macos".to_string(),
+            device_name: None,
+            desc: None,
+        }]);
+        let expected = crate::storage::paths::pcname();
+        // 绑定了但服务端没记录 device-name。
+        assert_eq!(remote_path_device_segment(&info, "service-mac"), expected);
+        // 未绑定（空串）。
+        assert_eq!(remote_path_device_segment(&info, ""), expected);
+        // 清单中不存在的设备。
+        assert_eq!(remote_path_device_segment(&info, "ghost"), expected);
+        // device-name 为空白串同样回退。
+        let blank = seg_info(vec![RemoteDevice {
+            name: "service-mac".to_string(),
+            port: 9465,
+            oc_port: None,
+            bound: true,
+            pctype: "macos".to_string(),
+            device_name: Some("   ".to_string()),
+            desc: None,
+        }]);
+        assert_eq!(remote_path_device_segment(&blank, "service-mac"), expected);
     }
 
     // --- bind_device（仅请求体序列化；不引入 mock server 依赖） ---

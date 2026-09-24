@@ -37,6 +37,10 @@ pub struct PathListStore {
     /// first time [`migrate_from_legacy_remote`](Self::migrate_from_legacy_remote)
     /// runs so the migration runs exactly once per process lifetime.
     migration_done: Arc<RwLock<bool>>,
+    /// Per-identity one-shot guard for the v3 suffix migration, keyed by
+    /// the new-format remote path (user_id/pctype/device_name). Network
+    /// failures do not mark the identity so the migration retries later.
+    v3_suffix_migrated: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl std::fmt::Debug for PathListStore {
@@ -58,12 +62,20 @@ impl PathListStore {
             remote: Arc::new(RwLock::new(None)),
             inner: Arc::new(RwLock::new(Vec::new())),
             migration_done: Arc::new(RwLock::new(false)),
+            v3_suffix_migrated: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
     /// Attach a remote (e.g. SilverBullet) for PUT/GET sync.
     pub async fn with_remote(&self, remote: RemoteClient) {
+        let summary = format!(
+            "base_url={} user_id={} device={}",
+            remote.base_url,
+            remote.user_id.as_deref().unwrap_or(""),
+            remote.device_name.as_deref().unwrap_or("")
+        );
         *self.remote.write().await = Some(remote);
+        tracing::info!(target: "sync", "store.with_remote ok: {}", summary);
     }
 
     /// Build the [`RemotePaths`] the store currently syncs to.
@@ -159,6 +171,12 @@ impl PathListStore {
         };
         let remote_count = remote_arr.len();
 
+        tracing::info!(
+            target: "sync",
+            "refresh decision: local={} remote={} status={}",
+            local_count, remote_count, status
+        );
+
         // "Not ok" branches.
         if status == 0 {
             tracing::warn!("remote unreachable; using local cache");
@@ -193,6 +211,11 @@ impl PathListStore {
 
         // A: remote non-empty + local empty
         if remote_count > 0 && local_count == 0 {
+            tracing::info!(
+                target: "sync",
+                "refresh: A branch — seeding local from remote ({} entries)",
+                remote_count
+            );
             let from_remote = json_arr_to_entries(&remote_value)?;
             let sorted = sort_desc(from_remote);
             self.cache.write(&sorted).await?;
@@ -207,6 +230,11 @@ impl PathListStore {
 
         // C: remote empty + local non-empty → seed remote
         if remote_count == 0 && local_count > 0 {
+            tracing::info!(
+                target: "sync",
+                "refresh: C branch — seeding remote from local ({} entries)",
+                local_count
+            );
             let sorted = sort_desc(local);
             self.cache.write(&sorted).await?;
             *self.inner.write().await = sorted.clone();
@@ -226,6 +254,11 @@ impl PathListStore {
         }
 
         // B: both non-empty → merge
+        tracing::info!(
+            target: "sync",
+            "refresh: B branch — merging remote ({}) + local ({})",
+            remote_count, local_count
+        );
         let remote_entries = json_arr_to_entries(&remote_value)?;
         let merged = merge_entries(remote_entries, local);
         self.cache.write(&merged).await?;
@@ -576,8 +609,20 @@ impl PathListStore {
 
     async fn async_push(&self, entries: Vec<PathEntry>) {
         let Some(remote_arc) = self.remote.read().await.clone() else {
+            tracing::warn!(target: "sync", "async_push skipped: no remote configured (local-only mode)");
             return;
         };
+        let target_path = remote_arc
+            .remote_paths()
+            .ok()
+            .map(|p| p.path_list_with_slash())
+            .unwrap_or_else(|| "<unknown>".into());
+        tracing::info!(
+            target: "sync",
+            "async_push start: {} entries to {} (thread spawned)",
+            entries.len(),
+            target_path
+        );
         tokio::spawn(async move {
             let body = match serde_json::to_string_pretty(&entries) {
                 Ok(b) => b,
@@ -605,7 +650,15 @@ impl PathListStore {
             };
             for attempt in 1..=3 {
                 match remote.put(&path, &body).await {
-                    Ok(200..=299) => return,
+                    Ok(200..=299) => {
+                        tracing::info!(
+                            target: "sync",
+                            "async_push done: {} entries pushed to {}",
+                            entries.len(),
+                            path
+                        );
+                        return;
+                    }
                     Ok(status) if status == 0 => {
                         tracing::warn!("push attempt {}: network unreachable", attempt);
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -732,6 +785,106 @@ impl PathListStore {
             migrated_entries: merged_count,
         })
     }
+
+    /// One-shot migration from the v3 extension-less remote path to the
+    /// `.md`-suffixed path.
+    ///
+    /// v3 曾把新格式远端路径写成无 `.md` 后缀的
+    /// `serv/opencode/{user_id}/{pctype}/{device_name}/path-list`。文件
+    /// 在远端真实存在且 `.fs` API 可读写，但 SilverBullet 只索引
+    /// `.md` page，导致该文件在所有服务商界面不可见。本迁移把旧路径
+    /// 数据搬运到带 `.md` 的现行路径：
+    ///
+    /// 1. GET 旧无后缀路径 — 404/空/非法 JSON → 无事可做（标记完成）；
+    ///    网络失败 → 不标记，下次重试。
+    /// 2. 三方合并：旧无后缀数据 + 现 `.md` 路径数据 + 本地 cache
+    ///    （[`merge_entries`] 语义），写回本地。
+    /// 3. [`push_blocking`] 推送合并结果到 `.md` 路径（3 次重试）；
+    ///    成功后 DELETE 旧无后缀文件（失败仅告警，残留无害——迁移
+    ///    幂等性由 guard 保证）。
+    ///
+    /// 幂等：按远端身份（新格式路径）记忆已处理过的迁移，同身份只跑
+    /// 一次；身份变化（换绑设备/换账号）会触发对应身份的迁移。
+    ///
+    /// # Errors
+    /// Returns [`AppError::Internal`] when the remote push fails after
+    /// retries (local cache is already updated at that point; the identity
+    /// is NOT marked so the migration retries on the next call), or when
+    /// the remote identity is incomplete (see [`RemoteClient::remote_paths`]).
+    pub async fn migrate_v3_suffix(&self) -> Result<MigrationReport, AppError> {
+        let Some(remote_arc) = self.remote.read().await.clone() else {
+            tracing::info!(target: "sync", "v3 suffix migration skipped: no remote configured");
+            return Ok(MigrationReport::default());
+        };
+        let mut remote = remote_arc;
+
+        let paths = remote.remote_paths()?;
+        let identity = paths.path_list();
+        if self.v3_suffix_migrated.read().await.contains(&identity) {
+            return Ok(MigrationReport::default());
+        }
+
+        let old_path = format!("/{}", paths.path_list_new_format_nosuffix());
+        let (status, body) = match remote.get(&old_path).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(target: "sync", "v3 suffix migration: GET {old_path} errored: {e}; will retry later");
+                return Ok(MigrationReport::default());
+            }
+        };
+        if status == 0 {
+            tracing::warn!(target: "sync", "v3 suffix migration: GET {old_path} unreachable; will retry later");
+            return Ok(MigrationReport::default());
+        }
+        if status != 200 {
+            tracing::info!(target: "sync", "v3 suffix migration: GET {old_path} → HTTP {status}; nothing to migrate");
+            self.v3_suffix_migrated.write().await.insert(identity);
+            return Ok(MigrationReport::default());
+        }
+        let old_entries = match serde_json::from_str::<Value>(&body) {
+            Ok(v) => json_arr_to_entries(&v).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(target: "sync", "v3 suffix migration: body at {old_path} is not JSON: {e}");
+                self.v3_suffix_migrated.write().await.insert(identity);
+                return Ok(MigrationReport::default());
+            }
+        };
+        if old_entries.is_empty() {
+            tracing::info!(target: "sync", "v3 suffix migration: {old_path} holds an empty array; nothing to migrate");
+            self.v3_suffix_migrated.write().await.insert(identity);
+            return Ok(MigrationReport::default());
+        }
+
+        let new_path = paths.path_list_with_slash();
+        let md_entries = match remote.get(&new_path).await {
+            Ok((200, b)) => serde_json::from_str::<Value>(&b)
+                .ok()
+                .and_then(|v| json_arr_to_entries(&v).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let local = self.cache.read().await.unwrap_or_default();
+        let merged = merge_entries(merge_entries(old_entries, md_entries), local);
+
+        self.cache.write(&merged).await?;
+        *self.inner.write().await = merged.clone();
+
+        if let Err(e) = self.push_blocking(merged.clone()).await {
+            tracing::error!(target: "sync", "v3 suffix migration: publishing to {new_path} failed: {e}; will retry later");
+            return Err(e);
+        }
+        match remote.delete(&old_path).await {
+            Ok(200..=299) => {}
+            Ok(s) => tracing::warn!(target: "sync", "v3 suffix migration: DELETE {old_path} returned HTTP {s}; stale extension-less file left behind (harmless, invisible to UI)"),
+            Err(e) => tracing::warn!(target: "sync", "v3 suffix migration: DELETE {old_path} errored: {e}; stale extension-less file left behind (harmless, invisible to UI)"),
+        }
+
+        self.v3_suffix_migrated.write().await.insert(identity);
+        tracing::info!(target: "sync", "v3 suffix migration: moved data from {old_path} to {new_path} ({} entries)", merged.len());
+        Ok(MigrationReport {
+            migrated_entries: merged.len(),
+        })
+    }
 }
 
 /// Outcome of [`PathListStore::migrate_from_legacy_remote`].
@@ -782,6 +935,7 @@ fn json_arr_to_entries(v: &Value) -> Result<Vec<PathEntry>, AppError> {
 /// `createdAt` = min, `lastOpenedAt` = max.
 #[must_use]
 pub fn merge_entries(mut remote: Vec<PathEntry>, mut local: Vec<PathEntry>) -> Vec<PathEntry> {
+    let paths_before = remote.len() + local.len();
     remote.append(&mut local);
     let mut by_path: std::collections::BTreeMap<String, PathEntry> =
         std::collections::BTreeMap::new();
@@ -817,6 +971,16 @@ pub fn merge_entries(mut remote: Vec<PathEntry>, mut local: Vec<PathEntry>) -> V
         }
     }
     let mut out: Vec<PathEntry> = by_path.into_values().collect();
+    let paths_after = out.len();
+    let sections_total: usize = out.iter().map(|e| e.sections.len()).sum();
+    tracing::info!(
+        target: "sync",
+        "merge: paths deduped {} -> {} ({} added); sections_total={}",
+        paths_before,
+        paths_after,
+        paths_before.saturating_sub(paths_after),
+        sections_total
+    );
     out.sort_by(|a, b| {
         let ka = format_dt(a.last_opened_at);
         let kb = format_dt(b.last_opened_at);
@@ -1212,5 +1376,191 @@ mod tests {
             matches!(err, crate::error::AppError::Internal(_)),
             "应返回 AppError::Internal,实际: {err:?}"
         );
+    }
+
+    // --- migrate_v3_suffix（本地 axum mock 模拟 SilverBullet .fs） ---
+
+    mod v3_suffix_mock {
+        use super::*;
+        use axum::extract::{Request, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::Router;
+        use std::collections::HashMap;
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        pub struct FsMock {
+            responses: HashMap<(String, String), (u16, String)>,
+            pub log: Vec<(String, String)>,
+        }
+
+        async fn handler(State(state): State<Arc<Mutex<FsMock>>>, req: Request) -> impl IntoResponse {
+            let method = req.method().to_string();
+            let path = req.uri().path().to_string();
+            let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+            let mut st = state.lock().unwrap();
+            st.log.push((method.clone(), path.clone()));
+            let (code, body) = st
+                .responses
+                .get(&(method, path))
+                .cloned()
+                .unwrap_or((404, String::new()));
+            (StatusCode::from_u16(code).expect("valid code"), body)
+        }
+
+        pub async fn spawn(
+            responses: HashMap<(String, String), (u16, String)>,
+        ) -> (SocketAddr, Arc<Mutex<FsMock>>) {
+            let shared = Arc::new(Mutex::new(FsMock { responses, log: Vec::new() }));
+            let app = Router::new().fallback(handler).with_state(shared.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("mock server");
+            });
+            (addr, shared)
+        }
+
+        pub fn user_info_fixture(id: &str, base_url: &str) -> crate::account::RemoteUserInfo {
+            serde_json::from_str(&format!(
+                r#"{{"id":"{id}","name":"T","key":"k","sb":{{"base_url":"{base_url}","username":"u","password":"p"}}}}"#
+            ))
+            .expect("fixture")
+        }
+
+        pub fn entry_json(path: &str) -> String {
+            format!(r#"{{"path":"{path}","sections":[]}}"#)
+        }
+    }
+
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn migrate_v3_suffix_moves_nosuffix_data_to_md_path() {
+        use v3_suffix_mock::{entry_json, spawn, user_info_fixture};
+
+        let pt = crate::storage::paths::pctype();
+        let old = format!("/.fs/serv/opencode/u-1/{pt}/dev-a/path-list");
+        let md = format!("/.fs/serv/opencode/u-1/{pt}/dev-a/path-list.md");
+        let mut responses = HashMap::new();
+        responses.insert(
+            ("GET".to_string(), old.clone()),
+            (200u16, format!("[{},{}]", entry_json("/p1"), entry_json("/p2"))),
+        );
+        responses.insert(("PUT".to_string(), md.clone()), (200u16, String::new()));
+        responses.insert(
+            ("DELETE".to_string(), old.clone()),
+            (200u16, String::new()),
+        );
+
+        let (addr, mock) = spawn(responses).await;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache.clone());
+        let remote =
+            RemoteClient::from_user_info_v2(&user_info_fixture("u-1", &format!("http://{addr}")), "dev-a", "pw");
+        store.with_remote(remote).await;
+
+        let report = store.migrate_v3_suffix().await.expect("migrate");
+        assert_eq!(report.migrated_entries, 2, "应搬运旧路径全部条目");
+
+        let on_disk = cache.read().await.expect("read cache");
+        assert_eq!(on_disk.len(), 2, "合并结果应写入本地 cache");
+
+        let log = mock.lock().unwrap().log.clone();
+        assert!(
+            log.contains(&("PUT".to_string(), md.clone())),
+            "必须 PUT 到 .md 路径: {log:?}"
+        );
+        assert!(
+            log.contains(&("DELETE".to_string(), old.clone())),
+            "必须 DELETE 旧无后缀路径: {log:?}"
+        );
+
+        let count_before = mock.lock().unwrap().log.len();
+        let report2 = store.migrate_v3_suffix().await.expect("migrate 2");
+        assert_eq!(report2.migrated_entries, 0, "同身份第二次调用为 no-op");
+        assert_eq!(
+            mock.lock().unwrap().log.len(),
+            count_before,
+            "幂等：不得产生任何新远端请求"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_v3_suffix_three_way_merges_with_md_and_local() {
+        use v3_suffix_mock::{entry_json, spawn, user_info_fixture};
+
+        let pt = crate::storage::paths::pctype();
+        let old = format!("/.fs/serv/opencode/u-9/{pt}/dev-b/path-list");
+        let md = format!("/.fs/serv/opencode/u-9/{pt}/dev-b/path-list.md");
+        let mut responses = HashMap::new();
+        responses.insert(
+            ("GET".to_string(), old.clone()),
+            (200u16, format!("[{}]", entry_json("/old-only"))),
+        );
+        responses.insert(
+            ("GET".to_string(), md.clone()),
+            (200u16, format!("[{}]", entry_json("/md-only"))),
+        );
+        responses.insert(("PUT".to_string(), md.clone()), (200u16, String::new()));
+        responses.insert(("DELETE".to_string(), old.clone()), (200u16, String::new()));
+
+        let (addr, mock) = spawn(responses).await;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache.clone());
+        let remote =
+            RemoteClient::from_user_info_v2(&user_info_fixture("u-9", &format!("http://{addr}")), "dev-b", "pw");
+        store.with_remote(remote).await;
+
+        store.upsert_path("/local-only").await.expect("seed local");
+
+        let report = store.migrate_v3_suffix().await.expect("migrate");
+        assert_eq!(report.migrated_entries, 3, "三方合并：旧 + .md + 本地");
+
+        let on_disk = cache.read().await.expect("read cache");
+        let paths: Vec<&str> = on_disk.iter().map(|e| e.path.as_str()).collect();
+        for p in ["/old-only", "/md-only", "/local-only"] {
+            assert!(paths.contains(&p), "缺 {p}: {paths:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migrate_v3_suffix_noop_when_old_path_missing() {
+        use v3_suffix_mock::{entry_json, spawn, user_info_fixture};
+
+        let (addr, mock) = spawn(HashMap::new()).await;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache.clone());
+        let remote =
+            RemoteClient::from_user_info_v2(&user_info_fixture("u-2", &format!("http://{addr}")), "dev-c", "pw");
+        store.with_remote(remote).await;
+
+        let report = store.migrate_v3_suffix().await.expect("migrate");
+        assert_eq!(report.migrated_entries, 0);
+
+        let log = mock.lock().unwrap().log.clone();
+        assert!(
+            log.iter().all(|(m, _)| m == "GET"),
+            "旧路径 404 时不得有 PUT/DELETE: {log:?}"
+        );
+        assert!(
+            cache.read().await.expect("read").is_empty(),
+            "本地 cache 不得被改动"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_v3_suffix_noop_without_remote() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cache = FileCache::new(dir.path().join("path-list.md"));
+        let store = PathListStore::new(cache);
+
+        let report = store.migrate_v3_suffix().await.expect("migrate");
+        assert_eq!(report.migrated_entries, 0);
     }
 }

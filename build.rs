@@ -1,10 +1,16 @@
-//! Build script: 把 `rathole/` bundle 复制到 `target/<profile>/rathole/`。
+//! Build script:
+//! 1. 把 `rathole/` bundle 复制到 `target/<profile>/rathole/`。
+//! 2. 从 `assets/icon.svg` 生成图标:伴随文件 `target/<profile>/assets/`,
+//!    嵌入字节 `$OUT_DIR/assets/`(见 src/icons.rs),macOS 另生成
+//!    `MiniOC.app`,Windows 把 ico 烧进 PE 资源。
 //!
 //! 这样 `cargo build --release` 后,产物自包含:
 //! ```text
 //! target/release/
-//! ├── mini-oc-gui-serve          # 可执行程序
+//! ├── mini-oc-gui-serve          # 可执行程序(内嵌三平台图标字节)
 //! ├── path-list-actor             # 可执行程序
+//! ├── MiniOC.app/                 # <- macOS: 带图标的 bundle(macOS 才有)
+//! ├── assets/                     # <- 图标伴随文件(png/ico/icns)
 //! └── rathole/                    # <- 本脚本生成
 //!     ├── bin/<os>/rathole        #   当前平台的 rathole 二进制
 //!     └── settings/                #   rathole 配置目录
@@ -22,6 +28,14 @@
 //! 通过 `cargo:rerun-if-changed` 监听源端 `rathole/bin/` 与
 //! `rathole/settings/` 下的文件变化;只在源端变动时执行复制,避免
 //! 每次增量编译都白白 fs copy 大文件。
+
+//! To change the icon, edit `assets/icon.svg` and rebuild — all platform artifacts
+//! regenerate from this single source, and a content hash forces rustc to
+//! re-embed the new bytes into the binary.
+//!
+//! allow: SIZE_OK — cargo build script 单文件约定;三段职责(rathole bundle /
+//! icon pipeline / .app 生成)以分节注释隔离,拆分需 #[path] mod 技巧反而
+//! 增加构建复杂度。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -107,6 +121,19 @@ fn main() {
     if let Err(e) = generate_icons(&manifest_dir, &profile_dir) {
         eprintln!("cargo:warning=icon pipeline: {e}");
     }
+
+    // 同步图标到 $OUT_DIR/assets/(缺失补空占位),供 include_bytes! 嵌入;
+    // 再以内容 hash 走 rustc-env —— 图标字节变化时强制 rustc 重编译,
+    // 避免「OUT_DIR 路径不变、fingerprint 不变、旧图标被缓存」的坑。
+    sync_icons_to_out_dir(&profile_dir, &out_dir);
+    println!(
+        "cargo:rustc-env=MINI_OC_GUI_ICON_HASH={:016x}",
+        out_icons_hash(&out_dir)
+    );
+
+    // macOS: 自动生成带图标的 MiniOC.app(Finder/Dock 直接可用)
+    #[cfg(target_os = "macos")]
+    build_app_bundle(&profile_dir);
 
     // Windows: embed icon.ico into the final .exe
     #[cfg(windows)]
@@ -363,6 +390,7 @@ fn generate_icons(manifest_dir: &Path, profile_dir: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Windows: embed icon.ico into the final .exe
 #[cfg(windows)]
 fn embed_windows_icon(profile_dir: &Path) {
     let ico = profile_dir.join("assets").join(PROFILE_ICON_ICO);
@@ -384,5 +412,132 @@ fn embed_windows_icon(profile_dir: &Path) {
     res.set_icon(ico_str);
     if let Err(e) = res.compile() {
         eprintln!("cargo:warning=winresource compile failed: {e}");
+    }
+}
+
+// ============================================================================
+// Embedded-icon support
+// The runtime crate include_bytes!'s icons from $OUT_DIR/assets/, so the
+// single executable carries icon.png/ico/icns and re-extracts them next to
+// itself at startup (see src/icons.rs). Two invariants keep that compile-time
+// embed sound:
+//   1. $OUT_DIR/assets/icon.{png,ico,icns} must ALWAYS exist — even when the
+//      SVG pipeline degraded to a warning, an empty placeholder is written so
+//      include_bytes! never breaks the build.
+//   2. cargo:rustc-env carries a content hash — OUT_DIR paths are stable, so
+//      without the hash rustc would keep serving stale icon bytes from cache.
+// ============================================================================
+
+/// 把 `profile_dir/assets/` 下的图标同步到 `out_dir/assets/`;
+/// 源缺失(生成降级)时写空占位,保证 include_bytes! 永远可编译。
+fn sync_icons_to_out_dir(profile_dir: &Path, out_dir: &Path) {
+    let src_assets = profile_dir.join("assets");
+    let dst_assets = out_dir.join("assets");
+    if let Err(e) = fs::create_dir_all(&dst_assets) {
+        eprintln!(
+            "cargo:warning=mkdir {} failed: {e}; embedded icons unavailable",
+            dst_assets.display()
+        );
+        return;
+    }
+    for name in [PROFILE_ICON_PNG, PROFILE_ICON_ICO, PROFILE_ICON_ICNS] {
+        let dst = dst_assets.join(name);
+        match fs::read(src_assets.join(name)) {
+            Ok(bytes) => {
+                if let Err(e) = fs::write(&dst, bytes) {
+                    eprintln!("cargo:warning=write {} failed: {e}", dst.display());
+                }
+            }
+            Err(_) => {
+                if !dst.exists() {
+                    if let Err(e) = fs::write(&dst, []) {
+                        eprintln!("cargo:warning=write placeholder {} failed: {e}", dst.display());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// $OUT_DIR/assets/ 三图标内容的 FNV-1a 风格聚合 hash(DefaultHasher 即可,
+/// 只用于指纹比较,不要求跨版本稳定)。
+fn out_icons_hash(out_dir: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut h = DefaultHasher::new();
+    for name in [PROFILE_ICON_ICO, PROFILE_ICON_ICNS, PROFILE_ICON_PNG] {
+        h.write(name.as_bytes());
+        if let Ok(bytes) = fs::read(out_dir.join("assets").join(name)) {
+            h.write(&bytes);
+        }
+    }
+    h.finish()
+}
+
+// ============================================================================
+// macOS .app bundle
+// cargo 在 build.rs 之后才链接出可执行文件,所以这里不能拷贝 exe —— 用相对
+// 符号链接 MacOS/mini-oc-gui-serve -> ../../../mini-oc-gui-serve 指向同级产物。
+// 符号链接创建时不要求目标存在,链接完成后 .app 立即整体可用;重建 exe 也不
+// 失效(目标路径不变)。分发时用 ditto / zip -y 保留链接,或先 cp -L 解引用。
+// ============================================================================
+
+const APP_BUNDLE_NAME: &str = "MiniOC.app";
+const APP_EXE_NAME: &str = "mini-oc-gui-serve";
+
+/// macOS: 在 `<profile>/MiniOC.app` 生成最小可用 bundle
+/// (Info.plist + PkgInfo + Resources/icon.icns + MacOS 符号链接)。
+#[cfg(target_os = "macos")]
+fn build_app_bundle(profile_dir: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let contents = profile_dir.join(APP_BUNDLE_NAME).join("Contents");
+    let macos_dir = contents.join("MacOS");
+    let resources_dir = contents.join("Resources");
+    if let Err(e) = fs::create_dir_all(&macos_dir).and_then(|()| fs::create_dir_all(&resources_dir)) {
+        eprintln!("cargo:warning=create .app dirs failed: {e}");
+        return;
+    }
+
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleName</key><string>MiniOC</string>
+  <key>CFBundleDisplayName</key><string>MiniOC</string>
+  <key>CFBundleExecutable</key><string>{APP_EXE_NAME}</string>
+  <key>CFBundleIdentifier</key><string>local.mini-oc-gui-serve</string>
+  <key>CFBundleVersion</key><string>{version}</string>
+  <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+</dict>
+</plist>
+"#
+    );
+    if let Err(e) = fs::write(contents.join("Info.plist"), plist) {
+        eprintln!("cargo:warning=write Info.plist failed: {e}");
+    }
+    if let Err(e) = fs::write(contents.join("PkgInfo"), b"APPL????") {
+        eprintln!("cargo:warning=write PkgInfo failed: {e}");
+    }
+
+    let icns_src = profile_dir.join("assets").join(PROFILE_ICON_ICNS);
+    if icns_src.is_file() {
+        if let Err(e) = fs::copy(&icns_src, resources_dir.join(PROFILE_ICON_ICNS)) {
+            eprintln!("cargo:warning=copy icon.icns into .app failed: {e}");
+        }
+    }
+
+    let exe_link = macos_dir.join(APP_EXE_NAME);
+    // 用 symlink_metadata 判断链接自身:构建早期目标 exe 尚未链接出来,
+    // exists()(跟随链接)恒为 false,只有 symlink_metadata 能识别已建链接。
+    if fs::symlink_metadata(&exe_link).is_ok() {
+        let _ = fs::remove_file(&exe_link);
+    }
+    if let Err(e) = symlink("../../../mini-oc-gui-serve", &exe_link) {
+        eprintln!("cargo:warning=symlink .app executable failed: {e}");
     }
 }
