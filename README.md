@@ -16,7 +16,6 @@ for the HTTP layer and **ratatui** for the terminal UI.
 - 🎨 App icon: "MOT" wordmark — rounded slate-grey badge with a bold green
   logotype. Auto-baked into Windows PE resources and shipped as macOS
   `.icns` / Linux `.png`. SVG source in `assets/icon.svg`.
-- **`path-list-actor` (binary)** — CLI for managing the path-list index (`add` / `list` / `remove`)
 
 ## Architecture
 
@@ -24,8 +23,6 @@ for the HTTP layer and **ratatui** for the terminal UI.
 src/
 ├── main.rs              # entrypoint: launch TUI + Axum concurrently
 ├── lib.rs               # crate root
-├── bin/
-│   └── path-list-actor.rs
 ├── domain/              # Project, Session, PathEntry, AppError
 ├── storage/             # path-list.md atomic R/W + SilverBullet sync
 ├── auth/                # HTTP Basic + Cookie session middleware
@@ -63,11 +60,6 @@ cargo build --release
 
 # 2b. Or run ONLY the HTTP server (no TUI) — works in any terminal
 ./target/release/mini-oc-gui-serve --no-tui
-
-# Manage path-list directly
-./target/release/path-list-actor add /abs/path/to/project
-./target/release/path-list-actor list
-./target/release/path-list-actor remove /abs/path/to/project
 
 # Override config via env (env vars take precedence over .oc-serve-auth.env)
 ATTACH_URL=http://<remote-host>:<oc-port> ./target/release/mini-oc-gui-serve
@@ -243,13 +235,8 @@ tier-1 target.
   `fontdb_mut().load_system_fonts()` before parsing — an empty fontdb makes
   usvg silently drop all text. Fonts missing from the host (e.g. Orbitron)
   fall back to the system sans-serif, so text-based marks may render with
-  slightly different metrics per machine; prefer geometry for
-  pixel-critical marks.
-- The icon bytes are additionally embedded in the executable
-  (`include_bytes!` via `$OUT_DIR`, see `src/icons.rs`): on startup the binary
-  re-extracts any missing icon file to `<exe_dir>/assets/`. Shipping the bare
-  executable is therefore enough; existing files are never overwritten, so a
-  custom icon survives upgrades.
+  slightly different metrics per machine; the current mark uses pure
+  geometry (rects/paths) for pixel-exact, machine-independent centering.
 
 ### 8. Graceful legacy migration
 
@@ -265,6 +252,9 @@ The MOT mark is generated at build time from [`assets/icon.svg`](assets/icon.svg
 - `target/<profile>/assets/icon.png` — generic 512×512 PNG (Linux desktop, docs)
 - `target/<profile>/assets/icon.ico` — Windows multi-resolution, embedded into `.exe` via `winresource`
 - `target/<profile>/assets/icon.icns` — macOS multi-resolution
+
+The Windows executable carries its icon through PE resources (no external
+files needed at runtime); macOS icons ship inside the `.app` bundle.
 
 ### macOS `.app` bundle (auto-generated)
 
@@ -282,8 +272,7 @@ cp -L target/release/MiniOC.app/Contents/MacOS/mini-oc-gui-serve /tmp/exe-copy \
 ```
 
 To change the icon, edit `assets/icon.svg` and rebuild — all platform artifacts
-regenerate from this single source, and a content hash forces rustc to
-re-embed the new bytes into the binary.
+regenerate from this single source.
 
 ## License
 

@@ -1,14 +1,13 @@
 //! Build script:
 //! 1. 把 `rathole/` bundle 复制到 `target/<profile>/rathole/`。
-//! 2. 从 `assets/icon.svg` 生成图标:伴随文件 `target/<profile>/assets/`,
-//!    嵌入字节 `$OUT_DIR/assets/`(见 src/icons.rs),macOS 另生成
-//!    `MiniOC.app`,Windows 把 ico 烧进 PE 资源。
+//! 2. 从 `assets/icon.svg` 生成图标伴随文件 `target/<profile>/assets/`
+//!    (png/ico/icns),macOS 另生成 `MiniOC.app`,Windows 把 ico 烧进
+//!    PE 资源。
 //!
 //! 这样 `cargo build --release` 后,产物自包含:
 //! ```text
 //! target/release/
-//! ├── mini-oc-gui-serve          # 可执行程序(内嵌三平台图标字节)
-//! ├── path-list-actor             # 可执行程序
+//! ├── mini-oc-gui-serve          # 可执行程序(Windows: PE 资源已含图标)
 //! ├── MiniOC.app/                 # <- macOS: 带图标的 bundle(macOS 才有)
 //! ├── assets/                     # <- 图标伴随文件(png/ico/icns)
 //! └── rathole/                    # <- 本脚本生成
@@ -121,15 +120,6 @@ fn main() {
     if let Err(e) = generate_icons(&manifest_dir, &profile_dir) {
         eprintln!("cargo:warning=icon pipeline: {e}");
     }
-
-    // 同步图标到 $OUT_DIR/assets/(缺失补空占位),供 include_bytes! 嵌入;
-    // 再以内容 hash 走 rustc-env —— 图标字节变化时强制 rustc 重编译,
-    // 避免「OUT_DIR 路径不变、fingerprint 不变、旧图标被缓存」的坑。
-    sync_icons_to_out_dir(&profile_dir, &out_dir);
-    println!(
-        "cargo:rustc-env=MINI_OC_GUI_ICON_HASH={:016x}",
-        out_icons_hash(&out_dir)
-    );
 
     // macOS: 自动生成带图标的 MiniOC.app(Finder/Dock 直接可用)
     #[cfg(target_os = "macos")]
@@ -422,65 +412,6 @@ fn embed_windows_icon(profile_dir: &Path) {
     if let Err(e) = res.compile() {
         eprintln!("cargo:warning=winresource compile failed: {e}");
     }
-}
-
-// ============================================================================
-// Embedded-icon support
-// The runtime crate include_bytes!'s icons from $OUT_DIR/assets/, so the
-// single executable carries icon.png/ico/icns and re-extracts them next to
-// itself at startup (see src/icons.rs). Two invariants keep that compile-time
-// embed sound:
-//   1. $OUT_DIR/assets/icon.{png,ico,icns} must ALWAYS exist — even when the
-//      SVG pipeline degraded to a warning, an empty placeholder is written so
-//      include_bytes! never breaks the build.
-//   2. cargo:rustc-env carries a content hash — OUT_DIR paths are stable, so
-//      without the hash rustc would keep serving stale icon bytes from cache.
-// ============================================================================
-
-/// 把 `profile_dir/assets/` 下的图标同步到 `out_dir/assets/`;
-/// 源缺失(生成降级)时写空占位,保证 include_bytes! 永远可编译。
-fn sync_icons_to_out_dir(profile_dir: &Path, out_dir: &Path) {
-    let src_assets = profile_dir.join("assets");
-    let dst_assets = out_dir.join("assets");
-    if let Err(e) = fs::create_dir_all(&dst_assets) {
-        eprintln!(
-            "cargo:warning=mkdir {} failed: {e}; embedded icons unavailable",
-            dst_assets.display()
-        );
-        return;
-    }
-    for name in [PROFILE_ICON_PNG, PROFILE_ICON_ICO, PROFILE_ICON_ICNS] {
-        let dst = dst_assets.join(name);
-        match fs::read(src_assets.join(name)) {
-            Ok(bytes) => {
-                if let Err(e) = fs::write(&dst, bytes) {
-                    eprintln!("cargo:warning=write {} failed: {e}", dst.display());
-                }
-            }
-            Err(_) => {
-                if !dst.exists() {
-                    if let Err(e) = fs::write(&dst, []) {
-                        eprintln!("cargo:warning=write placeholder {} failed: {e}", dst.display());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// $OUT_DIR/assets/ 三图标内容的 FNV-1a 风格聚合 hash(DefaultHasher 即可,
-/// 只用于指纹比较,不要求跨版本稳定)。
-fn out_icons_hash(out_dir: &Path) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
-    let mut h = DefaultHasher::new();
-    for name in [PROFILE_ICON_ICO, PROFILE_ICON_ICNS, PROFILE_ICON_PNG] {
-        h.write(name.as_bytes());
-        if let Ok(bytes) = fs::read(out_dir.join("assets").join(name)) {
-            h.write(&bytes);
-        }
-    }
-    h.finish()
 }
 
 // ============================================================================

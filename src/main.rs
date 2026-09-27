@@ -79,18 +79,12 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // 2. 释放内嵌图标到 <exe_dir>/assets/(缺失才写,允许用户自定义;
-    //    失败仅告警 —— 图标缺失不影响服务可用性)。
-    if let Err(e) = mini_oc_gui_serve::icons::export_default() {
-        tracing::warn!("释放内嵌图标失败: {e}");
-    }
-
-    // 3. Optional: generate-and-exit.
+    // 2. Optional: generate-and-exit.
     if cli.generate_auth {
         return generate_auth_and_exit(cli.auth_env.as_deref());
     }
 
-    // 4. 清理统一 env 文件为**仅账户登录区块**（端口 / auth / rathole /
+    // 3. 清理统一 env 文件为**仅账户登录区块**（端口 / auth / rathole /
     //    sb 等旧持久化行全部删除 —— 这些数据改为每次启动从
     //    /api/user/info 内存构建），再经 dotenvy 注入进程环境。
     let unified_env_path = cli
@@ -136,7 +130,7 @@ async fn main() -> Result<()> {
 
     let _ = dotenvy::from_filename_override(&unified_env_path);
 
-    // 5. 加载账户配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH / DEVICE_NAME）。
+    // 4. 加载账户配置（ACCOUNT_ID / ACCOUNT_KEY / REMOTE_PATH / DEVICE_NAME）。
     let account_config = AccountConfig::load();
 
     // --no-tui 模式无交互终端，未配置账户时提前退出。
@@ -147,7 +141,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 6. 同步拉取用户信息（账户已配置时）：
+    // 5. 同步拉取用户信息（账户已配置时）：
     //    端口（设备清单 port / oc-port）与 HTTP Basic 凭据都来自这次
     //    拉取的结果，axum 监听端口必须在其完成后才能确定，因此不能
     //    再放在后台任务里。拉取失败按业务规则降级：
@@ -437,7 +431,7 @@ async fn main() -> Result<()> {
     .map_err(|e| AppError::Internal(e.to_string()))?;
     ratatui::restore();
 
-    // 10. Tear down.
+    // 13. Tear down.
     let _ = supervisor.shutdown().await;
     if let Some(h) = server_handle {
         h.abort();

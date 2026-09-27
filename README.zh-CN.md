@@ -16,7 +16,6 @@
 - 🎨 应用图标："MOT" 字标 — 石板灰圆角底板 + 绿色粗体字标。构建时自动烧入
   Windows PE 资源，并以 macOS `.icns` / Linux `.png` 形式产出。SVG 源文件
   在 `assets/icon.svg`。
-- **`path-list-actor`（二进制）** — 管理 path-list 索引的 CLI（`add` / `list` / `remove`）
 
 ## 架构
 
@@ -24,8 +23,6 @@
 src/
 ├── main.rs              # 入口：并发启动 TUI 与 Axum
 ├── lib.rs               # crate 根
-├── bin/
-│   └── path-list-actor.rs
 ├── domain/              # Project、Session、PathEntry、AppError
 ├── storage/             # path-list.md 原子读写 + SilverBullet 同步
 ├── auth/                # HTTP Basic + Cookie 会话中间件
@@ -61,11 +58,6 @@ cargo build --release
 
 # 2b. 或只运行 HTTP 服务器（无 TUI）— 任意终端可用
 ./target/release/mini-oc-gui-serve --no-tui
-
-# 直接管理 path-list
-./target/release/path-list-actor add /abs/path/to/project
-./target/release/path-list-actor list
-./target/release/path-list-actor remove /abs/path/to/project
 
 # 通过环境变量覆盖配置（env 优先级高于 .oc-serve-auth.env）
 ATTACH_URL=http://<remote-host>:<oc-port> ./target/release/mini-oc-gui-serve
@@ -218,10 +210,8 @@ OC_DEFAULT_DIR=/path/to/project ./target/release/mini-oc-gui-serve
 - `<text>` 元素依赖系统字体：build.rs 必须在解析前调用
   `fontdb_mut().load_system_fonts()` — 空 fontdb 会让 usvg 静默丢弃所有文本。
   宿主机缺失的字体（如 Orbitron）回退到系统 sans-serif，因此文本字标在不同
-  机器上的字形度量可能略有差异；对像素敏感的标记优先用几何图形。
-- 图标字节额外内嵌进可执行文件（经 `$OUT_DIR` 的 `include_bytes!`，见
-  `src/icons.rs`）：每次启动把缺失的图标文件重新释放到 `<exe_dir>/assets/`。
-  因此只分发裸可执行文件就够了；已有文件永不覆盖，自定义图标可跨升级存活。
+  机器上的字形度量可能略有差异；当前字标使用纯几何图形（rect/path），
+  像素级精确居中且跨机器完全一致。
 
 ### 8. 优雅的遗留迁移
 
@@ -237,6 +227,9 @@ MOT 标记在构建期由 [`assets/icon.svg`](assets/icon.svg) 生成：
 - `target/<profile>/assets/icon.ico` — Windows 多分辨率，经 winresource 嵌入 `.exe`
 - `target/<profile>/assets/icon.icns` — macOS 多分辨率
 
+Windows 可执行文件的图标通过 PE 资源承载（运行时无需外部文件）；macOS 图标
+内置于 `.app` 包。
+
 ### macOS `.app` 包（自动生成）
 
 `cargo build --release` 还会产出 `target/release/MiniOC.app` — Finder / Dock
@@ -251,7 +244,7 @@ cp -L target/release/MiniOC.app/Contents/MacOS/mini-oc-gui-serve /tmp/exe-copy \
 ```
 
 更换图标只需编辑 `assets/icon.svg` 并重新构建 — 所有平台产物从这个单一源
-重新生成，内容哈希会强制 rustc 把新字节重新嵌入二进制。
+重新生成。
 
 ## 许可证
 

@@ -1,6 +1,6 @@
 //! Local file-backed cache for the `path-list.md` JSON array.
 //!
-//! Mirrors `path-list-actor.py::load_index` / `save_index`:
+//! Ported from the legacy Python actor's `load_index` / `save_index`:
 //! - Atomic write via tempfile + `fs::rename` (POSIX-atomic on the same fs).
 //! - On read failure, restore from `.bak`; failing that, error out.
 

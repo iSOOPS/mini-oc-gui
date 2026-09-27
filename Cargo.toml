@@ -13,10 +13,6 @@ build = "build.rs"
 name = "mini-oc-gui-serve"
 path = "src/main.rs"
 
-[[bin]]
-name = "path-list-actor"
-path = "src/bin/path-list-actor.rs"
-
 [lib]
 name = "mini_oc_gui_serve"
 path = "src/lib.rs"

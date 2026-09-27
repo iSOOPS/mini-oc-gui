@@ -4,15 +4,28 @@
      height="128"
      viewBox="0 0 128 128">
 
-  <rect x="0" y="0" width="128" height="128"
-        rx="12px" ry="12px"
-        fill="#1f2937"/>
+  <!-- ============================================================
+       MOT 字标 — 几何字形(非 <text>)
+       原因: resvg 对 dominant-baseline 支持不完整,且 Orbitron 缺失时
+       各机器回退字体不同 → 文字既难精确居中也不跨机一致。
+       几何坐标精确保证: 字标区域 x∈[11,117] y∈[46,82], 双向中心 64。
+       ============================================================ -->
 
-  <text x="64" y="64"
-        font-family="'Orbitron', sans-serif"
-        font-size="49px"
-        font-weight="800"
-        fill="#42d01b"
-        text-anchor="middle"
-        dominant-baseline="middle">MOT</text>
+  <!-- 底板: 圆角矩形 -->
+  <rect x="0" y="0" width="128" height="128" rx="12" ry="12" fill="#1f2937"/>
+
+  <!-- M: 左竖 + 右竖 + 中缝 V (区域 x∈[11,41]) -->
+  <g fill="#42d01b">
+    <rect x="11" y="46" width="7" height="36"/>
+    <rect x="34" y="46" width="7" height="36"/>
+    <path d="M 18 46 L 26 70 L 34 46 L 34 59 L 26 82 L 18 59 Z"/>
+
+    <!-- O: 描边圆角矩形 (视觉外沿 x∈[49,81] y∈[46,82]) -->
+    <rect x="53" y="50" width="24" height="28" rx="5"
+          fill="none" stroke="#42d01b" stroke-width="8"/>
+
+    <!-- T: 顶横 + 中竖 (区域 x∈[89,117]) -->
+    <rect x="89" y="46" width="28" height="8"/>
+    <rect x="99" y="54" width="8" height="28"/>
+  </g>
 </svg>

@@ -1,7 +1,7 @@
 //! `PathEntry` — a single record in `path-list.md` — and `PathValidator`,
 //! which enforces the same rejection rules as the original shell scripts
-//! (`oc-serve-tui-actuator.sh::validate_local_path` and
-//! `path-list-actor.py::validate_path`).
+//! (`oc-serve-tui-actuator.sh::validate_local_path` and the legacy
+//! Python actor's `validate_path`).
 
 use chrono::{DateTime, FixedOffset};
 use path_clean::PathClean;
