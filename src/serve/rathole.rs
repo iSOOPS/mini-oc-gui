@@ -13,7 +13,8 @@
 //! │   ├── windows-x86_64/rathole.exe # Windows x86_64
 //! │   ├── linux-x86_64/rathole      # Linux x86_64 (gnu)
 //! │   └── linux-aarch64/rathole     # Linux aarch64 (gnu)
-//! └── settings/*.toml               # tunnel configs (33-/40-/41- prefix)
+//! └── settings/*.toml               # tunnel configs (global.toml, generated
+//!                                    # by the settings panel at runtime)
 //! ```
 //!
 //! # Resolved location

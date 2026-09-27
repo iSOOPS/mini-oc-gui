@@ -8,7 +8,7 @@
 //! Cookie name 不再来自静态配置（`AuthConfig::sb_cookie_name` 字段与
 //! `SB_COOKIE_NAME` 环境变量已删除）。SilverBullet 的 cookie name 在登录后
 //! 由 [`crate::storage::remote::RemoteClient`] 根据 sb `base_url` 动态派生
-//! （`https://md.isoops.com` → `auth_md_isoops_com`，见
+//! （`https://md.example.com` → `auth_md_example_com`，见
 //! `RemoteClient::derive_cookie_name`）。因此本 extractor 按 SilverBullet
 //! 的 `auth_*` 命名约定扫描 Cookie 头，接受任何携带未过期 JWT 的 `auth_*`
 //! cookie。完整认证流：用户登录 → `/api/user/info` → 拿到 sb config →
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn parses_single_cookie() {
         assert_eq!(
-            cookie_value("auth_md_isoops_com=abc.def.ghi", "auth_md_isoops_com"),
+            cookie_value("auth_md_example_com=abc.def.ghi", "auth_md_example_com"),
             Some("abc.def.ghi".to_string())
         );
     }
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn parses_among_multiple_cookies() {
         assert_eq!(
-            cookie_value("a=1; auth_md_isoops_com=TOKEN; b=2", "auth_md_isoops_com"),
+            cookie_value("a=1; auth_md_example_com=TOKEN; b=2", "auth_md_example_com"),
             Some("TOKEN".to_string())
         );
     }
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn extracts_first_auth_prefixed_jwt() {
         assert_eq!(
-            extract_session_token("a=1; auth_md_isoops_com=abc.def.ghi; b=2"),
+            extract_session_token("a=1; auth_md_example_com=abc.def.ghi; b=2"),
             Some("abc.def.ghi".to_string())
         );
     }
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn skips_non_jwt_auth_cookie() {
-        assert_eq!(extract_session_token("auth_md_isoops_com=not-a-jwt"), None);
+        assert_eq!(extract_session_token("auth_md_example_com=not-a-jwt"), None);
     }
 
     #[test]

@@ -22,3 +22,6 @@ assets/icon.icns
 
 # Playwright MCP tool artifacts (browser automation test sessions)
 .playwright-mcp/
+
+# Code intelligence index (codegraph tool cache)
+.codegraph/

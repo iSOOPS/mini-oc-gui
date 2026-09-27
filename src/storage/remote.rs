@@ -32,9 +32,9 @@ pub type Status = u16;
 /// Remote file store client (SilverBullet-shaped).
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
-    /// Base URL, e.g. `https://md.isoops.com`.
+    /// Base URL, e.g. `https://md.example.com`.
     pub base_url: String,
-    /// Cookie name to send and look for in responses (e.g. `auth_md_isoops_com`).
+    /// Cookie name to send and look for in responses (e.g. `auth_md_example_com`).
     pub cookie_name: String,
     /// Current cookie value (`<name>=<jwt>`). `None` triggers auto-login.
     pub cookie: Option<String>,
@@ -181,7 +181,7 @@ impl RemoteClient {
 
     /// Derive the SilverBullet cookie name from a base URL.
     ///
-    /// Example: `https://md.isoops.com` → `auth_md_isoops_com`.
+    /// Example: `https://md.example.com` → `auth_md_example_com`.
     #[must_use]
     pub fn derive_cookie_name(base_url: &str) -> String {
         derive_cookie_name(base_url)
@@ -380,8 +380,8 @@ mod tests {
     #[test]
     fn cookie_name_from_url() {
         assert_eq!(
-            RemoteClient::derive_cookie_name("https://md.isoops.com"),
-            "auth_md_isoops_com"
+            RemoteClient::derive_cookie_name("https://md.example.com"),
+            "auth_md_example_com"
         );
         assert_eq!(
             RemoteClient::derive_cookie_name("http://127.0.0.1:8080"),
@@ -395,15 +395,15 @@ mod tests {
 
     #[test]
     fn url_for_normalizes() {
-        let c = RemoteClient::new("https://md.isoops.com");
+        let c = RemoteClient::new("https://md.example.com");
         let path = RemotePaths::new("").path_list_with_slash();
         assert_eq!(
             c.url_for(&path),
-            format!("https://md.isoops.com/.fs{}", RemotePaths::new("").path_list_with_slash())
+            format!("https://md.example.com/.fs{}", RemotePaths::new("").path_list_with_slash())
         );
         assert_eq!(
             c.url_for(path.trim_start_matches('/')),
-            format!("https://md.isoops.com/.fs{}", RemotePaths::new("").path_list_with_slash())
+            format!("https://md.example.com/.fs{}", RemotePaths::new("").path_list_with_slash())
         );
     }
 

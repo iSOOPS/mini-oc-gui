@@ -611,7 +611,7 @@ pub struct TuiApp {
     account_id_input: String,
     /// 设置：账户密钥输入缓冲（打开面板时留空，掩码回显已保存位数）。
     account_key_input: String,
-    /// 设置：账户中心远程路径输入缓冲（默认 `oc.isoops.com`，无 scheme 自动补 `https://`）。
+    /// 设置：账户中心远程路径输入缓冲（默认 `api.example.com`，无 scheme 自动补 `https://`）。
     remote_path_input: String,
     /// 当前帧的可点击区域（渲染时填充，鼠标事件查询）。
     click_regions: Vec<ClickRegion>,
@@ -1992,7 +1992,7 @@ impl TuiApp {
             self.input_mode = InputMode::SettingsAccountKey;
             return;
         }
-        // 远程路径：空 → 默认 `oc.isoops.com`；可显式带 http(s):// 或不带 scheme
+        // 远程路径：空 → 默认 `api.example.com`；可显式带 http(s):// 或不带 scheme
         // （不带 scheme 由服务端代码自动补 `https://`）。
         let remote_path = {
             let raw = self.remote_path_input.trim().trim_end_matches('/');
@@ -5586,9 +5586,9 @@ let left = ratatui::layout::Layout::default()
         let got = apply_paste_to_buffer(
             InputMode::SettingsRemotePath,
             "",
-            "https://oc.isoops.com/中文路径",
+            "https://api.example.com/中文路径",
         );
-        assert_eq!(got, "https://oc.isoops.com/中文路径");
+        assert_eq!(got, "https://api.example.com/中文路径");
     }
 
     /// 账户ID / 密钥 同为文本字段,粘贴同样整段追加。
@@ -5883,7 +5883,7 @@ let left = ratatui::layout::Layout::default()
             let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
             guard.account_id = "u-1".to_string();
             guard.account_key = "k-abcdef".to_string();
-            guard.remote_path = "https://oc.isoops.com".to_string();
+            guard.remote_path = "https://api.example.com".to_string();
         }
 
         // 未绑定时:行 idx=5 显示「(未绑定)」,并提示「点击选择设备」。
@@ -5948,7 +5948,7 @@ let left = ratatui::layout::Layout::default()
             let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
             guard.account_id = "u-1".to_string();
             guard.account_key = "k-abcdef".to_string();
-            guard.remote_path = "https://oc.isoops.com".to_string();
+            guard.remote_path = "https://api.example.com".to_string();
         }
         // 打开设置弹框,模拟点击「绑定设备」行的屏幕坐标。
         app.input_mode = InputMode::SettingsAccountId;
@@ -6022,7 +6022,7 @@ let left = ratatui::layout::Layout::default()
                 desc: None,
             }],
             sb: crate::account::RemoteSbConfig {
-                base_url: "https://md.isoops.com".to_string(),
+                base_url: "https://md.example.com".to_string(),
                 username: "alice".to_string(),
                 password: "secret".to_string(),
             },
@@ -6039,7 +6039,7 @@ let left = ratatui::layout::Layout::default()
         *app.device_picker_trigger.lock().unwrap() = Some(DevicePickerTrigger {
             user_info: mk_info(),
             account_key: "k-abcdef".to_string(),
-            remote_path: "https://oc.isoops.com".to_string(),
+            remote_path: "https://api.example.com".to_string(),
             force: true,
         });
         app.consume_device_picker_trigger();
@@ -6057,7 +6057,7 @@ let left = ratatui::layout::Layout::default()
         *app2.device_picker_trigger.lock().unwrap() = Some(DevicePickerTrigger {
             user_info: mk_info(),
             account_key: "k-abcdef".to_string(),
-            remote_path: "https://oc.isoops.com".to_string(),
+            remote_path: "https://api.example.com".to_string(),
             force: false,
         });
         app2.consume_device_picker_trigger();
@@ -7054,7 +7054,7 @@ let left = ratatui::layout::Layout::default()
         app.first_setup_required = false;
         app.account_id_input = "tester".to_string();
         app.account_key_input = "test-key-0123456789abcdef".to_string();
-        app.remote_path_input = "ftp://oc.isoops.com".to_string();
+        app.remote_path_input = "ftp://api.example.com".to_string();
         app.input_mode = InputMode::SettingsAccountId;
 
         let env_path = crate::config::unified_env_path();
@@ -7155,7 +7155,7 @@ let left = ratatui::layout::Layout::default()
             let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
             guard.account_id = "u-1".to_string();
             guard.account_key = "k-abcdef".to_string();
-            guard.remote_path = "https://oc.isoops.com".to_string();
+            guard.remote_path = "https://api.example.com".to_string();
         }
         app.input_mode = InputMode::SettingsAccountId;
         terminal.draw(|frame| app.render_settings_popup(frame)).expect("draw");
@@ -7215,7 +7215,7 @@ let left = ratatui::layout::Layout::default()
             let mut guard = app.account_config.write().unwrap_or_else(|e| e.into_inner());
             guard.account_id = "u-1".to_string();
             guard.account_key = "k-abcdef".to_string();
-            guard.remote_path = "https://oc.isoops.com".to_string();
+            guard.remote_path = "https://api.example.com".to_string();
         }
         let line = &app.build_settings_lines()[5];
         let text: String = line

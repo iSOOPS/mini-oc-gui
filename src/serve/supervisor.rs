@@ -753,7 +753,7 @@ mod tests {
 
     // --- build_opencode_serve_spec 的鉴权环境变量注入 ---
 
-    fn spec_env(spec: &ProcessSpec, key: &str) -> Option<&str> {
+    fn spec_env<'a>(spec: &'a ProcessSpec, key: &str) -> Option<&'a str> {
         spec.env
             .iter()
             .find(|(k, _)| k == key)

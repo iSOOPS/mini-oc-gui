@@ -256,9 +256,18 @@ fn icon_assets_dir(profile_dir: &Path) -> PathBuf {
 fn render_svg_to_pngs(svg_path: &Path) -> anyhow::Result<BTreeMap<u32, Vec<u8>>> {
     let svg_data = std::fs::read(svg_path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", svg_path.display()))?;
-    let opts = usvg::Options::default();
+    let mut opts = usvg::Options::default();
+    // `<text>` 元素依赖系统字体:默认 fontdb 是空的,不加载系统字体时
+    // 文本会被静默丢弃(只渲染图形元素)。
+    opts.fontdb_mut().load_system_fonts();
     let tree = usvg::Tree::from_data(&svg_data, &opts)
         .map_err(|e| anyhow::anyhow!("usvg parse: {e}"))?;
+
+    // 缩放基准 = SVG 自身逻辑尺寸(由 width/height/viewBox 解析而来),
+    // 不能硬编码:历史 bug 是 v2 图标 1024 单位、v3 改 32 单位后基准
+    // 未同步,图标被缩到画布左上角 1/N。
+    let svg_units = tree.size().width();
+    debug_assert!(svg_units > 0.0, "usvg guarantees a positive tree size");
 
     let mut out = BTreeMap::new();
     for &size in ICON_SIZES {
@@ -267,8 +276,8 @@ fn render_svg_to_pngs(svg_path: &Path) -> anyhow::Result<BTreeMap<u32, Vec<u8>>>
             .ok_or_else(|| anyhow::anyhow!("invalid pixmap size {size}"))?;
         let mut pixmap = resvg::tiny_skia::Pixmap::new(pixmap_size.width(), pixmap_size.height())
             .ok_or_else(|| anyhow::anyhow!("pixmap alloc for {size} failed"))?;
-        // Scale: SVG is 1024 logical units; we want the rendered output at `size` physical px.
-        let scale = size as f32 / 1024.0;
+        // Scale: map the SVG's full logical width onto `size` physical px.
+        let scale = size as f32 / svg_units;
         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
         resvg::render(&tree, transform, &mut pixmap.as_mut());
         if pixmap.data().iter().all(|&p| p == 0) {
@@ -482,7 +491,9 @@ fn out_icons_hash(out_dir: &Path) -> u64 {
 // 失效(目标路径不变)。分发时用 ditto / zip -y 保留链接,或先 cp -L 解引用。
 // ============================================================================
 
+#[cfg(target_os = "macos")]
 const APP_BUNDLE_NAME: &str = "MiniOC.app";
+#[cfg(target_os = "macos")]
 const APP_EXE_NAME: &str = "mini-oc-gui-serve";
 
 /// macOS: 在 `<profile>/MiniOC.app` 生成最小可用 bundle
