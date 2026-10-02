@@ -260,14 +260,21 @@ impl OpencodeClient {
     /// 返回可读的错误消息。
     pub async fn health_check(&self) -> Result<(), String> {
         let url = format!("{}/project", self.base_url);
+        crate::http_trace::log_request("GET", &url, None);
         let resp = self
             .http
             .get(&url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
-            .map_err(|e| format!("无法连接 opencode serve: {e}"))?;
-        match resp.status().as_u16() {
+            .map_err(|e| {
+                crate::http_trace::log_response_error("GET", &url, &e.to_string());
+                format!("无法连接 opencode serve: {e}")
+            })?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        crate::http_trace::log_response("GET", &url, status, &body);
+        match status {
             200 => Ok(()),
             401 | 403 => Err("认证失败（用户名/密码不匹配）".to_string()),
             s => Err(format!("opencode serve 返回 HTTP {s}")),
@@ -279,7 +286,8 @@ impl OpencodeClient {
     /// # Errors
     /// 返回可读的错误消息（供状态栏/日志展示）。
     pub async fn list_sessions(&self, directory: &str) -> Result<Vec<OcSession>, String> {
-        let url = format!("{}/session", self.base_url);
+        let url = format!("{}/session?directory={}", self.base_url, directory);
+        crate::http_trace::log_request("GET", &url, None);
         let resp = self
             .http
             .get(&url)
@@ -287,13 +295,17 @@ impl OpencodeClient {
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
-            .map_err(|e| format!("GET /session 请求失败: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("GET /session 返回 HTTP {}", resp.status()));
+            .map_err(|e| {
+                crate::http_trace::log_response_error("GET", &url, &e.to_string());
+                format!("GET /session 请求失败: {e}")
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        crate::http_trace::log_response("GET", &url, status.as_u16(), &body);
+        if !status.is_success() {
+            return Err(format!("GET /session 返回 HTTP {status}"));
         }
-        resp.json::<Vec<OcSession>>()
-            .await
-            .map_err(|e| format!("GET /session 解析失败: {e}"))
+        serde_json::from_str(&body).map_err(|e| format!("GET /session 解析失败: {e}"))
     }
 
     /// `DELETE /session/{id}` → 在 opencode serve 端删除一个会话。
@@ -305,14 +317,20 @@ impl OpencodeClient {
     /// 返回可读的错误消息（连接错误 / 非 2xx 状态码）。
     pub async fn delete_session(&self, sid: &str) -> Result<(), String> {
         let url = format!("{}/session/{sid}", self.base_url);
+        crate::http_trace::log_request("DELETE", &url, None);
         let resp = self
             .http
             .delete(&url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
-            .map_err(|e| format!("DELETE /session 请求失败: {e}"))?;
+            .map_err(|e| {
+                crate::http_trace::log_response_error("DELETE", &url, &e.to_string());
+                format!("DELETE /session 请求失败: {e}")
+            })?;
         let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        crate::http_trace::log_response("DELETE", &url, status, &body);
         match status {
             200..=299 => Ok(()),
             404 => Ok(()), // 幂等：远端已删过
@@ -331,6 +349,7 @@ impl OpencodeClient {
             "title": title,
             "location": { "directory": directory }
         });
+        crate::http_trace::log_request("POST", &url, Some(&body.to_string()));
         let resp = self
             .http
             .post(&url)
@@ -338,9 +357,15 @@ impl OpencodeClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("POST /api/session 请求失败: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("POST /api/session 返回 HTTP {}", resp.status()));
+            .map_err(|e| {
+                crate::http_trace::log_response_error("POST", &url, &e.to_string());
+                format!("POST /api/session 请求失败: {e}")
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        crate::http_trace::log_response("POST", &url, status.as_u16(), &body);
+        if !status.is_success() {
+            return Err(format!("POST /api/session 返回 HTTP {status}"));
         }
 
         #[derive(Deserialize)]
@@ -351,10 +376,8 @@ impl OpencodeClient {
         struct CreateData {
             id: String,
         }
-        let r: CreateResp = resp
-            .json()
-            .await
-            .map_err(|e| format!("POST /api/session 响应解析失败: {e}"))?;
+        let r: CreateResp =
+            serde_json::from_str(&body).map_err(|e| format!("POST /api/session 响应解析失败: {e}"))?;
         Ok(r.data.id)
     }
 }

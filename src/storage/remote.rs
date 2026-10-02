@@ -206,6 +206,11 @@ impl RemoteClient {
 
     async fn do_login(&mut self, user: &str, password: &str) -> Result<(), AppError> {
         let login_url = format!("{}/.auth", self.base_url.trim_end_matches('/'));
+        crate::http_trace::log_request(
+            "POST",
+            &login_url,
+            Some(&format!("username={user}&password={password}")),
+        );
         let resp = self
             .http
             .post(&login_url)
@@ -213,9 +218,18 @@ impl RemoteClient {
             .form(&[("username", user), ("password", password)])
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("login network error: {e}")))?;
+            .map_err(|e| {
+                crate::http_trace::log_response_error("POST", &login_url, &e.to_string());
+                AppError::Internal(format!("login network error: {e}"))
+            })?;
 
-        let cookie = extract_cookie(resp.headers(), &self.cookie_name)
+        // text() 会 move resp，cookie 头须先取出。
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let body = resp.text().await.unwrap_or_default();
+        crate::http_trace::log_response("POST", &login_url, status, &body);
+
+        let cookie = extract_cookie(&headers, &self.cookie_name)
             .ok_or_else(|| AppError::Internal("login response missing session cookie".to_string()))?;
         self.cookie = Some(cookie);
         Ok(())
@@ -266,6 +280,8 @@ impl RemoteClient {
         url: &str,
         body: Option<String>,
     ) -> Result<(Status, String), AppError> {
+        let method_name = method.as_str().to_string();
+        crate::http_trace::log_request(&method_name, url, body.as_deref());
         let mut req = self.http.request(method, url).header(ACCEPT, "*/*");
         if let Some(cookie) = &self.cookie {
             if let Ok(v) = HeaderValue::from_str(cookie) {
@@ -277,12 +293,16 @@ impl RemoteClient {
                 .header(CONTENT_TYPE, "text/markdown; charset=utf-8")
                 .body(b);
         }
-        let resp = req.send().await.map_err(|e| AppError::Internal(format!("network: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            crate::http_trace::log_response_error(&method_name, url, &e.to_string());
+            AppError::Internal(format!("network: {e}"))
+        })?;
         let status = resp.status().as_u16();
         let text = resp
             .text()
             .await
             .map_err(|e| AppError::Internal(format!("read body: {e}")))?;
+        crate::http_trace::log_response(&method_name, url, status, &text);
         Ok((status, text))
     }
 

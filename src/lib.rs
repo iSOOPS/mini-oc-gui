@@ -21,6 +21,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod handlers;
+pub mod http_trace;
 pub mod serve;
 pub mod storage;
 pub mod ui;

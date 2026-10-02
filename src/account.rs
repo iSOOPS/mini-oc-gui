@@ -618,24 +618,38 @@ pub async fn fetch_user_info(
     let base = normalize_remote_path(remote_path);
     let url = format!("{base}/api/user/info");
 
+    let login_body = LoginBody { key: account_key };
+    crate::http_trace::log_request(
+        "POST",
+        &url,
+        Some(&serde_json::to_string(&login_body).unwrap_or_default()),
+    );
+
     let resp = http_client()
         .post(&url)
-        .json(&LoginBody { key: account_key }) // 自动设置 Content-Type: application/json
+        .json(&login_body) // 自动设置 Content-Type: application/json
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("user/info network error: {e}")))?;
+        .map_err(|e| {
+            crate::http_trace::log_response_error("POST", &url, &e.to_string());
+            AppError::Internal(format!("user/info network error: {e}"))
+        })?;
 
+    // 先取 header（Retry-After），再消费 body —— text() 会 move resp。
     let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body_text = resp.text().await.unwrap_or_default();
+    crate::http_trace::log_response("POST", &url, status.as_u16(), &body_text);
+
     if !status.is_success() {
-        // 429 时尽量带上 Retry-After（须在 body 消费 response 前读取）。
-        let retry_after = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
+        // 429 时尽量带上 Retry-After（已在上文 body 消费前读取）。
+        let retry_after = retry_after
             .map(|s| format!("，retry after {s}s"))
             .unwrap_or_default();
-        let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("POST {url} failed: HTTP {status}");
 
         let reason = match status.as_u16() {
             429 => format!("rate limited (HTTP 429{retry_after})"),
@@ -644,13 +658,11 @@ pub async fn fetch_user_info(
         };
         return Err(AppError::Internal(format!(
             "user/info request failed: {reason}: {}",
-            body_excerpt(&body)
+            body_excerpt(&body_text)
         )));
     }
 
-    let info = resp
-        .json::<RemoteUserInfo>()
-        .await
+    let info = serde_json::from_str::<RemoteUserInfo>(&body_text)
         .map_err(|e| AppError::Internal(format!("user/info response parse error: {e}")))?;
     tracing::info!(
         target: "sync",
@@ -781,24 +793,34 @@ pub async fn bind_device(
     let base = normalize_remote_path(remote_path);
     let url = format!("{base}/api/device-bind");
 
+    let bind_body = DeviceBindBody {
+        key: account_key,
+        user_id,
+        name: device_name,
+        bound,
+        pctype,
+        device_name: client_device_name,
+    };
+    crate::http_trace::log_request(
+        "POST",
+        &url,
+        Some(&serde_json::to_string(&bind_body).unwrap_or_default()),
+    );
+
     let resp = http_client()
         .post(&url)
-        .json(&DeviceBindBody {
-            key: account_key,
-            user_id,
-            name: device_name,
-            bound,
-            pctype,
-            device_name: client_device_name,
-        })
+        .json(&bind_body)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("device-bind network error: {e}")))?;
+        .map_err(|e| {
+            crate::http_trace::log_response_error("POST", &url, &e.to_string());
+            AppError::Internal(format!("device-bind network error: {e}"))
+        })?;
 
     let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    crate::http_trace::log_response("POST", &url, status.as_u16(), &body);
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("POST {url} failed: HTTP {status}");
         let code = status.as_u16();
         let reason = match code {
             401 => "unauthorized (HTTP 401) — account_key 无效".to_string(),
@@ -819,8 +841,7 @@ pub async fn bind_device(
         return Err(AppError::Internal(detail));
     }
 
-    resp.json::<DeviceBindResponse>()
-        .await
+    serde_json::from_str::<DeviceBindResponse>(&body)
         .map_err(|e| AppError::Internal(format!("device-bind response parse error: {e}")))
 }
 
